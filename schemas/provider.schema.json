@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sxamx/bifrost/schemas/provider.schema.json",
+  "title": "Bifrost Provider Schema",
+  "description": "Ficha declarativa de un proveedor o adaptador en Bifrost y bifrost-providers.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "packageType",
+    "baseUrl",
+    "auth",
+    "modelsSource"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$",
+      "description": "Identificador único del proveedor (ej. openrouter, nvidia-nim, deepseek-web)."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "category": {
+      "type": "string",
+      "enum": ["aggregator", "official-api", "experimental-adapter"]
+    },
+    "packageType": {
+      "type": "string",
+      "enum": ["official-json", "experimental-adapter"]
+    },
+    "verified": {
+      "type": "boolean",
+      "default": false
+    },
+    "publishedAt": {
+      "type": "string",
+      "format": "date"
+    },
+    "baseUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL base compatible con OpenAI (ej. https://openrouter.ai/api/v1)."
+    },
+    "auth": {
+      "type": "object",
+      "required": ["type", "header"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["bearer", "header", "none"]
+        },
+        "header": {
+          "type": "string",
+          "default": "Authorization"
+        },
+        "prefix": {
+          "type": "string",
+          "default": "Bearer "
+        },
+        "extraHeaders": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "modelsSource": {
+      "type": "string",
+      "enum": ["api", "static"]
+    },
+    "modelsEndpoint": {
+      "type": "string",
+      "description": "Ruta relativa o URL para listar modelos si modelsSource es 'api' (ej. /models)."
+    },
+    "freeRule": {
+      "type": "object",
+      "description": "Reglas declarativas para filtrar solo modelos gratuitos.",
+      "additionalProperties": false,
+      "properties": {
+        "priceZeroPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Rutas JSON que deben ser 0 o '0' (ej. ['pricing.prompt', 'pricing.completion'])."
+        },
+        "requiredEndpoint": {
+          "type": "string",
+          "description": "Endpoint obligatorio en el modelo (ej. /api/v1/chat/completions)."
+        },
+        "idSuffix": {
+          "type": "string",
+          "description": "Sufijo opcional de señal (ej. :free)."
+        }
+      }
+    },
+    "staticModels": {
+      "type": "array",
+      "description": "Lista fija de modelos si modelsSource es 'static'.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "canonicalModelId": { "type": "string" },
+          "contextLength": { "type": "integer" },
+          "maxOutput": { "type": "integer" }
+        }
+      }
+    },
+    "reviewedAt": {
+      "type": "string",
+      "format": "date",
+      "description": "Obligatorio cuando modelsSource es 'static'."
+    },
+    "adapter": {
+      "type": "object",
+      "description": "Configuración del proceso/contenedor aislado cuando packageType es 'experimental-adapter'.",
+      "required": ["defaultPort", "healthPath"],
+      "properties": {
+        "defaultPort": { "type": "integer" },
+        "healthPath": { "type": "string", "default": "/health" },
+        "accountLabel": { "type": "string", "default": "Token / Sesión" }
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+# Secretos: nunca se suben
+.env
+*.env
+secrets/
+keys.json
+
+# Datos locales
+*.db
+*.db-journal
+*.sqlite
+state.json
+
+# Dependencias y compilados
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+
+# Sistema
+.DS_Store
+Thumbs.db

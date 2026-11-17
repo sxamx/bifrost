@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/sxamx/bifrost/schemas/model.schema.json",
+  "title": "Bifrost Model Schema",
+  "description": "Formato normalizado de un modelo en Bifrost.",
+  "type": "object",
+  "required": [
+    "fullId",
+    "providerId",
+    "modelId",
+    "name",
+    "modalities",
+    "capabilities",
+    "isFree"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "fullId": {
+      "type": "string",
+      "description": "Identificador unificado proveedor/modelo."
+    },
+    "providerId": {
+      "type": "string"
+    },
+    "modelId": {
+      "type": "string"
+    },
+    "canonicalModelId": {
+      "type": ["string", "null"]
+    },
+    "name": {
+      "type": "string"
+    },
+    "contextLength": {
+      "type": ["integer", "null"]
+    },
+    "maxOutput": {
+      "type": ["integer", "null"]
+    },
+    "modalities": {
+      "type": "object",
+      "required": ["input", "output"],
+      "properties": {
+        "input": { "type": "array", "items": { "type": "string" } },
+        "output": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["tools", "reasoning", "structuredOutput"],
+      "properties": {
+        "tools": { "type": "boolean" },
+        "reasoning": { "type": "boolean" },
+        "structuredOutput": { "type": "boolean" }
+      }
+    },
+    "isFree": {
+      "type": "boolean"
+    },
+    "firstSeenAt": {
+      "type": "integer",
+      "description": "Timestamp Unix UTC cuando Bifrost detectó el modelo."
+    },
+    "upstreamCreatedAt": {
+      "type": ["integer", "null"]
+    }
+  }
+}
