@@ -4,28 +4,41 @@ Gateway y router self-hosted de cuotas gratuitas de modelos de IA. Expone una AP
 
 La app se instala **vacía**. Los proveedores e integraciones se instalan bajo demanda desde el marketplace (`bifrost-providers`).
 
-> Estado: arquitectura y especificación listas. Iniciando implementación (Fase 1).
+## Inicio rápido
+
+### Opción 1: Docker Compose (recomendada)
+
+```bash
+docker compose up -d
+```
+
+El panel y la API responden en `http://localhost:8080`.
+
+### Opción 2: Instalación nativa en Linux (`systemd`)
+
+```bash
+bash scripts/install.sh
+```
 
 ## Estructura
 
 | Carpeta | Qué va ahí |
 |---|---|
-| [`docs/`](docs/) | Visión, decisiones, arquitectura, protocolo de nodos, historias y orden de implementación. |
-| [`core/`](core/) | Núcleo del router: API OpenAI, enrutamiento por clave, salud, failover, SQLite cifrado. |
-| [`panel/`](panel/) | Panel web React/Vite: resumen, proveedores, métricas, comparador, playground y logs. |
-| [`nodes/`](nodes/) | Nodos de salida: túnel ligero que reenvía tráfico cifrado sin ver claves ni contenido. |
+| [`core/`](core/) | Núcleo HTTP (Hono + Node.js): API OpenAI (`/v1/*`), API del panel (`/api/*`), SQLite cifrado. |
+| [`panel/`](panel/) | Panel web (React + Vite + TypeScript): configuración inicial, resumen, proveedores, métricas y API keys. |
+| [`nodes/`](nodes/) | Nodos de salida: túnel `HTTP CONNECT` que reenvía tráfico cifrado sin ver claves ni contenido. |
 | [`schemas/`](schemas/) | JSON Schemas oficiales para fichas de proveedor e información de modelos. |
-| [`tests/`](tests/) | Pruebas y criterios de aceptación. |
+| [`scripts/`](scripts/) | Instalador nativo Linux (`install.sh`) y unidad `systemd`. |
+| [`docs/`](docs/) | Visión, decisiones, arquitectura técnica y protocolo núcleo–nodo. |
+| [`tests/`](tests/) | Pruebas automatizadas de integración y criterios de aceptación. |
 
-## Documentos
+## Documentación
 
 - [Visión](docs/VISION.md)
 - [Decisiones](docs/DECISIONS.md)
 - [Arquitectura técnica](docs/ARQUITECTURA.md)
 - [Protocolo núcleo–nodo](docs/PROTOCOLO-NODOS.md)
-- [Historias de usuario](docs/HISTORIAS.md)
-- [Orden de implementación](docs/ORDEN-DE-IMPLEMENTACION.md)
-- [Pendientes por aclarar](docs/PENDIENTES.md)
+- [Roadmap e Historias de Usuario (Issues)](https://github.com/sxamx/bifrost/issues)
 
 ## Licencia
 

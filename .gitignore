@@ -1,19 +1,30 @@
 # Secretos: nunca se suben
 .env
 *.env
+!.env.example
 secrets/
 keys.json
+*.key
+*.enc
 
 # Datos locales
+data/
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 state.json
 
 # Dependencias y compilados
 node_modules/
 dist/
 build/
+*.tsbuildinfo
+coverage/
+*.log
 __pycache__/
 *.pyc
 
