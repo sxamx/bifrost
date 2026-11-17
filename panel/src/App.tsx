@@ -37,7 +37,10 @@ export const App: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
   const [autoFocusKeyInput, setAutoFocusKeyInput] = useState(false);
-  const [marketplaceModalOpen, setMarketplaceModalOpen] = useState(false);
+  const [providersSubView, setProvidersSubView] = useState<
+    'installed' | 'marketplace' | 'local-json' | undefined
+  >(undefined);
+  const [guestInfoModalOpen, setGuestInfoModalOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
 
   const loadWorkspaceData = useCallback(async () => {
@@ -123,12 +126,30 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  const refreshProvidersAndStats = useCallback(async () => {
+    setProvidersLoading(true);
+    const [providersResult, meResult] = await Promise.allSettled([api.getProviders(), api.getMe()]);
+    if (providersResult.status === 'fulfilled' && Array.isArray(providersResult.value?.providers)) {
+      setProviders(providersResult.value.providers);
+      setProvidersLoaded(true);
+    }
+    setProvidersLoading(false);
+
+    if (meResult.status === 'fulfilled') {
+      setUser(meResult.value.user);
+      setStats(meResult.value.stats ?? EMPTY_STATS);
+    } else if (meResult.reason instanceof ApiError && meResult.reason.status === 401) {
+      setUser(null);
+      setStage('login');
+    }
+  }, []);
+
   async function handleLogout() {
     setLoggingOut(true);
     try {
       await api.logout();
     } catch {
-      // Even if session already expired, transition cleanly to login screen
+      // Transition cleanly to login screen even if session already expired
     } finally {
       setLoggingOut(false);
       setUser(null);
@@ -250,14 +271,14 @@ export const App: React.FC = () => {
             providersLoaded={providersLoaded}
             keysCount={effectiveKeysCount}
             onNavigateProviders={() => {
+              setProvidersSubView('marketplace');
               setActiveTab('providers');
-              setMarketplaceModalOpen(true);
             }}
             onNavigateCreateKey={() => {
               setActiveTab('keys');
               setAutoFocusKeyInput(true);
             }}
-            onOpenMarketplaceInfo={() => setMarketplaceModalOpen(true)}
+            onOpenMarketplaceInfo={() => setGuestInfoModalOpen(true)}
           />
         ) : null}
 
@@ -275,60 +296,37 @@ export const App: React.FC = () => {
           <ProvidersTab
             providers={providers}
             loading={providersLoading}
-            onOpenMarketplaceModal={() => setMarketplaceModalOpen(true)}
+            initialSubView={providersSubView}
+            onInitialSubViewConsumed={() => setProvidersSubView(undefined)}
+            onProvidersChanged={refreshProvidersAndStats}
           />
         ) : null}
       </main>
 
-      {/* Phase 2 Marketplace Preview / Explanation Modal */}
-      {marketplaceModalOpen ? (
+      {/* Info Modal for Guest Role clicking Add Provider */}
+      {guestInfoModalOpen ? (
         <div
           className="modal-backdrop"
           role="dialog"
           aria-modal="true"
-          aria-labelledby="marketplace-modal-title"
-          onClick={() => setMarketplaceModalOpen(false)}
+          aria-labelledby="guest-prov-modal-title"
+          onClick={() => setGuestInfoModalOpen(false)}
         >
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-            <div className="gate-badge" style={{ alignSelf: 'flex-start', marginBottom: 0 }}>
-              Catálogo bifrost-providers · Fase 2
-            </div>
-            <h2 id="marketplace-modal-title" className="card-title" style={{ fontSize: '1.2rem' }}>
-              Instalación modular de proveedores
+            <h2 id="guest-prov-modal-title" className="card-title">
+              Instalación reservada al administrador
             </h2>
             <p style={{ color: 'var(--sub)', fontSize: '0.93rem' }}>
-              En Bifrost, los conectores de IA viven desacoplados en el catálogo comunitario{' '}
-              <code className="mono">bifrost-providers</code>. En la Fase 2 podrás:
+              Solo una cuenta con rol <strong>admin</strong> puede instalar proveedores desde{' '}
+              <code className="mono">bifrost-providers</code> o registrar credenciales cifradas.
+              Mientras tanto, puedes crear tus propias llaves internas{' '}
+              <code className="mono">sk-bf-…</code>.
             </p>
-            <ul
-              style={{
-                margin: 0,
-                paddingLeft: 20,
-                color: 'var(--sub)',
-                fontSize: '0.9rem',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 8,
-              }}
-            >
-              <li>
-                Explorar e instalar proveedores (OpenAI, Anthropic, Gemini, OpenRouter, Groq,
-                Ollama…) directamente desde este panel.
-              </li>
-              <li>
-                Almacenar múltiples cuentas y API keys reales cifradas con AES-GCM dentro de{' '}
-                <code className="mono">core/</code>.
-              </li>
-              <li>
-                Mientras tanto, ya puedes generar tus llaves internas{' '}
-                <code className="mono">sk-bf-…</code> y dejar configurados tus editores.
-              </li>
-            </ul>
             <div className="modal-actions">
               <button
                 type="button"
                 className="btn btn-secondary"
-                onClick={() => setMarketplaceModalOpen(false)}
+                onClick={() => setGuestInfoModalOpen(false)}
               >
                 Cerrar
               </button>
@@ -336,7 +334,7 @@ export const App: React.FC = () => {
                 type="button"
                 className="btn btn-primary"
                 onClick={() => {
-                  setMarketplaceModalOpen(false);
+                  setGuestInfoModalOpen(false);
                   setActiveTab('keys');
                   setAutoFocusKeyInput(true);
                 }}

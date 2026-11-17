@@ -5,16 +5,27 @@ import type { DatabaseSync } from 'node:sqlite';
 import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import {
+  encryptSecret,
   generateInternalApiKey,
   generateSessionToken,
   hashPassword,
   sha256Hex,
   verifyPassword,
 } from './crypto.js';
-import { writeSystemLog } from './db.js';
+import { redactSecretsInText, writeSystemLog } from './db.js';
+import { ModelSyncHttpError, formatModelRow, syncProviderModels } from './models-sync.js';
+import { DrainingRegistry, executeChatCompletions } from './router.js';
+import {
+  type ProviderManifest,
+  isValidHttpUri,
+  loadSeedManifests,
+  validateProviderManifest,
+} from './schema.js';
 
 const SESSION_COOKIE_NAME = 'bifrost_session';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+const DEFAULT_MARKETPLACE_URL =
+  'https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json';
 
 export interface AuthUser {
   id: string;
@@ -37,6 +48,9 @@ export interface CreateAppOptions {
   db: DatabaseSync;
   masterKey: Buffer;
   panelDistDir?: string;
+  schemasDir?: string;
+  marketplaceUrl?: string;
+  fetchImpl?: typeof fetch;
   now?: () => number;
 }
 
@@ -92,15 +106,96 @@ function mapUserRow(row: Record<string, unknown>): AuthUser {
   };
 }
 
+function formatProviderKeyRow(row: Record<string, unknown>) {
+  return {
+    id: String(row.id),
+    providerId: String(row.provider_id),
+    label: String(row.label),
+    last4: String(row.last4),
+    nodeId: row.node_id === null || row.node_id === undefined ? null : String(row.node_id),
+    forcedNode: Number(row.forced_node ?? 0) === 1,
+    dailyQuotaLimit:
+      row.daily_quota_limit === null || row.daily_quota_limit === undefined
+        ? null
+        : Number(row.daily_quota_limit),
+    ratelimitRemaining:
+      row.ratelimit_remaining === null || row.ratelimit_remaining === undefined
+        ? null
+        : Number(row.ratelimit_remaining),
+    ratelimitResetAt:
+      row.ratelimit_reset_at === null || row.ratelimit_reset_at === undefined
+        ? null
+        : Number(row.ratelimit_reset_at),
+    status: String(row.status),
+    lastError:
+      row.last_error === null || row.last_error === undefined ? null : String(row.last_error),
+    createdAt: Number(row.created_at),
+  };
+}
+
+function formatProviderSummaryRow(
+  row: Record<string, unknown>,
+  keysCount: number,
+  modelsCount: number,
+  isAdmin: boolean,
+) {
+  let manifest: ProviderManifest | undefined;
+  try {
+    manifest = JSON.parse(String(row.schema_json)) as ProviderManifest;
+  } catch {
+    manifest = undefined;
+  }
+
+  if (!isAdmin) {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      packageType: String(row.package_type),
+      modelsSource: String(row.models_source),
+      enabled: Number(row.enabled) === 1,
+      modelsCount,
+    };
+  }
+
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    packageType: String(row.package_type),
+    modelsSource: String(row.models_source),
+    category: manifest?.category,
+    verified: Boolean(manifest?.verified ?? false),
+    baseUrl: manifest?.baseUrl,
+    adapterUrl:
+      row.adapter_url === null || row.adapter_url === undefined ? null : String(row.adapter_url),
+    enabled: Number(row.enabled) === 1,
+    reviewedAt: manifest?.reviewedAt ?? null,
+    lastModelsSyncAt:
+      row.last_models_sync_at === null || row.last_models_sync_at === undefined
+        ? null
+        : Number(row.last_models_sync_at),
+    createdAt: Number(row.created_at),
+    manifest,
+    keysCount,
+    modelsCount,
+  };
+}
+
 export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   const { db, masterKey } = options;
   if (masterKey.length !== 32) {
     throw new Error('createApp requires a 32-byte masterKey Buffer.');
   }
   const now = options.now ?? (() => Date.now());
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   const defaultPanelDistDir = path.resolve(import.meta.dirname, '../../panel/dist');
   const resolvedPanelDistDir = path.resolve(options.panelDistDir ?? defaultPanelDistDir);
+  const resolvedSchemasDir = path.resolve(
+    options.schemasDir ?? path.resolve(import.meta.dirname, '../../schemas'),
+  );
+  const marketplaceUrl =
+    options.marketplaceUrl ?? process.env.BIFROST_MARKETPLACE_URL ?? DEFAULT_MARKETPLACE_URL;
 
+  const registry = new DrainingRegistry();
   const app = new Hono<AppEnv>();
 
   const nowSeconds = () => Math.floor(now() / 1000);
@@ -356,23 +451,26 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   app.get('/api/auth/me', (c) => {
     const user = c.get('user');
 
-    const providersRow = db
-      .prepare(`SELECT COUNT(*) AS count FROM providers`)
-      .get() as { count: number | bigint } | undefined;
+    const allProviderRows = db
+      .prepare(`SELECT id FROM providers`)
+      .all() as Array<{ id: string }>;
+    const providersCount = allProviderRows.filter(
+      (p) => !registry.isProviderDraining(p.id),
+    ).length;
 
-    const modelsRow =
+    const modelRows =
       user.role === 'admin'
         ? (db
             .prepare(
-              `SELECT COUNT(*) AS count
+              `SELECT m.full_id, m.provider_id
                FROM models m
                JOIN providers p ON p.id = m.provider_id
                WHERE m.active = 1 AND p.enabled = 1`,
             )
-            .get() as { count: number | bigint } | undefined)
+            .all() as Array<{ full_id: string; provider_id: string }>)
         : (db
             .prepare(
-              `SELECT COUNT(DISTINCT m.full_id) AS count
+              `SELECT DISTINCT m.full_id, m.provider_id
                FROM models m
                JOIN providers p ON p.id = m.provider_id
                JOIN user_model_access uma
@@ -380,7 +478,11 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
                 AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*')
                WHERE m.active = 1 AND p.enabled = 1`,
             )
-            .get(user.id) as { count: number | bigint } | undefined);
+            .all(user.id) as Array<{ full_id: string; provider_id: string }>);
+
+    const modelsCount = modelRows.filter(
+      (m) => !registry.isProviderDraining(m.provider_id),
+    ).length;
 
     const keysRow = db
       .prepare(
@@ -399,42 +501,606 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         quotaResetMode: user.quotaResetMode,
       },
       stats: {
-        providersCount: Number(providersRow?.count ?? 0),
-        modelsCount: Number(modelsRow?.count ?? 0),
+        providersCount,
+        modelsCount,
         keysCount: Number(keysRow?.count ?? 0),
       },
     });
   });
 
-  // --- Installed Providers (HU-02 empty state check) ---
+  // --- Marketplace & Provider Installation (HU-06) ---
+
+  const loadCachedOrSeedCatalog = (): ProviderManifest[] => {
+    const cachedRow = db
+      .prepare(`SELECT payload_json FROM external_cache WHERE cache_key = 'marketplace:index'`)
+      .get() as { payload_json: string } | undefined;
+
+    if (cachedRow?.payload_json) {
+      try {
+        const parsed = JSON.parse(cachedRow.payload_json) as unknown[];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed as ProviderManifest[];
+        }
+      } catch {
+        // Fall through to seed manifests
+      }
+    }
+
+    return loadSeedManifests(resolvedSchemasDir);
+  };
+
+  app.get('/api/marketplace', async (c) => {
+    const nowSec = nowSeconds();
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      let res: Response;
+      try {
+        res = await fetchImpl(marketplaceUrl, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!res.ok) {
+        throw new Error(`Marketplace HTTP ${res.status}`);
+      }
+
+      const rawJson = (await res.json()) as unknown;
+      let rawItems: unknown[] = [];
+      if (Array.isArray(rawJson)) {
+        rawItems = rawJson;
+      } else if (rawJson && typeof rawJson === 'object') {
+        const rec = rawJson as Record<string, unknown>;
+        if (Array.isArray(rec.providers)) rawItems = rec.providers;
+        else if (Array.isArray(rec.manifests)) rawItems = rec.manifests;
+        else if (Array.isArray(rec.items)) rawItems = rec.items;
+        else if (Array.isArray(rec.catalog)) rawItems = rec.catalog;
+      }
+
+      const validManifests: ProviderManifest[] = [];
+      for (const item of rawItems) {
+        const check = validateProviderManifest(item, resolvedSchemasDir);
+        if (check.valid && check.manifest) {
+          validManifests.push(check.manifest);
+        }
+      }
+
+      db.prepare(
+        `INSERT INTO external_cache (cache_key, payload_json, etag, fetched_at)
+         VALUES ('marketplace:index', ?, ?, ?)
+         ON CONFLICT(cache_key) DO UPDATE SET
+           payload_json = excluded.payload_json,
+           etag = excluded.etag,
+           fetched_at = excluded.fetched_at`,
+      ).run(JSON.stringify(validManifests), res.headers.get('etag'), nowSec);
+
+      return c.json({
+        online: true,
+        offline: false,
+        providers: validManifests,
+        manifests: validManifests,
+      });
+    } catch (err) {
+      const fallback = loadCachedOrSeedCatalog();
+      const errMsg = redactSecretsInText(
+        err instanceof Error ? err.message : 'Unable to reach remote marketplace catalog.',
+      );
+
+      return c.json({
+        online: false,
+        offline: true,
+        providers: fallback,
+        manifests: fallback,
+        notice:
+          'Catálogo remoto fuera de línea. Mostrando fichas locales verificadas; también puedes importar un archivo JSON local.',
+        error: errMsg,
+      });
+    }
+  });
+
+  const handleInstallProvider = async (
+    body: Record<string, unknown>,
+    allowCatalogIdLookup: boolean,
+  ) => {
+    let candidateManifest: unknown;
+    const rawAdapterUrl =
+      typeof body.adapterUrl === 'string' && body.adapterUrl.trim().length > 0
+        ? body.adapterUrl.trim()
+        : undefined;
+
+    if (body.manifest && typeof body.manifest === 'object' && !Array.isArray(body.manifest)) {
+      candidateManifest = body.manifest;
+    } else if (
+      allowCatalogIdLookup &&
+      typeof (body.id ?? body.providerId) === 'string' &&
+      !('schemaVersion' in body) &&
+      !('baseUrl' in body)
+    ) {
+      const targetId = String(body.id ?? body.providerId);
+      const catalog = loadCachedOrSeedCatalog();
+      const found = catalog.find((m) => m.id === targetId);
+      if (!found) {
+        return {
+          status: 404 as const,
+          payload: { error: `Provider "${targetId}" was not found in the marketplace catalog.` },
+        };
+      }
+      candidateManifest = found;
+    } else {
+      candidateManifest = body;
+    }
+
+    const validation = validateProviderManifest(candidateManifest, resolvedSchemasDir);
+    if (!validation.valid || !validation.manifest) {
+      return {
+        status: 400 as const,
+        payload: {
+          error: `Invalid provider manifest: ${validation.errors.join('; ')}`,
+          details: validation.errors,
+        },
+      };
+    }
+
+    const manifest = validation.manifest;
+    let adapterUrl: string | null = null;
+    if (manifest.packageType === 'experimental-adapter') {
+      if (rawAdapterUrl) {
+        if (!isValidHttpUri(rawAdapterUrl)) {
+          return {
+            status: 400 as const,
+            payload: { error: 'adapterUrl must be a valid http:// or https:// URL.' },
+          };
+        }
+        adapterUrl = rawAdapterUrl;
+      } else {
+        adapterUrl = manifest.baseUrl;
+      }
+    }
+
+    const existing = db
+      .prepare(`SELECT id FROM providers WHERE id = ?`)
+      .get(manifest.id) as { id: string } | undefined;
+
+    if (existing && !registry.isProviderDraining(manifest.id)) {
+      return {
+        status: 409 as const,
+        payload: { error: `Provider "${manifest.id}" is already installed.` },
+      };
+    }
+
+    const createdAt = nowSeconds();
+    db.prepare(
+      `INSERT INTO providers (
+         id, name, package_type, models_source, schema_json,
+         adapter_url, enabled, last_models_sync_at, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 1, NULL, ?)`,
+    ).run(
+      manifest.id,
+      manifest.name,
+      manifest.packageType,
+      manifest.modelsSource,
+      JSON.stringify(manifest),
+      adapterUrl,
+      createdAt,
+    );
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Provider "${manifest.name}" (${manifest.id}) installed (${manifest.packageType})`,
+      {
+        providerId: manifest.id,
+        packageType: manifest.packageType,
+        modelsSource: manifest.modelsSource,
+      },
+      createdAt,
+    );
+
+    const insertedRow = db
+      .prepare(`SELECT * FROM providers WHERE id = ?`)
+      .get(manifest.id) as Record<string, unknown>;
+
+    return {
+      status: 201 as const,
+      payload: {
+        provider: formatProviderSummaryRow(insertedRow, 0, 0, true),
+      },
+    };
+  };
+
+  app.post('/api/marketplace/install', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const result = await handleInstallProvider(body, true);
+    return c.json(result.payload, result.status);
+  });
+
+  app.post('/api/providers', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const result = await handleInstallProvider(body, false);
+    return c.json(result.payload, result.status);
+  });
+
+  // --- Installed Providers List & Graceful Deletion (HU-02, HU-06, HU-10) ---
 
   app.get('/api/providers', (c) => {
+    const user = c.get('user');
+    const isAdmin = user.role === 'admin';
+
     const rows = db
-      .prepare(
-        `SELECT p.id, p.name, p.package_type, p.models_source, p.adapter_url,
-                p.enabled, p.last_models_sync_at, p.created_at,
-                (SELECT COUNT(*) FROM provider_keys pk WHERE pk.provider_id = p.id) AS keys_count,
-                (SELECT COUNT(*) FROM models m WHERE m.provider_id = p.id AND m.active = 1) AS models_count
-         FROM providers p
-         ORDER BY p.created_at ASC`,
-      )
+      .prepare(`SELECT * FROM providers ORDER BY created_at ASC`)
       .all() as Array<Record<string, unknown>>;
 
-    const providers = rows.map((r) => ({
-      id: String(r.id),
-      name: String(r.name),
-      packageType: String(r.package_type),
-      modelsSource: String(r.models_source),
-      adapterUrl: r.adapter_url === null ? null : String(r.adapter_url),
-      enabled: Number(r.enabled) === 1,
-      lastModelsSyncAt:
-        r.last_models_sync_at === null ? null : Number(r.last_models_sync_at),
-      createdAt: Number(r.created_at),
-      keysCount: Number(r.keys_count ?? 0),
-      modelsCount: Number(r.models_count ?? 0),
-    }));
+    const visibleProviders = rows.filter((r) => !registry.isProviderDraining(String(r.id)));
+
+    const providers = visibleProviders.map((r) => {
+      const providerId = String(r.id);
+      const keyIdRows = db
+        .prepare(`SELECT id FROM provider_keys WHERE provider_id = ?`)
+        .all(providerId) as Array<{ id: string }>;
+      const keysCount = keyIdRows.filter((k) => !registry.isKeyDraining(k.id)).length;
+
+      const modelsRow = db
+        .prepare(`SELECT COUNT(*) AS count FROM models WHERE provider_id = ? AND active = 1`)
+        .get(providerId) as { count: number | bigint } | undefined;
+      const modelsCount = Number(modelsRow?.count ?? 0);
+
+      return formatProviderSummaryRow(r, keysCount, modelsCount, isAdmin);
+    });
 
     return c.json({ providers });
+  });
+
+  app.delete('/api/providers/:id', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const providerId = c.req.param('id');
+    if (registry.isProviderDraining(providerId)) {
+      return c.json({ error: `Provider "${providerId}" not found.` }, 404);
+    }
+
+    const existing = db
+      .prepare(`SELECT id, name FROM providers WHERE id = ?`)
+      .get(providerId) as { id: string; name: string } | undefined;
+
+    if (!existing) {
+      return c.json({ error: `Provider "${providerId}" not found.` }, 404);
+    }
+
+    const keyRows = db
+      .prepare(`SELECT id FROM provider_keys WHERE provider_id = ?`)
+      .all(providerId) as Array<{ id: string }>;
+    const keyIds = keyRows.map((k) => k.id);
+
+    // Prevent any new request from matching this provider immediately
+    db.prepare(`UPDATE providers SET enabled = 0 WHERE id = ?`).run(providerId);
+
+    const { draining } = registry.drainAndRemoveProvider(providerId, keyIds, () => {
+      db.prepare(`DELETE FROM providers WHERE id = ?`).run(providerId);
+    });
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Provider "${existing.name}" (${providerId}) removed${draining ? ' (draining in-flight requests)' : ''}`,
+      { providerId, draining },
+      nowSeconds(),
+    );
+
+    return c.json({ ok: true, draining });
+  });
+
+  // --- Encrypted Provider Keys Vault & Graceful Key Removal (HU-07, HU-10) ---
+
+  app.get('/api/providers/:id/keys', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const providerId = c.req.param('id');
+    if (registry.isProviderDraining(providerId)) {
+      return c.json({ error: `Provider "${providerId}" not found.` }, 404);
+    }
+
+    const prov = db
+      .prepare(`SELECT id FROM providers WHERE id = ?`)
+      .get(providerId) as { id: string } | undefined;
+    if (!prov) {
+      return c.json({ error: `Provider "${providerId}" not found.` }, 404);
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT id, provider_id, label, last4, node_id, forced_node,
+                daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
+                status, last_error, created_at
+         FROM provider_keys
+         WHERE provider_id = ?
+         ORDER BY created_at ASC`,
+      )
+      .all(providerId) as Array<Record<string, unknown>>;
+
+    const keys = rows
+      .filter((r) => !registry.isKeyDraining(String(r.id)))
+      .map(formatProviderKeyRow);
+
+    return c.json({ keys });
+  });
+
+  app.post('/api/providers/:id/keys', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const providerId = c.req.param('id');
+    if (registry.isProviderDraining(providerId)) {
+      return c.json({ error: `Provider "${providerId}" not found.` }, 404);
+    }
+
+    const prov = db
+      .prepare(`SELECT id, name FROM providers WHERE id = ?`)
+      .get(providerId) as { id: string; name: string } | undefined;
+    if (!prov) {
+      return c.json({ error: `Provider "${providerId}" not found.` }, 404);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const label = typeof body.label === 'string' ? body.label.trim() : '';
+    const rawSecret = typeof body.secret === 'string' ? body.secret.trim() : '';
+
+    if (!label || label.length > 100) {
+      return c.json({ error: 'Key label must be between 1 and 100 characters.' }, 400);
+    }
+    if (rawSecret.length < 4) {
+      return c.json({ error: 'API key secret must be at least 4 characters.' }, 400);
+    }
+
+    let dailyQuotaLimit: number | null = null;
+    if (body.dailyQuotaLimit !== undefined && body.dailyQuotaLimit !== null) {
+      const parsedLimit = Number(body.dailyQuotaLimit);
+      if (!Number.isInteger(parsedLimit) || parsedLimit <= 0) {
+        return c.json({ error: 'dailyQuotaLimit must be a positive integer.' }, 400);
+      }
+      dailyQuotaLimit = parsedLimit;
+    }
+
+    let assignedNodeId: string | null = null;
+    let forcedNode = 0;
+
+    if (typeof body.nodeId === 'string' && body.nodeId.trim().length > 0) {
+      const targetNodeId = body.nodeId.trim();
+      const nodeRow = db
+        .prepare(`SELECT id FROM nodes WHERE id = ?`)
+        .get(targetNodeId) as { id: string } | undefined;
+      if (!nodeRow) {
+        return c.json({ error: `Node "${targetNodeId}" not found.` }, 400);
+      }
+      assignedNodeId = targetNodeId;
+      forcedNode = body.forcedNode ? 1 : 0;
+    } else {
+      // Auto-assign to online node with fewest keys for this provider
+      const autoNode = db
+        .prepare(
+          `SELECT n.id,
+                  (SELECT COUNT(*) FROM provider_keys pk WHERE pk.node_id = n.id AND pk.provider_id = ?) AS prov_keys,
+                  (SELECT COUNT(*) FROM provider_keys pk WHERE pk.node_id = n.id) AS total_keys
+           FROM nodes n
+           WHERE n.status = 'online'
+           ORDER BY prov_keys ASC, total_keys ASC, n.created_at ASC
+           LIMIT 1`,
+        )
+        .get(providerId) as { id: string } | undefined;
+
+      if (autoNode) {
+        assignedNodeId = autoNode.id;
+      }
+    }
+
+    const keyId = randomUUID();
+    const last4 = rawSecret.slice(-4);
+    const encryptedSecret = encryptSecret(rawSecret, masterKey);
+    const createdAt = nowSeconds();
+
+    db.prepare(
+      `INSERT INTO provider_keys (
+         id, provider_id, label, encrypted_secret, last4,
+         node_id, forced_node, daily_quota_limit,
+         ratelimit_remaining, ratelimit_reset_at,
+         status, last_error, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'active', NULL, ?)`,
+    ).run(
+      keyId,
+      providerId,
+      label,
+      encryptedSecret,
+      last4,
+      assignedNodeId,
+      forcedNode,
+      dailyQuotaLimit,
+      createdAt,
+    );
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Key "${label}" (…${last4}) registered on provider "${providerId}"`,
+      { providerId, keyId, last4, nodeId: assignedNodeId },
+      createdAt,
+    );
+
+    const inserted = db
+      .prepare(
+        `SELECT id, provider_id, label, last4, node_id, forced_node,
+                daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
+                status, last_error, created_at
+         FROM provider_keys
+         WHERE id = ?`,
+      )
+      .get(keyId) as Record<string, unknown>;
+
+    return c.json({ key: formatProviderKeyRow(inserted) }, 201);
+  });
+
+  app.delete('/api/providers/:id/keys/:keyId', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const providerId = c.req.param('id');
+    const keyId = c.req.param('keyId');
+
+    if (registry.isKeyDraining(keyId)) {
+      return c.json({ error: 'Provider key not found.' }, 404);
+    }
+
+    const existing = db
+      .prepare(`SELECT id, label, last4 FROM provider_keys WHERE id = ? AND provider_id = ?`)
+      .get(keyId, providerId) as { id: string; label: string; last4: string } | undefined;
+
+    if (!existing) {
+      return c.json({ error: 'Provider key not found.' }, 404);
+    }
+
+    const { draining } = registry.drainAndRemoveKey(keyId, () => {
+      db.prepare(`DELETE FROM provider_keys WHERE id = ? AND provider_id = ?`).run(
+        keyId,
+        providerId,
+      );
+    });
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Key "${existing.label}" (…${existing.last4}) removed from provider "${providerId}"${draining ? ' (draining in-flight requests)' : ''}`,
+      { providerId, keyId, last4: existing.last4, draining },
+      nowSeconds(),
+    );
+
+    return c.json({ ok: true, draining });
+  });
+
+  // --- Detect & Reload Provider Models (HU-06b, HU-06c) ---
+
+  const handleModelSync = async (providerId: string) => {
+    return syncProviderModels({
+      db,
+      masterKey,
+      providerId,
+      drainingKeys: registry.getDrainingKeys(),
+      drainingProviders: registry.getDrainingProviders(),
+      fetchImpl,
+      nowSec: nowSeconds(),
+    });
+  };
+
+  app.post('/api/providers/:id/detect-models', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    try {
+      const diff = await handleModelSync(c.req.param('id'));
+      return c.json(diff);
+    } catch (err) {
+      if (err instanceof ModelSyncHttpError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/providers/:id/reload-models', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    try {
+      const diff = await handleModelSync(c.req.param('id'));
+      return c.json(diff);
+    } catch (err) {
+      if (err instanceof ModelSyncHttpError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.get('/api/models', (c) => {
+    const user = c.get('user');
+
+    const rows =
+      user.role === 'admin'
+        ? (db
+            .prepare(
+              `SELECT m.*
+               FROM models m
+               JOIN providers p ON p.id = m.provider_id
+               WHERE m.active = 1 AND p.enabled = 1
+               ORDER BY m.full_id ASC`,
+            )
+            .all() as Array<Record<string, unknown>>)
+        : (db
+            .prepare(
+              `SELECT DISTINCT m.*
+               FROM models m
+               JOIN providers p ON p.id = m.provider_id
+               JOIN user_model_access uma
+                 ON uma.user_id = ?
+                AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*')
+               WHERE m.active = 1 AND p.enabled = 1
+               ORDER BY m.full_id ASC`,
+            )
+            .all(user.id) as Array<Record<string, unknown>>);
+
+    const models = rows
+      .filter((r) => !registry.isProviderDraining(String(r.provider_id)))
+      .map(formatModelRow);
+
+    return c.json({ models });
   });
 
   // --- Internal API Keys sk-bf-... (HU-03b) ---
@@ -542,7 +1208,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     return c.json({ error: 'Not Found' }, 404);
   });
 
-  // --- OpenAI-Compatible API /v1/* (HU-03b) ---
+  // --- OpenAI-Compatible API /v1/* (HU-03b, HU-09, HU-10) ---
 
   app.use('/v1/*', async (c, next) => {
     const authHeader = c.req.header('authorization') ?? '';
@@ -558,7 +1224,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       );
     }
 
-    const rawKey = match[1];
+    const rawKey = match[1]!;
     const keyHash = sha256Hex(rawKey);
 
     const row = db
@@ -693,15 +1359,17 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
             )
             .all(user.id) as Array<Record<string, unknown>>);
 
-    const data = rows.map((m) => ({
-      id: String(m.full_id),
-      object: 'model' as const,
-      created:
-        m.upstream_created_at !== null && m.upstream_created_at !== undefined
-          ? Number(m.upstream_created_at)
-          : Number(m.first_seen_at),
-      owned_by: String(m.provider_id),
-    }));
+    const data = rows
+      .filter((m) => !registry.isProviderDraining(String(m.provider_id)))
+      .map((m) => ({
+        id: String(m.full_id),
+        object: 'model' as const,
+        created:
+          m.upstream_created_at !== null && m.upstream_created_at !== undefined
+            ? Number(m.upstream_created_at)
+            : Number(m.first_seen_at),
+        owned_by: String(m.provider_id),
+      }));
 
     return c.json({
       object: 'list',
@@ -726,8 +1394,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       );
     }
 
-    const modelId = typeof body.model === 'string' ? body.model.trim() : '';
-    if (!modelId) {
+    const requestedModel = typeof body.model === 'string' ? body.model.trim() : '';
+    if (!requestedModel) {
       return c.json(
         openAiError(
           'Missing required parameter: "model".',
@@ -759,12 +1427,12 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
            WHERE user_id = ? AND (model_full_id = ? OR model_full_id = '*')
            LIMIT 1`,
         )
-        .get(user.id, modelId) as { allowed: number } | undefined;
+        .get(user.id, requestedModel) as { allowed: number } | undefined;
 
       if (!accessRow) {
         return c.json(
           openAiError(
-            `You do not have access to model "${modelId}".`,
+            `You do not have access to model "${requestedModel}".`,
             'permission_error',
             'model_not_allowed',
             'model',
@@ -776,17 +1444,19 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     const modelRow = db
       .prepare(
-        `SELECT m.full_id, m.provider_id
+        `SELECT m.full_id, m.model_id, m.provider_id
          FROM models m
          JOIN providers p ON p.id = m.provider_id
          WHERE m.full_id = ? AND m.active = 1 AND p.enabled = 1`,
       )
-      .get(modelId) as { full_id: string; provider_id: string } | undefined;
+      .get(requestedModel) as
+      | { full_id: string; model_id: string; provider_id: string }
+      | undefined;
 
-    if (!modelRow) {
+    if (!modelRow || registry.isProviderDraining(modelRow.provider_id)) {
       return c.json(
         openAiError(
-          `No active provider or model is configured for "${modelId}" yet.`,
+          `No active provider or model is configured for "${requestedModel}" yet.`,
           'invalid_request_error',
           'model_not_found',
           'model',
@@ -795,34 +1465,33 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       );
     }
 
-    const activeKeyRow = db
-      .prepare(
-        `SELECT id
-         FROM provider_keys
-         WHERE provider_id = ? AND status = 'active'
-         LIMIT 1`,
-      )
-      .get(modelRow.provider_id) as { id: string } | undefined;
+    const providerRow = db
+      .prepare(`SELECT * FROM providers WHERE id = ? AND enabled = 1`)
+      .get(modelRow.provider_id) as Record<string, unknown> | undefined;
 
-    if (!activeKeyRow) {
+    if (!providerRow) {
       return c.json(
         openAiError(
-          `Provider "${modelRow.provider_id}" has no active API keys configured yet.`,
+          `Provider "${modelRow.provider_id}" is not enabled.`,
           'service_unavailable',
-          'no_provider_keys',
+          'provider_unavailable',
         ),
         503,
       );
     }
 
-    return c.json(
-      openAiError(
-        `Upstream forwarding for provider "${modelRow.provider_id}" is not yet configured.`,
-        'service_unavailable',
-        'provider_unavailable',
-      ),
-      503,
-    );
+    return executeChatCompletions({
+      db,
+      masterKey,
+      registry,
+      fetchImpl,
+      now,
+      userId: user.id,
+      modelFullId: modelRow.full_id,
+      modelId: modelRow.model_id,
+      providerRow,
+      requestBody: body,
+    });
   });
 
   app.all('/v1/*', (c) => {
