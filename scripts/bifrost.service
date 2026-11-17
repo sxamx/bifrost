@@ -1,0 +1,39 @@
+[Unit]
+Description=Bifrost Self-Hosted AI Gateway and Quota Router
+Documentation=https://github.com/sxamx/bifrost
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bifrost
+Group=bifrost
+WorkingDirectory=/opt/bifrost/core
+Environment=NODE_ENV=production
+Environment=PORT=8080
+Environment=DATA_DIR=/var/lib/bifrost
+Environment=PANEL_DIST_DIR=/opt/bifrost/panel/dist
+EnvironmentFile=-/etc/default/bifrost
+ExecStart=/usr/bin/env node /opt/bifrost/core/dist/index.js
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bifrost
+
+# Systemd security hardening (V8 JIT-compatible)
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/bifrost
+ReadOnlyPaths=/opt/bifrost
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "1.0",
+  "id": "custom-adapter",
+  "name": "Custom Experimental Adapter",
+  "category": "experimental-adapter",
+  "packageType": "experimental-adapter",
+  "verified": false,
+  "publishedAt": "2026-11-17",
+  "baseUrl": "http://127.0.0.1:3100/v1",
+  "auth": {
+    "type": "bearer",
+    "header": "Authorization",
+    "prefix": "Bearer "
+  },
+  "modelsSource": "static",
+  "staticModels": [
+    {
+      "id": "deepseek-r1-session",
+      "name": "DeepSeek R1 (Experimental Adapter)",
+      "canonicalModelId": "deepseek/deepseek-r1",
+      "contextLength": 65536,
+      "maxOutput": 8192
+    }
+  ],
+  "reviewedAt": "2026-11-17",
+  "adapter": {
+    "defaultPort": 3100,
+    "healthPath": "/health",
+    "accountLabel": "Token de sesión"
+  }
+}
