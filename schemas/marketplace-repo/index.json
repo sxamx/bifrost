@@ -1,0 +1,73 @@
+{
+  "schemaVersion": "1.0",
+  "repository": "sxamx/bifrost-providers",
+  "updatedAt": "2026-11-17",
+  "providers": [
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "description": "Agregador compatible con OpenAI con detección automática de modelos :free verificados.",
+      "category": "aggregator",
+      "packageType": "official-json",
+      "verified": true,
+      "approved": true,
+      "publishedAt": "2026-11-17",
+      "manifestPath": "providers/openrouter.json"
+    },
+    {
+      "id": "nvidia-nim",
+      "name": "NVIDIA NIM",
+      "description": "Catálogo oficial de microservicios de inferencia NVIDIA NIM con créditos gratuitos.",
+      "category": "official-api",
+      "packageType": "official-json",
+      "verified": true,
+      "approved": true,
+      "publishedAt": "2026-11-17",
+      "manifestPath": "providers/nvidia-nim.json"
+    },
+    {
+      "id": "opencode-zen",
+      "name": "OpenCode Zen",
+      "description": "Endpoint OpenAI-compatible de OpenCode Zen con filtrado automático de modelos -free.",
+      "category": "official-api",
+      "packageType": "official-json",
+      "verified": true,
+      "approved": true,
+      "publishedAt": "2026-11-17",
+      "manifestPath": "providers/opencode-zen.json"
+    },
+    {
+      "id": "google-ai-studio",
+      "name": "Google AI Studio (Gemini OpenAI API)",
+      "description": "API oficial compatible con OpenAI de Google Gemini (capa gratuita de AI Studio).",
+      "category": "official-api",
+      "packageType": "official-json",
+      "verified": true,
+      "approved": true,
+      "publishedAt": "2026-11-17",
+      "manifestPath": "providers/google-ai-studio.json"
+    },
+    {
+      "id": "groq",
+      "name": "Groq Cloud",
+      "description": "Inferencia LPU ultrarrápida con capa gratuita para modelos abiertos en Groq Cloud.",
+      "category": "official-api",
+      "packageType": "official-json",
+      "verified": true,
+      "approved": true,
+      "publishedAt": "2026-11-17",
+      "manifestPath": "providers/groq.json"
+    },
+    {
+      "id": "experimental-sidecar-template",
+      "name": "Adaptador Experimental Sidecar (Plantilla)",
+      "description": "Plantilla declarativa para adaptadores experimentales aislados en proceso/contenedor externo.",
+      "category": "experimental-adapter",
+      "packageType": "experimental-adapter",
+      "verified": false,
+      "approved": true,
+      "publishedAt": "2026-11-17",
+      "manifestPath": "providers/experimental-sidecar-template.json"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1.0",
+  "id": "groq",
+  "name": "Groq Cloud",
+  "category": "official-api",
+  "packageType": "official-json",
+  "verified": true,
+  "publishedAt": "2026-11-17",
+  "baseUrl": "https://api.groq.com/openai/v1",
+  "auth": {
+    "type": "bearer",
+    "header": "Authorization",
+    "prefix": "Bearer "
+  },
+  "modelsSource": "api",
+  "modelsEndpoint": "/models"
+}

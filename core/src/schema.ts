@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { validateProviderTargetUrl } from './url-security.js';
 
 export type ProviderPackageType = 'official-json' | 'experimental-adapter';
 export type ProviderModelsSource = 'api' | 'static';
@@ -221,8 +222,17 @@ export function validateAgainstSchema(
 
 function validateProviderSemantics(manifest: Record<string, unknown>): string[] {
   const errors: string[] = [];
-  if (typeof manifest.baseUrl === 'string' && !isValidHttpUri(manifest.baseUrl)) {
-    errors.push('$.baseUrl: must be an http:// or https:// URI');
+  if (typeof manifest.baseUrl === 'string') {
+    if (!isValidHttpUri(manifest.baseUrl)) {
+      errors.push('$.baseUrl: must be an http:// or https:// URI');
+    } else {
+      const pkgType: ProviderPackageType =
+        manifest.packageType === 'experimental-adapter' ? 'experimental-adapter' : 'official-json';
+      const urlCheck = validateProviderTargetUrl(manifest.baseUrl, pkgType, 'baseUrl');
+      if (!urlCheck.valid) {
+        errors.push(`$.baseUrl: ${urlCheck.error ?? 'forbidden target URL'}`);
+      }
+    }
   }
   if (manifest.modelsSource === 'static') {
     if (!manifest.reviewedAt) {

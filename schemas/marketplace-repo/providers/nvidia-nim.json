@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1.0",
+  "id": "nvidia-nim",
+  "name": "NVIDIA NIM",
+  "category": "official-api",
+  "packageType": "official-json",
+  "verified": true,
+  "publishedAt": "2026-11-17",
+  "baseUrl": "https://integrate.api.nvidia.com/v1",
+  "auth": {
+    "type": "bearer",
+    "header": "Authorization",
+    "prefix": "Bearer "
+  },
+  "modelsSource": "api",
+  "modelsEndpoint": "/models"
+}

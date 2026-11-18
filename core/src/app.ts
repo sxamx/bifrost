@@ -37,6 +37,13 @@ import {
   round2,
 } from './metrics/index.js';
 import {
+  fetchRemoteMarketplaceCatalog,
+  isKnownUnapprovedMarketplaceId,
+  readCachedOrBundledMarketplaceCatalog,
+  stripMarketplaceWrapperFields,
+  validateProviderTargetUrl,
+} from './marketplace.js';
+import {
   ModelSyncHttpError,
   formatModelRow,
   runModelsAutoSyncTick,
@@ -588,76 +595,22 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     });
   });
 
-  // --- Marketplace & Provider Installation (HU-06) ---
+  // --- Marketplace & Provider Installation (HU-06, HU-23, HU-24) ---
 
-  const loadCachedOrSeedCatalog = (): ProviderManifest[] => {
-    const cachedRow = db
-      .prepare(`SELECT payload_json FROM external_cache WHERE cache_key = 'marketplace:index'`)
-      .get() as { payload_json: string } | undefined;
-
-    if (cachedRow?.payload_json) {
-      try {
-        const parsed = JSON.parse(cachedRow.payload_json) as unknown[];
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed as ProviderManifest[];
-        }
-      } catch {
-        // Fall through to seed manifests
-      }
-    }
-
-    return loadSeedManifests(resolvedSchemasDir);
-  };
+  const loadCachedOrSeedCatalog = () =>
+    readCachedOrBundledMarketplaceCatalog(db, resolvedSchemasDir);
 
   app.get('/api/marketplace', async (c) => {
     const nowSec = nowSeconds();
 
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4000);
-      let res: Response;
-      try {
-        res = await fetchImpl(marketplaceUrl, {
-          method: 'GET',
-          headers: { Accept: 'application/json' },
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-
-      if (!res.ok) {
-        throw new Error(`Marketplace HTTP ${res.status}`);
-      }
-
-      const rawJson = (await res.json()) as unknown;
-      let rawItems: unknown[] = [];
-      if (Array.isArray(rawJson)) {
-        rawItems = rawJson;
-      } else if (rawJson && typeof rawJson === 'object') {
-        const rec = rawJson as Record<string, unknown>;
-        if (Array.isArray(rec.providers)) rawItems = rec.providers;
-        else if (Array.isArray(rec.manifests)) rawItems = rec.manifests;
-        else if (Array.isArray(rec.items)) rawItems = rec.items;
-        else if (Array.isArray(rec.catalog)) rawItems = rec.catalog;
-      }
-
-      const validManifests: ProviderManifest[] = [];
-      for (const item of rawItems) {
-        const check = validateProviderManifest(item, resolvedSchemasDir);
-        if (check.valid && check.manifest) {
-          validManifests.push(check.manifest);
-        }
-      }
-
-      db.prepare(
-        `INSERT INTO external_cache (cache_key, payload_json, etag, fetched_at)
-         VALUES ('marketplace:index', ?, ?, ?)
-         ON CONFLICT(cache_key) DO UPDATE SET
-           payload_json = excluded.payload_json,
-           etag = excluded.etag,
-           fetched_at = excluded.fetched_at`,
-      ).run(JSON.stringify(validManifests), res.headers.get('etag'), nowSec);
+      const { manifests: validManifests } = await fetchRemoteMarketplaceCatalog({
+        db,
+        marketplaceUrl,
+        schemasDir: resolvedSchemasDir,
+        fetchImpl,
+        nowSec,
+      });
 
       return c.json({
         online: true,
@@ -693,26 +646,52 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         ? body.adapterUrl.trim()
         : undefined;
 
+    if (body.approved === false) {
+      return {
+        status: 403 as const,
+        payload: { error: 'Unapproved marketplace packages cannot be installed.' },
+      };
+    }
+
     if (body.manifest && typeof body.manifest === 'object' && !Array.isArray(body.manifest)) {
-      candidateManifest = body.manifest;
+      const rawM = body.manifest as Record<string, unknown>;
+      if (rawM.approved === false) {
+        return {
+          status: 403 as const,
+          payload: { error: 'Unapproved marketplace packages cannot be installed.' },
+        };
+      }
+      if (allowCatalogIdLookup && typeof rawM.id === 'string' && isKnownUnapprovedMarketplaceId(db, rawM.id)) {
+        return {
+          status: 403 as const,
+          payload: { error: `Provider "${rawM.id}" is not approved in the marketplace catalog.` },
+        };
+      }
+      candidateManifest = allowCatalogIdLookup ? stripMarketplaceWrapperFields(rawM) : rawM;
     } else if (
       allowCatalogIdLookup &&
       typeof (body.id ?? body.providerId) === 'string' &&
       !('schemaVersion' in body) &&
       !('baseUrl' in body)
     ) {
-      const targetId = String(body.id ?? body.providerId);
+      const targetId = String(body.id ?? body.providerId).trim();
+      if (isKnownUnapprovedMarketplaceId(db, targetId)) {
+        return {
+          status: 403 as const,
+          payload: { error: `Provider "${targetId}" is not approved in the marketplace catalog.` },
+        };
+      }
       const catalog = loadCachedOrSeedCatalog();
       const found = catalog.find((m) => m.id === targetId);
       if (!found) {
         return {
           status: 404 as const,
-          payload: { error: `Provider "${targetId}" was not found in the marketplace catalog.` },
+          payload: { error: `Provider "${targetId}" was not found in the approved marketplace catalog.` },
         };
       }
-      candidateManifest = found;
+      candidateManifest = stripMarketplaceWrapperFields(found as unknown as Record<string, unknown>);
     } else {
-      candidateManifest = body;
+      candidateManifest = allowCatalogIdLookup ? stripMarketplaceWrapperFields(body) : body;
     }
 
     const validation = validateProviderManifest(candidateManifest, resolvedSchemasDir);
@@ -729,17 +708,24 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     const manifest = validation.manifest;
     let adapterUrl: string | null = null;
     if (manifest.packageType === 'experimental-adapter') {
-      if (rawAdapterUrl) {
-        if (!isValidHttpUri(rawAdapterUrl)) {
-          return {
-            status: 400 as const,
-            payload: { error: 'adapterUrl must be a valid http:// or https:// URL.' },
-          };
-        }
-        adapterUrl = rawAdapterUrl;
-      } else {
-        adapterUrl = manifest.baseUrl;
+      const targetAdapterUrl = rawAdapterUrl ?? manifest.baseUrl;
+      const adapterCheck = validateProviderTargetUrl(
+        targetAdapterUrl,
+        'experimental-adapter',
+        'adapterUrl',
+      );
+      if (!adapterCheck.valid || !adapterCheck.normalizedUrl) {
+        return {
+          status: 400 as const,
+          payload: { error: adapterCheck.error ?? 'Invalid adapterUrl.' },
+        };
       }
+      adapterUrl = adapterCheck.normalizedUrl;
+    } else if (rawAdapterUrl !== undefined) {
+      return {
+        status: 400 as const,
+        payload: { error: 'adapterUrl is only allowed for experimental-adapter packages.' },
+      };
     }
 
     const existing = db
@@ -751,6 +737,23 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         status: 409 as const,
         payload: { error: `Provider "${manifest.id}" is already installed.` },
       };
+    }
+
+    let adapterHealth: { reachable: boolean; status: number | null } | undefined;
+    if (
+      manifest.packageType === 'experimental-adapter' &&
+      adapterUrl &&
+      body.checkAdapterHealth === true &&
+      manifest.adapter?.healthPath
+    ) {
+      try {
+        const parsedAdapter = new URL(adapterUrl);
+        const healthUrl = new URL(manifest.adapter.healthPath, parsedAdapter.origin).href;
+        const hRes = await fetchImpl(healthUrl, { method: 'GET', redirect: 'error' });
+        adapterHealth = { reachable: hRes.ok, status: hRes.status };
+      } catch {
+        adapterHealth = { reachable: false, status: null };
+      }
     }
 
     const createdAt = nowSeconds();
@@ -778,6 +781,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         providerId: manifest.id,
         packageType: manifest.packageType,
         modelsSource: manifest.modelsSource,
+        ...(adapterUrl ? { adapterUrl } : {}),
       },
       createdAt,
     );
@@ -790,6 +794,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       status: 201 as const,
       payload: {
         provider: formatProviderSummaryRow(insertedRow, 0, 0, true),
+        ...(adapterHealth ? { adapterHealth } : {}),
       },
     };
   };
