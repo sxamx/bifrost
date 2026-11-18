@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "1.0",
+  "id": "experimental-sidecar-template",
+  "name": "Adaptador Experimental Sidecar (Plantilla)",
+  "category": "experimental-adapter",
+  "packageType": "experimental-adapter",
+  "verified": false,
+  "publishedAt": "2026-11-17",
+  "baseUrl": "http://127.0.0.1:3100/v1",
+  "auth": {
+    "type": "bearer",
+    "header": "Authorization",
+    "prefix": "Bearer "
+  },
+  "modelsSource": "static",
+  "reviewedAt": "2026-11-17",
+  "staticModels": [
+    {
+      "id": "sidecar-chat-free",
+      "name": "Sidecar Chat (Experimental)",
+      "contextLength": 65536,
+      "maxOutput": 8192
+    }
+  ],
+  "adapter": {
+    "defaultPort": 3100,
+    "healthPath": "/health",
+    "accountLabel": "Token de sesión"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "1.0",
+  "id": "opencode-zen",
+  "name": "OpenCode Zen",
+  "category": "official-api",
+  "packageType": "official-json",
+  "verified": true,
+  "publishedAt": "2026-11-17",
+  "baseUrl": "https://opencode.ai/zen/v1",
+  "auth": {
+    "type": "bearer",
+    "header": "Authorization",
+    "prefix": "Bearer "
+  },
+  "modelsSource": "api",
+  "modelsEndpoint": "/models",
+  "freeRule": {
+    "idSuffix": "-free"
+  }
+}
