@@ -241,9 +241,11 @@ function recordUsageLog(
     createdAt: number;
   },
 ): void {
+  const outputTokens =
+    entry.completionTokens > 0 ? entry.completionTokens : entry.reasoningTokens;
   const tokensPerSec =
-    entry.durationMs > 0 && entry.completionTokens > 0
-      ? Number(((entry.completionTokens * 1000) / entry.durationMs).toFixed(2))
+    entry.durationMs > 0 && outputTokens > 0
+      ? Number(((outputTokens * 1000) / entry.durationMs).toFixed(2))
       : null;
 
   db.prepare(
@@ -268,6 +270,210 @@ function recordUsageLog(
     entry.errorType,
     entry.createdAt,
   );
+}
+
+/**
+ * HU-17 & HU-05: Enforces daily token quota strictly using the server's UTC clock
+ * (`utc_midnight` or `rolling_24h`), 100% immune to any client Date/Timezone headers.
+ */
+export function checkUserDailyQuotaUtc(
+  db: DatabaseSync,
+  userId: string,
+  nowMs: number,
+):
+  | { exceeded: false }
+  | {
+      exceeded: true;
+      usedTokens: number;
+      dailyTokenLimit: number;
+      resetAtIso: string;
+      retryAfterSec: number;
+      response: Response;
+    } {
+  const userRow = db
+    .prepare(`SELECT daily_token_limit, quota_reset_mode FROM users WHERE id = ?`)
+    .get(userId) as
+    | { daily_token_limit: number | bigint | null; quota_reset_mode: string | null }
+    | undefined;
+
+  if (
+    !userRow ||
+    userRow.daily_token_limit === null ||
+    userRow.daily_token_limit === undefined
+  ) {
+    return { exceeded: false };
+  }
+
+  const dailyTokenLimit = Number(userRow.daily_token_limit);
+  const nowSec = Math.floor(nowMs / 1000);
+  let windowStartSec: number;
+  let resetAtMs: number;
+
+  if (userRow.quota_reset_mode === 'rolling_24h') {
+    windowStartSec = nowSec - 86400;
+    const oldestRow = db
+      .prepare(
+        `SELECT MIN(created_at) AS oldest_created_at
+         FROM usage_logs
+         WHERE user_id = ? AND created_at >= ?
+           AND (prompt_tokens + completion_tokens + reasoning_tokens) > 0`,
+      )
+      .get(userId, windowStartSec) as { oldest_created_at: number | bigint | null } | undefined;
+
+    const oldestSec =
+      oldestRow?.oldest_created_at !== null && oldestRow?.oldest_created_at !== undefined
+        ? Number(oldestRow.oldest_created_at)
+        : nowSec;
+    resetAtMs = (oldestSec + 86400) * 1000;
+  } else {
+    const startOfUtcDaySec = Math.floor(nowSec / 86400) * 86400;
+    windowStartSec = startOfUtcDaySec;
+    resetAtMs = (startOfUtcDaySec + 86400) * 1000;
+  }
+
+  const usageRow = db
+    .prepare(
+      `SELECT COALESCE(SUM(prompt_tokens + completion_tokens + reasoning_tokens), 0) AS used_tokens
+       FROM usage_logs
+       WHERE user_id = ? AND created_at >= ?`,
+    )
+    .get(userId, windowStartSec) as { used_tokens: number | bigint } | undefined;
+
+  const usedTokens = Number(usageRow?.used_tokens ?? 0);
+  if (usedTokens < dailyTokenLimit) {
+    return { exceeded: false };
+  }
+
+  const resetAtIso = new Date(resetAtMs).toISOString();
+  const retryAfterSec = Math.max(1, Math.ceil((resetAtMs - nowMs) / 1000));
+  const message = `Daily token quota exceeded (${usedTokens}/${dailyTokenLimit} tokens used). Quota resets at ${resetAtIso}.`;
+
+  const response = new Response(
+    JSON.stringify({
+      error: {
+        message,
+        type: 'quota_exceeded',
+        param: null,
+        code: 'daily_quota_exceeded',
+        reset_at: resetAtIso,
+      },
+      reset_at: resetAtIso,
+    }),
+    {
+      status: 429,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Retry-After': String(retryAfterSec),
+      },
+    },
+  );
+
+  return {
+    exceeded: true,
+    usedTokens,
+    dailyTokenLimit,
+    resetAtIso,
+    retryAfterSec,
+    response,
+  };
+}
+
+function detectRequestContractFlags(requestBody: Record<string, unknown>): {
+  usesTools: boolean;
+  requiresToolCall: boolean;
+  usesStructuredOutput: boolean;
+} {
+  const usesTools =
+    (Array.isArray(requestBody.tools) && requestBody.tools.length > 0) ||
+    (Array.isArray(requestBody.functions) && requestBody.functions.length > 0);
+  const tc = requestBody.tool_choice;
+  const requiresToolCall =
+    usesTools && (tc === 'required' || (tc !== null && typeof tc === 'object'));
+
+  const rf = requestBody.response_format;
+  const rfType =
+    rf !== null && typeof rf === 'object' ? (rf as Record<string, unknown>).type : undefined;
+  const usesStructuredOutput = rfType === 'json_object' || rfType === 'json_schema';
+
+  return { usesTools, requiresToolCall, usesStructuredOutput };
+}
+
+function classifyFailureErrorType(
+  baseErrorType: string,
+  flags: { usesTools: boolean; usesStructuredOutput: boolean },
+): string {
+  if (baseErrorType === 'rate_limit') {
+    return 'rate_limit';
+  }
+  if (flags.usesTools) {
+    return 'tool_error';
+  }
+  if (flags.usesStructuredOutput) {
+    return 'structured_error';
+  }
+  return baseErrorType;
+}
+
+function isValidJsonText(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function classifyPayloadContractError(
+  data: Record<string, unknown>,
+  flags: { usesTools: boolean; requiresToolCall: boolean; usesStructuredOutput: boolean },
+): 'tool_error' | 'structured_error' | null {
+  const choices = Array.isArray(data.choices) ? data.choices : [];
+  const choice0 =
+    choices.length > 0 && choices[0] && typeof choices[0] === 'object'
+      ? (choices[0] as Record<string, unknown>)
+      : null;
+  const message =
+    choice0?.message && typeof choice0.message === 'object'
+      ? (choice0.message as Record<string, unknown>)
+      : null;
+
+  const toolCalls = Array.isArray(message?.tool_calls)
+    ? (message.tool_calls as Array<Record<string, unknown>>)
+    : [];
+
+  if (toolCalls.length > 0) {
+    for (const tc of toolCalls) {
+      const fn =
+        tc && typeof tc.function === 'object' && tc.function !== null
+          ? (tc.function as Record<string, unknown>)
+          : null;
+      const fnName = typeof fn?.name === 'string' ? fn.name.trim() : '';
+      const fnArgs = fn?.arguments;
+      if (!fnName || typeof fnArgs !== 'string' || !isValidJsonText(fnArgs)) {
+        return 'tool_error';
+      }
+    }
+  } else if (message?.function_call && typeof message.function_call === 'object') {
+    const fc = message.function_call as Record<string, unknown>;
+    const fnName = typeof fc.name === 'string' ? fc.name.trim() : '';
+    const fnArgs = fc.arguments;
+    if (!fnName || typeof fnArgs !== 'string' || !isValidJsonText(fnArgs)) {
+      return 'tool_error';
+    }
+  } else if (flags.requiresToolCall) {
+    return 'tool_error';
+  }
+
+  if (flags.usesStructuredOutput && toolCalls.length === 0) {
+    const content = typeof message?.content === 'string' ? message.content : '';
+    if (!isValidJsonText(content)) {
+      return 'structured_error';
+    }
+  }
+
+  return null;
 }
 
 function loadCandidateKeys(
@@ -359,6 +565,15 @@ export async function executeChatCompletions(options: {
     requestBody,
   } = options;
 
+  const startMs = now();
+  const nowSec = Math.floor(startMs / 1000);
+
+  // Enforce server-side UTC daily token quota before any upstream execution (HU-17, HU-05)
+  const quotaCheck = checkUserDailyQuotaUtc(db, userId, startMs);
+  if (quotaCheck.exceeded) {
+    return quotaCheck.response;
+  }
+
   const providerId = String(providerRow.id);
   if (registry.isProviderDraining(providerId)) {
     return openAiErrorJson(
@@ -369,6 +584,8 @@ export async function executeChatCompletions(options: {
     );
   }
 
+  const contractFlags = detectRequestContractFlags(requestBody);
+
   const manifest = JSON.parse(String(providerRow.schema_json)) as ProviderManifest;
   const effectiveBaseUrl =
     providerRow.package_type === 'experimental-adapter' &&
@@ -378,8 +595,6 @@ export async function executeChatCompletions(options: {
       : manifest.baseUrl;
 
   const chatUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/chat/completions`;
-  const startMs = now();
-  const nowSec = Math.floor(startMs / 1000);
 
   const candidates = loadCandidateKeys(db, providerId, registry, nowSec);
   if (candidates.length === 0) {
@@ -526,6 +741,23 @@ export async function executeChatCompletions(options: {
 
         if (!res.ok) {
           const errText = await res.text().catch(() => '');
+          const endMs = now();
+          const endSec = Math.floor(endMs / 1000);
+          recordUsageLog(db, {
+            userId,
+            providerId,
+            providerKeyId: key.id,
+            modelFullId,
+            promptTokens: 0,
+            completionTokens: 0,
+            reasoningTokens: 0,
+            cachedTokens: 0,
+            ttftMs: null,
+            durationMs: Math.max(1, endMs - startMs),
+            status: 'error',
+            errorType: classifyFailureErrorType('upstream', contractFlags),
+            createdAt: endSec,
+          });
           return openAiErrorJson(
             redactSecretsInText(errText || `Upstream returned HTTP ${res.status}`),
             'invalid_request_error',
@@ -535,7 +767,35 @@ export async function executeChatCompletions(options: {
         }
 
         const ttftMs = Math.max(1, now() - startMs);
-        const data = (await res.json()) as Record<string, unknown>;
+        let data: Record<string, unknown>;
+        try {
+          data = (await res.json()) as Record<string, unknown>;
+        } catch {
+          const endMs = now();
+          const endSec = Math.floor(endMs / 1000);
+          recordUsageLog(db, {
+            userId,
+            providerId,
+            providerKeyId: key.id,
+            modelFullId,
+            promptTokens: 0,
+            completionTokens: 0,
+            reasoningTokens: 0,
+            cachedTokens: 0,
+            ttftMs,
+            durationMs: Math.max(1, endMs - startMs),
+            status: 'error',
+            errorType: classifyFailureErrorType('upstream', contractFlags),
+            createdAt: endSec,
+          });
+          return openAiErrorJson(
+            'Upstream provider returned malformed JSON response.',
+            'server_error',
+            'malformed_upstream_json',
+            502,
+          );
+        }
+
         const endMs = now();
         const durationMs = Math.max(1, endMs - startMs);
         const endSec = Math.floor(endMs / 1000);
@@ -562,6 +822,8 @@ export async function executeChatCompletions(options: {
         );
         const cachedTokens = Number(promptDetails.cached_tokens ?? usage.cached_tokens ?? 0);
 
+        const contractError = classifyPayloadContractError(data, contractFlags);
+
         recordUsageLog(db, {
           userId,
           providerId,
@@ -573,8 +835,8 @@ export async function executeChatCompletions(options: {
           cachedTokens,
           ttftMs,
           durationMs,
-          status: 'ok',
-          errorType: null,
+          status: contractError ? 'error' : 'ok',
+          errorType: contractError,
           createdAt: endSec,
         });
 
@@ -583,9 +845,22 @@ export async function executeChatCompletions(options: {
           model: modelFullId,
         };
 
+        const outTokens = completionTokens > 0 ? completionTokens : reasoningTokens;
+        const tps =
+          durationMs > 0 && outTokens > 0
+            ? Number(((outTokens * 1000) / durationMs).toFixed(2))
+            : null;
+        const responseHeaders: Record<string, string> = {
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Bifrost-TTFT-Ms': String(ttftMs),
+        };
+        if (tps !== null) {
+          responseHeaders['X-Bifrost-Tokens-Per-Sec'] = String(tps);
+        }
+
         return new Response(JSON.stringify(responsePayload), {
           status: 200,
-          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          headers: responseHeaders,
         });
       } finally {
         releaseLease();
@@ -603,6 +878,9 @@ export async function executeChatCompletions(options: {
       failSec,
     );
 
+    const baseFailType =
+      lastStatus === 429 ? 'rate_limit' : lastWasNetwork ? 'network' : 'upstream';
+
     recordUsageLog(db, {
       userId,
       providerId,
@@ -615,7 +893,7 @@ export async function executeChatCompletions(options: {
       ttftMs: null,
       durationMs: Math.max(1, failEndMs - startMs),
       status: 'error',
-      errorType: lastStatus === 429 ? 'rate_limit' : lastWasNetwork ? 'network' : 'upstream',
+      errorType: classifyFailureErrorType(baseFailType, contractFlags),
       createdAt: failSec,
     });
 
@@ -632,6 +910,9 @@ export async function executeChatCompletions(options: {
   // =========================================================================
 
   const triedKeyIds = new Set<string>();
+  let lastStreamOpenKeyId: string | null = null;
+  let lastStreamOpenStatus: number | null = null;
+  let nonRetryableStreamFailure: { status: number; message: string; keyId: string } | null = null;
 
   const openStreamWithNextKey = async (
     messagesToSend: Array<Record<string, unknown>>,
@@ -646,6 +927,7 @@ export async function executeChatCompletions(options: {
         continue;
       }
       triedKeyIds.add(key.id);
+      lastStreamOpenKeyId = key.id;
 
       const releaseLease = registry.acquireLease(providerId, key.id);
       try {
@@ -671,6 +953,7 @@ export async function executeChatCompletions(options: {
           });
         } catch (err) {
           releaseLease();
+          lastStreamOpenStatus = null;
           const msg = err instanceof Error ? err.message : String(err);
           const safeMsg = redactSecretsInText(`Network/tunnel error: ${msg}`);
           markKeyFailure(db, key.id, null, safeMsg, null, Math.floor(now() / 1000));
@@ -693,6 +976,7 @@ export async function executeChatCompletions(options: {
 
         if (isRetryableKeyFailureStatus(res.status) || !res.body) {
           const status = res.status;
+          lastStreamOpenStatus = status;
           const errSnippet = await res.text().catch(() => '');
           releaseLease();
           const safeMsg = redactSecretsInText(
@@ -717,7 +1001,13 @@ export async function executeChatCompletions(options: {
         }
 
         if (!res.ok) {
+          const errText = await res.text().catch(() => '');
           releaseLease();
+          nonRetryableStreamFailure = {
+            status: res.status,
+            message: redactSecretsInText(errText || `Upstream returned HTTP ${res.status}`),
+            keyId: key.id,
+          };
           return null;
         }
 
@@ -735,18 +1025,44 @@ export async function executeChatCompletions(options: {
   if (!initialConnection) {
     const failEndMs = now();
     const failSec = Math.floor(failEndMs / 1000);
+    if (nonRetryableStreamFailure !== null) {
+      const nrf: { status: number; message: string; keyId: string } = nonRetryableStreamFailure;
+      recordUsageLog(db, {
+        userId,
+        providerId,
+        providerKeyId: nrf.keyId,
+        modelFullId,
+        promptTokens: 0,
+        completionTokens: 0,
+        reasoningTokens: 0,
+        cachedTokens: 0,
+        ttftMs: null,
+        durationMs: Math.max(1, failEndMs - startMs),
+        status: 'error',
+        errorType: classifyFailureErrorType('upstream', contractFlags),
+        createdAt: failSec,
+      });
+      return openAiErrorJson(
+        nrf.message,
+        'invalid_request_error',
+        'upstream_error',
+        nrf.status,
+      );
+    }
+
     writeSystemLog(
       db,
       'error',
       'failover',
       `All candidate keys failed before starting SSE stream on provider "${providerId}"`,
-      { providerId, triedKeysCount: triedKeyIds.size },
+      { providerId, triedKeysCount: triedKeyIds.size, lastStatus: lastStreamOpenStatus },
       failSec,
     );
+    const baseOpenErr = lastStreamOpenStatus === 429 ? 'rate_limit' : 'upstream';
     recordUsageLog(db, {
       userId,
       providerId,
-      providerKeyId: null,
+      providerKeyId: lastStreamOpenKeyId,
       modelFullId,
       promptTokens: 0,
       completionTokens: 0,
@@ -755,14 +1071,14 @@ export async function executeChatCompletions(options: {
       ttftMs: null,
       durationMs: Math.max(1, failEndMs - startMs),
       status: 'error',
-      errorType: 'upstream',
+      errorType: classifyFailureErrorType(baseOpenErr, contractFlags),
       createdAt: failSec,
     });
     return openAiErrorJson(
       `All configured keys for provider "${providerId}" failed to open stream.`,
-      'service_unavailable',
-      'upstream_unavailable',
-      502,
+      lastStreamOpenStatus === 429 ? 'rate_limit_error' : 'service_unavailable',
+      lastStreamOpenStatus === 429 ? 'upstream_rate_limited' : 'upstream_unavailable',
+      lastStreamOpenStatus === 429 ? 429 : 502,
     );
   }
 
@@ -777,6 +1093,8 @@ export async function executeChatCompletions(options: {
       } | null = initialConnection;
 
       let contentAccumulated = '';
+      let reasoningAccumulated = '';
+      const toolCallsAccumulated = new Map<number, { name: string; args: string }>();
       let ttftMs: number | null = null;
       let promptTokens = 0;
       let completionTokens = 0;
@@ -854,8 +1172,40 @@ export async function executeChatCompletions(options: {
                 choice0.delta && typeof choice0.delta === 'object'
                   ? (choice0.delta as Record<string, unknown>)
                   : null;
-              if (delta && typeof delta.content === 'string' && delta.content.length > 0) {
-                contentAccumulated += delta.content;
+              if (delta) {
+                if (typeof delta.content === 'string' && delta.content.length > 0) {
+                  contentAccumulated += delta.content;
+                }
+                const deltaReasoning =
+                  typeof delta.reasoning_content === 'string'
+                    ? delta.reasoning_content
+                    : typeof delta.reasoning === 'string'
+                      ? delta.reasoning
+                      : '';
+                if (deltaReasoning.length > 0) {
+                  reasoningAccumulated += deltaReasoning;
+                }
+                if (Array.isArray(delta.tool_calls)) {
+                  for (let tcIdx = 0; tcIdx < delta.tool_calls.length; tcIdx++) {
+                    const tcRaw = delta.tool_calls[tcIdx];
+                    if (tcRaw && typeof tcRaw === 'object') {
+                      const tcObj = tcRaw as Record<string, unknown>;
+                      const slot = typeof tcObj.index === 'number' ? tcObj.index : tcIdx;
+                      const existing = toolCallsAccumulated.get(slot) ?? { name: '', args: '' };
+                      const fn =
+                        tcObj.function && typeof tcObj.function === 'object'
+                          ? (tcObj.function as Record<string, unknown>)
+                          : null;
+                      if (typeof fn?.name === 'string') {
+                        existing.name += fn.name;
+                      }
+                      if (typeof fn?.arguments === 'string') {
+                        existing.args += fn.arguments;
+                      }
+                      toolCallsAccumulated.set(slot, existing);
+                    }
+                  }
+                }
               }
               if (
                 choice0.finish_reason !== null &&
@@ -928,6 +1278,30 @@ export async function executeChatCompletions(options: {
             if (completionTokens === 0 && contentAccumulated.length > 0) {
               completionTokens = Math.max(1, Math.ceil(contentAccumulated.length / 4));
             }
+            if (reasoningTokens === 0 && reasoningAccumulated.length > 0) {
+              reasoningTokens = Math.max(1, Math.ceil(reasoningAccumulated.length / 4));
+            }
+
+            let streamContractError: 'tool_error' | 'structured_error' | null = null;
+            if (toolCallsAccumulated.size > 0) {
+              for (const tc of toolCallsAccumulated.values()) {
+                if (!tc.name.trim() || !isValidJsonText(tc.args)) {
+                  streamContractError = 'tool_error';
+                  break;
+                }
+              }
+            } else if (contractFlags.requiresToolCall) {
+              streamContractError = 'tool_error';
+            }
+
+            if (
+              streamContractError === null &&
+              contractFlags.usesStructuredOutput &&
+              toolCallsAccumulated.size === 0 &&
+              !isValidJsonText(contentAccumulated)
+            ) {
+              streamContractError = 'structured_error';
+            }
 
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 
@@ -942,8 +1316,8 @@ export async function executeChatCompletions(options: {
               cachedTokens,
               ttftMs,
               durationMs: Math.max(1, endMs - startMs),
-              status: wasResumed ? 'resumed' : 'ok',
-              errorType: null,
+              status: streamContractError ? 'error' : wasResumed ? 'resumed' : 'ok',
+              errorType: streamContractError,
               createdAt: endSec,
             });
 
@@ -957,6 +1331,9 @@ export async function executeChatCompletions(options: {
           markKeyFailure(db, currentKey.id, null, dropReason, null, dropSec);
 
           const isMidStreamContinuation = contentAccumulated.length > 0;
+          if (!isMidStreamContinuation) {
+            toolCallsAccumulated.clear();
+          }
           const continuationMessages = isMidStreamContinuation
             ? [
                 ...originalMessages,
@@ -1039,12 +1416,14 @@ export async function executeChatCompletions(options: {
             completionTokens:
               completionTokens ||
               (contentAccumulated.length > 0 ? Math.ceil(contentAccumulated.length / 4) : 0),
-            reasoningTokens,
+            reasoningTokens:
+              reasoningTokens ||
+              (reasoningAccumulated.length > 0 ? Math.ceil(reasoningAccumulated.length / 4) : 0),
             cachedTokens,
             ttftMs,
             durationMs: Math.max(1, errEndMs - startMs),
             status: 'error',
-            errorType: 'network',
+            errorType: classifyFailureErrorType('network', contractFlags),
             createdAt: errSec,
           });
 
