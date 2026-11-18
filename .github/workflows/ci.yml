@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify-build-test:
+    name: Validación, compilación y pruebas (Node.js 24 LTS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar Node.js 24 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: |
+            panel/package-lock.json
+            core/package-lock.json
+            nodes/package-lock.json
+
+      - name: Verificar higiene del repositorio y ausencia de secretos
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          node --input-type=module <<'EOF'
+          import { execFileSync } from 'node:child_process';
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const failures = [];
+
+          const FORBIDDEN_FILE_PATTERNS = [
+            { regex: /\.key$/i, reason: 'archivo de llave criptográfica (.key)' },
+            { regex: /\.db(?:-(?:wal|shm|journal))?$/i, reason: 'base de datos SQLite (.db)' },
+            { regex: /\.sqlite(?:-(?:wal|shm))?$/i, reason: 'base de datos SQLite (.sqlite)' },
+            { regex: /\.enc$/i, reason: 'archivo cifrado o respaldo (.enc)' },
+            {
+              regex: /(?:^|\/)\.env(?:\..+)?$/i,
+              allow: /(?:^|\/)\.env\.example$/i,
+              reason: 'archivo de variables de entorno (.env)',
+            },
+            {
+              regex: /(?:^|\/)(?:keys|state)\.json$/i,
+              reason: 'estado local sensible (keys.json / state.json)',
+            },
+            { regex: /^secrets\//i, reason: 'directorio secrets/' },
+            { regex: /^data\//i, reason: 'directorio de datos locales data/' },
+          ];
+
+          function checkForbiddenPath(filePath, origin) {
+            const normalized = filePath.trim().replace(/\\/g, '/');
+            if (!normalized) return;
+            for (const rule of FORBIDDEN_FILE_PATTERNS) {
+              if (rule.regex.test(normalized) && !(rule.allow && rule.allow.test(normalized))) {
+                failures.push(`[${origin}] Archivo prohibido (${rule.reason}): ${normalized}`);
+              }
+            }
+          }
+
+          // 1. Verificar archivos actualmente versionados en Git
+          const trackedFiles = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8' })
+            .split('\0')
+            .filter(Boolean);
+
+          for (const file of trackedFiles) {
+            checkForbiddenPath(file, 'git ls-files');
+          }
+
+          // 2. Verificar archivos introducidos en los commits del push o pull request
+          const baseSha = (process.env.BASE_SHA || '').trim();
+          const headSha = (process.env.HEAD_SHA || 'HEAD').trim();
+          const zeroSha = /^0+$/;
+          let revRange = 'HEAD';
+          if (baseSha && !zeroSha.test(baseSha)) {
+            try {
+              execFileSync('git', ['cat-file', '-e', `${baseSha}^{commit}`], { stdio: 'ignore' });
+              revRange = `${baseSha}..${headSha}`;
+            } catch {
+              revRange = 'HEAD';
+            }
+          }
+
+          const historyFiles = execFileSync(
+            'git',
+            ['log', '--diff-filter=AMCR', '--name-only', '--pretty=format:', revRange],
+            { encoding: 'utf8' },
+          )
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean);
+
+          for (const file of new Set(historyFiles)) {
+            checkForbiddenPath(file, `commits (${revRange})`);
+          }
+
+          // 3. Escaneo anti-secretos y regla de higiene visual (sin cursor de ayuda)
+          const SECRET_CONTENT_PATTERNS = [
+            {
+              regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----/,
+              reason: 'clave privada PEM en texto plano',
+            },
+            {
+              regex: /\b(?:ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b/,
+              reason: 'token personal de GitHub en texto plano',
+            },
+            {
+              regex: /\bsk-or-v1-[a-f0-9]{48,}\b/i,
+              reason: 'credencial de proveedor en texto plano',
+            },
+            {
+              regex: /\bsk-bf-[A-Za-z0-9_-]{40,}\b/,
+              reason: 'llave interna sk-bf- en texto plano',
+            },
+          ];
+
+          const UI_FILE_EXT = /\.(?:css|scss|sass|less|html|tsx|ts|jsx|js|mjs)$/i;
+          const CURSOR_HELP_CSS = /\bcursor\s*:\s*help\b/i;
+          const CURSOR_HELP_JS = /\bcursor\s*:\s*['"`]\s*help(?:\s*!important)?\s*['"`]/i;
+
+          function stripCommentsPreservingLines(source, ext) {
+            if (ext === '.html') {
+              return source.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '));
+            }
+            const withoutBlock = source.replace(/\/\*[\s\S]*?\*\//g, (m) =>
+              m.replace(/[^\n]/g, ' '),
+            );
+            if (ext === '.css') {
+              return withoutBlock;
+            }
+            return withoutBlock.replace(/(^|[^:\\])\/\/.*$/gm, (m, prefix) =>
+              prefix + ' '.repeat(m.length - prefix.length),
+            );
+          }
+
+          for (const file of trackedFiles) {
+            if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) continue;
+            const isWorkflowFile = file.startsWith('.github/workflows/');
+            const isTestFile = /(?:^|\/)tests\/|\.test\.[cm]?[jt]sx?$/i.test(file);
+
+            const rawBuffer = fs.readFileSync(file);
+            if (rawBuffer.includes(0)) continue;
+            const content = rawBuffer.toString('utf8');
+
+            if (!isTestFile && !isWorkflowFile) {
+              for (const secretRule of SECRET_CONTENT_PATTERNS) {
+                if (secretRule.regex.test(content)) {
+                  failures.push(`[anti-secretos] ${file}: detectado ${secretRule.reason}`);
+                }
+              }
+            }
+
+            if (!isWorkflowFile && !isTestFile && !file.startsWith('docs/') && UI_FILE_EXT.test(file)) {
+              const ext = path.extname(file).toLowerCase();
+              const stripped = stripCommentsPreservingLines(content, ext);
+              const lines = stripped.split('\n');
+              lines.forEach((line, idx) => {
+                if (CURSOR_HELP_CSS.test(line) || CURSOR_HELP_JS.test(line)) {
+                  failures.push(
+                    `[higiene-ui] ${file}:${idx + 1}: declaración prohibida de cursor de ayuda`,
+                  );
+                }
+              });
+            }
+          }
+
+          if (failures.length > 0) {
+            console.error('Falló la verificación de higiene y seguridad del repositorio:');
+            for (const msg of failures) {
+              console.error(`  - ${msg}`);
+            }
+            process.exit(1);
+          }
+
+          console.log(
+            `[ok] Higiene y seguridad verificadas en ${trackedFiles.length} archivos (${revRange}).`,
+          );
+          EOF
+
+      - name: Validar esquemas JSON y sintaxis Bash
+        run: |
+          node scripts/validate-schemas.mjs
+          bash -n scripts/install.sh && bash -n nodes/install-node.sh
+
+      - name: Instalar dependencias limpias (panel, core, nodes)
+        run: |
+          npm --prefix panel ci
+          npm --prefix core ci
+          npm --prefix nodes ci
+
+      - name: Compilar TypeScript y aplicación Vite
+        run: npm run build
+
+      - name: Ejecutar batería completa de pruebas automatizadas
+        run: npm test

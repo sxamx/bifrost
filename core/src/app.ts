@@ -21,6 +21,22 @@ import {
 } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
 import {
+  type ActivityGroupBy,
+  type ActivityRange,
+  type MetricsRange,
+  type SystemLogCategory,
+  type SystemLogLevel,
+  computePercentiles,
+  getLatencyMetrics,
+  getProviderErrorRates7d,
+  getSpeedAndCacheMetrics,
+  getSummaryMetrics,
+  getTokenActivity,
+  getUptime60Days,
+  querySystemLogs,
+  round2,
+} from './metrics/index.js';
+import {
   ModelSyncHttpError,
   formatModelRow,
   runModelsAutoSyncTick,
@@ -37,7 +53,7 @@ import {
   rotateNodeToken,
   runNodesHealthTick,
 } from './nodes.js';
-import { DrainingRegistry, executeChatCompletions } from './router.js';
+import { DrainingRegistry, checkUserDailyQuotaUtc, executeChatCompletions } from './router.js';
 import {
   type ProviderManifest,
   isValidHttpUri,
@@ -45,7 +61,7 @@ import {
   validateProviderManifest,
 } from './schema.js';
 
-export { runNodesHealthTick, runModelsAutoSyncTick };
+export { runNodesHealthTick, runModelsAutoSyncTick, computePercentiles };
 
 const SESSION_COOKIE_NAME = 'bifrost_session';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
@@ -2051,11 +2067,222 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     });
   });
 
+  // --- Phase 5: Telemetry, Quota Summary, Percentiles, Uptime & Audit Logs (HU-17..HU-20c) ---
+
+  const VALID_METRICS_RANGES = new Set<string>(['today', '24h', '7d', '30d']);
+  const VALID_ACTIVITY_GROUP_BY = new Set<string>(['model', 'provider', 'user']);
+  const VALID_LOG_LEVELS = new Set<string>(['info', 'warn', 'error']);
+  const VALID_LOG_CATEGORIES = new Set<string>([
+    'failover',
+    'stream_resume',
+    'node',
+    'sync',
+    'auth',
+    'backup',
+    'system',
+  ]);
+
+  app.get('/api/metrics/summary', (c) => {
+    const user = c.get('user');
+    const summary = getSummaryMetrics(db, {
+      nowSec: nowSeconds(),
+      userId: user.id,
+      role: user.role,
+    });
+    const totalDailyLimit = summary.quotaToday.configuredDailyLimit;
+    const quotaPercentageRemaining =
+      totalDailyLimit !== null && totalDailyLimit > 0
+        ? round2(
+            Math.max(
+              0,
+              Math.min(
+                100,
+                ((totalDailyLimit - summary.quotaToday.usedTokensToday) / totalDailyLimit) * 100,
+              ),
+            ),
+          )
+        : null;
+
+    return c.json({
+      ...summary,
+      totalDailyLimit,
+      usedTokensToday: summary.quotaToday.usedTokensToday,
+      remainingTokensToday: summary.quotaToday.remainingTokensToday,
+      quotaPercentageRemaining,
+      nextResetAt: summary.quotaToday.nextResetAt,
+      resetMode: summary.quotaToday.quotaResetMode,
+    });
+  });
+
+  app.get('/api/metrics/latency', (c) => {
+    const user = c.get('user');
+    const rawRange = (c.req.query('range') ?? '24h').trim();
+    if (!VALID_METRICS_RANGES.has(rawRange)) {
+      return c.json(
+        { error: 'Invalid range parameter. Expected one of: today, 24h, 7d, 30d.' },
+        400,
+      );
+    }
+
+    const providerId = (c.req.query('providerId') ?? c.req.query('provider') ?? '').trim();
+    const modelFullId = (c.req.query('modelFullId') ?? c.req.query('model') ?? '').trim();
+
+    const result = getLatencyMetrics(db, {
+      nowSec: nowSeconds(),
+      range: rawRange as MetricsRange,
+      providerId: providerId || undefined,
+      modelFullId: modelFullId || undefined,
+      userId: user.role === 'guest' ? user.id : undefined,
+    });
+
+    return c.json(result);
+  });
+
+  app.get('/api/metrics/speed', (c) => {
+    const user = c.get('user');
+    const rawRange = (c.req.query('range') ?? '7d').trim();
+    if (!VALID_METRICS_RANGES.has(rawRange)) {
+      return c.json(
+        { error: 'Invalid range parameter. Expected one of: today, 24h, 7d, 30d.' },
+        400,
+      );
+    }
+
+    const result = getSpeedAndCacheMetrics(db, {
+      nowSec: nowSeconds(),
+      range: rawRange as MetricsRange,
+    });
+
+    if (user.role === 'guest') {
+      const filteredModels = result.models.filter((m) =>
+        isGuestModelAllowed(user.id, m.modelFullId),
+      );
+      const allowedProviders = new Set(filteredModels.map((m) => m.providerId));
+      const filteredProviders = result.providers.filter((p) =>
+        allowedProviders.has(p.providerId),
+      );
+      return c.json({
+        range: result.range,
+        models: filteredModels,
+        providers: filteredProviders,
+        cacheByProvider: filteredProviders,
+      });
+    }
+
+    return c.json(result);
+  });
+
+  app.get('/api/metrics/uptime', (c) => {
+    const nowSec = nowSeconds();
+    const uptime60d = getUptime60Days(db, { nowSec });
+    const errRates7d = getProviderErrorRates7d(db, { nowSec });
+    const errByProvider = new Map(errRates7d.providers.map((item) => [item.providerId, item]));
+
+    const providers = uptime60d.providers.map((prov) => {
+      const err = errByProvider.get(prov.providerId);
+      const totalRequests7d = err?.totalRequests ?? 0;
+      const toolErrors = err?.toolErrors ?? 0;
+      const structuredErrors = err?.structuredErrors ?? 0;
+      const toolErrorRate = err?.toolErrorRate ?? null;
+      const structuredErrorRate = err?.structuredErrorRate ?? null;
+
+      return {
+        ...prov,
+        totalRequests7d,
+        toolErrors,
+        structuredErrors,
+        toolErrorRate,
+        structuredErrorRate,
+        toolErrorRate7d: toolErrorRate,
+        structuredErrorRate7d: structuredErrorRate,
+      };
+    });
+
+    return c.json({
+      windowDays: uptime60d.windowDays,
+      fromDate: uptime60d.fromDate,
+      toDate: uptime60d.toDate,
+      providers,
+      errorRates7d: errRates7d,
+    });
+  });
+
+  app.get('/api/metrics/activity', (c) => {
+    const user = c.get('user');
+    const rawRange = (c.req.query('range') ?? '7d').trim();
+    if (!VALID_METRICS_RANGES.has(rawRange)) {
+      return c.json(
+        { error: 'Invalid range parameter. Expected one of: today, 24h, 7d, 30d.' },
+        400,
+      );
+    }
+
+    const rawGroupBy = (c.req.query('groupBy') ?? 'model').trim();
+    if (!VALID_ACTIVITY_GROUP_BY.has(rawGroupBy)) {
+      return c.json(
+        { error: 'Invalid groupBy parameter. Expected one of: model, provider, user.' },
+        400,
+      );
+    }
+
+    const filterId = (c.req.query('filterId') ?? c.req.query('id') ?? '').trim();
+    const result = getTokenActivity(db, {
+      nowSec: nowSeconds(),
+      range: rawRange as ActivityRange,
+      groupBy: rawGroupBy as ActivityGroupBy,
+      filterId: filterId || undefined,
+      userIdScope: user.role === 'guest' ? user.id : undefined,
+    });
+
+    return c.json(result);
+  });
+
+  app.get('/api/logs', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    const rawLevel = (c.req.query('level') ?? '').trim();
+    if (rawLevel && !VALID_LOG_LEVELS.has(rawLevel)) {
+      return c.json({ error: 'Invalid level parameter. Expected info, warn, or error.' }, 400);
+    }
+
+    const rawCategory = (c.req.query('category') ?? '').trim();
+    if (rawCategory && !VALID_LOG_CATEGORIES.has(rawCategory)) {
+      return c.json({ error: 'Invalid category parameter.' }, 400);
+    }
+
+    const q = c.req.query('q');
+    const rawLimit = c.req.query('limit');
+    const rawOffset = c.req.query('offset');
+
+    const limit = rawLimit !== undefined && rawLimit !== '' ? Number(rawLimit) : 50;
+    const offset = rawOffset !== undefined && rawOffset !== '' ? Number(rawOffset) : 0;
+
+    if (!Number.isFinite(limit) || limit < 1) {
+      return c.json({ error: 'Invalid limit parameter.' }, 400);
+    }
+    if (!Number.isFinite(offset) || offset < 0) {
+      return c.json({ error: 'Invalid offset parameter.' }, 400);
+    }
+
+    const result = querySystemLogs(db, {
+      level: (rawLevel || undefined) as SystemLogLevel | undefined,
+      category: (rawCategory || undefined) as SystemLogCategory | undefined,
+      q: q ?? undefined,
+      limit,
+      offset,
+    });
+
+    return c.json(result);
+  });
+
   app.all('/api/*', (c) => {
     return c.json({ error: 'Not Found' }, 404);
   });
 
-  // --- OpenAI-Compatible API /v1/* (HU-03b, HU-09, HU-10) ---
+  // --- OpenAI-Compatible API /v1/* (HU-03b, HU-09, HU-10, HU-17) ---
 
   app.use('/v1/*', async (c, next) => {
     const authHeader = c.req.header('authorization') ?? '';
@@ -2102,76 +2329,10 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     db.prepare(`UPDATE internal_api_keys SET last_used_at = ? WHERE id = ?`).run(nowSec, keyId);
 
-    // Server-side UTC quota check (ignores any client date/time headers)
-    if (user.dailyTokenLimit !== null) {
-      let windowStartSec: number;
-      let resetAtMs: number;
-
-      if (user.quotaResetMode === 'rolling_24h') {
-        windowStartSec = nowSec - 86400;
-        const oldestRow = db
-          .prepare(
-            `SELECT MIN(created_at) AS oldest_created_at
-             FROM usage_logs
-             WHERE user_id = ? AND created_at >= ?
-               AND (prompt_tokens + completion_tokens + reasoning_tokens) > 0`,
-          )
-          .get(user.id, windowStartSec) as { oldest_created_at: number | bigint | null } | undefined;
-
-        const oldestSec =
-          oldestRow?.oldest_created_at !== null && oldestRow?.oldest_created_at !== undefined
-            ? Number(oldestRow.oldest_created_at)
-            : nowSec;
-        resetAtMs = (oldestSec + 86400) * 1000;
-      } else {
-        const utcNow = new Date(nowMs);
-        const startOfUtcDayMs = Date.UTC(
-          utcNow.getUTCFullYear(),
-          utcNow.getUTCMonth(),
-          utcNow.getUTCDate(),
-          0,
-          0,
-          0,
-          0,
-        );
-        const nextUtcMidnightMs = Date.UTC(
-          utcNow.getUTCFullYear(),
-          utcNow.getUTCMonth(),
-          utcNow.getUTCDate() + 1,
-          0,
-          0,
-          0,
-          0,
-        );
-        windowStartSec = Math.floor(startOfUtcDayMs / 1000);
-        resetAtMs = nextUtcMidnightMs;
-      }
-
-      const usageRow = db
-        .prepare(
-          `SELECT COALESCE(SUM(prompt_tokens + completion_tokens + reasoning_tokens), 0) AS used_tokens
-           FROM usage_logs
-           WHERE user_id = ? AND created_at >= ?`,
-        )
-        .get(user.id, windowStartSec) as { used_tokens: number | bigint } | undefined;
-
-      const usedTokens = Number(usageRow?.used_tokens ?? 0);
-
-      if (usedTokens >= user.dailyTokenLimit) {
-        const resetAtIso = new Date(resetAtMs).toISOString();
-        const retryAfterSec = Math.max(1, Math.ceil((resetAtMs - nowMs) / 1000));
-        c.header('Retry-After', String(retryAfterSec));
-        return c.json(
-          openAiError(
-            `Daily token quota exceeded (${usedTokens}/${user.dailyTokenLimit} tokens used). Quota resets at ${resetAtIso}.`,
-            'quota_exceeded',
-            'daily_quota_exceeded',
-            null,
-            { reset_at: resetAtIso },
-          ),
-          429,
-        );
-      }
+    // Server-side UTC quota check (100% anchored to server UTC clock; ignores client headers)
+    const quotaCheck = checkUserDailyQuotaUtc(db, user.id, nowMs);
+    if (quotaCheck.exceeded) {
+      return quotaCheck.response;
     }
 
     c.set('user', user);
