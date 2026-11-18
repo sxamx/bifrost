@@ -1,0 +1,21 @@
+{
+  "name": "@bifrost/nodes",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agente ligero de nodo de salida de cero conocimiento (HTTP CONNECT) para Bifrost",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "test": "npm run build && node --test nodes.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}

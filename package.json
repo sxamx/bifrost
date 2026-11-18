@@ -9,13 +9,14 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "install:all": "npm --prefix panel install && npm --prefix core install",
+    "install:all": "npm --prefix panel install && npm --prefix core install && npm --prefix nodes install",
     "build:panel": "npm --prefix panel run build",
     "build:core": "npm --prefix core run build",
-    "build": "npm --prefix panel run build && npm --prefix core run build",
+    "build:nodes": "npm --prefix nodes run build",
+    "build": "npm --prefix panel run build && npm --prefix core run build && npm --prefix nodes run build",
     "start": "npm --prefix core run start",
     "dev:core": "npm --prefix core run dev",
     "dev:panel": "npm --prefix panel run dev",
-    "test": "npm --prefix core test"
+    "test": "npm --prefix nodes test && npm --prefix core test"
   }
 }

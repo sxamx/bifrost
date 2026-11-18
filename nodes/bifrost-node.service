@@ -1,0 +1,39 @@
+[Unit]
+Description=Bifrost Zero-Knowledge Egress Node Agent (HTTP CONNECT)
+Documentation=https://github.com/sxamx/bifrost
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bifrost-node
+Group=bifrost-node
+WorkingDirectory=/opt/bifrost-node
+Environment=NODE_ENV=production
+Environment=BIFROST_NODE_MODE=tailscale
+Environment=BIFROST_NODE_PORT=9443
+Environment=BIFROST_NODE_DATA_DIR=/var/lib/bifrost-node
+EnvironmentFile=-/etc/default/bifrost-node
+ExecStart=/usr/bin/env node /opt/bifrost-node/dist/index.js
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bifrost-node
+
+# Systemd security hardening (V8 JIT-compatible)
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/bifrost-node
+ReadOnlyPaths=/opt/bifrost-node
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

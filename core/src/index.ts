@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
 import { loadMasterKeyOrExit } from './crypto.js';
 import { openDatabase, writeSystemLog } from './db.js';
+import { runNodesHealthTick } from './nodes.js';
 
 const resolved = loadMasterKeyOrExit();
 const db = openDatabase(resolved.dbPath);
@@ -17,6 +18,24 @@ const app = createApp({
   panelDistDir: process.env.PANEL_DIST_DIR,
 });
 
+let healthTickRunning = false;
+const triggerNodesHealthTick = () => {
+  if (healthTickRunning) return;
+  healthTickRunning = true;
+  void runNodesHealthTick(db, resolved.key)
+    .catch(() => {
+      // Errors per node are captured inside runNodesHealthTick
+    })
+    .finally(() => {
+      healthTickRunning = false;
+    });
+};
+
+// Initial sweep + 30-second periodic heartbeat & 24h token rotation check (HU-12, HU-11c)
+triggerNodesHealthTick();
+const nodesHeartbeatInterval = setInterval(triggerNodesHealthTick, 30_000);
+nodesHeartbeatInterval.unref();
+
 const server = serve(
   {
     fetch: app.fetch,
@@ -29,6 +48,7 @@ const server = serve(
 
 function shutdown(signal: string): void {
   process.stdout.write(`[Bifrost] Received ${signal}, shutting down...\n`);
+  clearInterval(nodesHeartbeatInterval);
   server.close(() => {
     try {
       db.close();

@@ -1,6 +1,11 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { decryptSecret } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
+import {
+  type NodeMode,
+  type UpstreamTlsOptions,
+  fetchViaExitNode,
+} from './nodes.js';
 import { type ProviderManifest, buildProviderAuthHeaders } from './schema.js';
 
 export class DrainingRegistry {
@@ -122,6 +127,12 @@ interface ProviderKeyRecord {
   last4: string;
   node_id: string | null;
   status: string;
+  node_name: string | null;
+  node_mode: NodeMode | null;
+  node_endpoint: string | null;
+  node_encrypted_token: Uint8Array | null;
+  node_tls_fingerprint: string | null;
+  node_status: string | null;
 }
 
 function parseRateLimitHeaders(
@@ -190,7 +201,9 @@ function markKeyFailure(
 ): void {
   const safeReason = redactSecretsInText(reason).slice(0, 300);
   if (httpStatus === 429) {
-    const parsed = headers ? parseRateLimitHeaders(headers, nowSec) : { remaining: 0, resetAt: null };
+    const parsed = headers
+      ? parseRateLimitHeaders(headers, nowSec)
+      : { remaining: 0, resetAt: null };
     const resetAt = parsed.resetAt ?? nowSec + 60;
     db.prepare(
       `UPDATE provider_keys
@@ -263,7 +276,7 @@ function loadCandidateKeys(
   registry: DrainingRegistry,
   nowSec: number,
 ): ProviderKeyRecord[] {
-  // Recover rate-limited keys whose reset timestamp has passed
+  // Recover rate-limited keys whose reset timestamp has passed (only if node is not unresponsive)
   db.prepare(
     `UPDATE provider_keys
      SET status = 'active', last_error = NULL
@@ -275,12 +288,18 @@ function loadCandidateKeys(
 
   const rows = db
     .prepare(
-      `SELECT id, provider_id, label, encrypted_secret, last4, node_id, status
-       FROM provider_keys
-       WHERE provider_id = ? AND status = 'active'
+      `SELECT pk.id, pk.provider_id, pk.label, pk.encrypted_secret, pk.last4, pk.node_id, pk.status,
+              n.name AS node_name, n.mode AS node_mode, n.endpoint AS node_endpoint,
+              n.encrypted_token AS node_encrypted_token, n.tls_fingerprint AS node_tls_fingerprint,
+              n.status AS node_status
+       FROM provider_keys pk
+       LEFT JOIN nodes n ON n.id = pk.node_id
+       WHERE pk.provider_id = ?
+         AND pk.status = 'active'
+         AND (pk.node_id IS NULL OR n.status = 'online')
        ORDER BY
-         CASE WHEN ratelimit_remaining = 0 THEN 1 ELSE 0 END ASC,
-         created_at ASC`,
+         CASE WHEN pk.ratelimit_remaining = 0 THEN 1 ELSE 0 END ASC,
+         pk.created_at ASC`,
     )
     .all(providerId) as unknown as ProviderKeyRecord[];
 
@@ -318,6 +337,7 @@ export async function executeChatCompletions(options: {
   masterKey: Buffer;
   registry: DrainingRegistry;
   fetchImpl: typeof fetch;
+  upstreamTls?: UpstreamTlsOptions;
   now: () => number;
   userId: string;
   modelFullId: string;
@@ -330,6 +350,7 @@ export async function executeChatCompletions(options: {
     masterKey,
     registry,
     fetchImpl,
+    upstreamTls,
     now,
     userId,
     modelFullId,
@@ -363,12 +384,35 @@ export async function executeChatCompletions(options: {
   const candidates = loadCandidateKeys(db, providerId, registry, nowSec);
   if (candidates.length === 0) {
     return openAiErrorJson(
-      `Provider "${providerId}" has no active API keys configured yet.`,
+      `Provider "${providerId}" has no active API keys with an online exit node available.`,
       'service_unavailable',
       'no_provider_keys',
       503,
     );
   }
+
+  const dispatchRequestForKey = async (
+    key: ProviderKeyRecord,
+    init: RequestInit,
+  ): Promise<Response> => {
+    if (key.node_id && key.node_encrypted_token && key.node_endpoint) {
+      const nodeRawToken = decryptSecret(key.node_encrypted_token, masterKey);
+      return fetchViaExitNode(
+        chatUrl,
+        init,
+        {
+          id: key.node_id,
+          name: key.node_name ?? key.node_id,
+          mode: key.node_mode === 'public_ip' ? 'public_ip' : 'tailscale',
+          endpoint: key.node_endpoint,
+          rawToken: nodeRawToken,
+          tlsFingerprint: key.node_tls_fingerprint,
+        },
+        upstreamTls,
+      );
+    }
+    return fetchImpl(chatUrl, init);
+  };
 
   const isStream = requestBody.stream === true;
   const originalMessages = Array.isArray(requestBody.messages)
@@ -376,7 +420,7 @@ export async function executeChatCompletions(options: {
     : [];
 
   // =========================================================================
-  // Mode 1: Non-Streaming (stream: false) with HU-09 Failover
+  // Mode 1: Non-Streaming (stream: false) with HU-09 Failover + Exit Node Tunnel
   // =========================================================================
   if (!isStream) {
     const triedKeyIds = new Set<string>();
@@ -408,7 +452,7 @@ export async function executeChatCompletions(options: {
 
         let res: Response;
         try {
-          res = await fetchImpl(chatUrl, {
+          res = await dispatchRequestForKey(key, {
             method: 'POST',
             headers,
             body: JSON.stringify(upstreamBody),
@@ -417,7 +461,7 @@ export async function executeChatCompletions(options: {
           const msg = err instanceof Error ? err.message : String(err);
           lastStatus = null;
           lastWasNetwork = true;
-          lastErrorMsg = redactSecretsInText(`Network error: ${msg}`);
+          lastErrorMsg = redactSecretsInText(`Network/tunnel error: ${msg}`);
           markKeyFailure(db, key.id, null, lastErrorMsg, null, Math.floor(now() / 1000));
 
           const nextKey = candidates.slice(i + 1).find((k) => !registry.isKeyDraining(k.id));
@@ -426,11 +470,12 @@ export async function executeChatCompletions(options: {
               db,
               'warn',
               'failover',
-              `Key "${key.label}" (…${key.last4}) failed with network error on "${providerId}"; failing over to "${nextKey.label}" (…${nextKey.last4})`,
+              `Key "${key.label}" (…${key.last4}) failed with network/tunnel error on "${providerId}"; failing over to "${nextKey.label}" (…${nextKey.last4})`,
               {
                 providerId,
                 failedKeyId: key.id,
                 failedKeyLast4: key.last4,
+                nodeId: key.node_id,
                 nextKeyId: nextKey.id,
                 reason: lastErrorMsg,
               },
@@ -468,6 +513,7 @@ export async function executeChatCompletions(options: {
                 providerId,
                 failedKeyId: key.id,
                 failedKeyLast4: key.last4,
+                nodeId: key.node_id,
                 nextKeyId: nextKey.id,
                 httpStatus: res.status,
               },
@@ -618,7 +664,7 @@ export async function executeChatCompletions(options: {
 
         let res: Response;
         try {
-          res = await fetchImpl(chatUrl, {
+          res = await dispatchRequestForKey(key, {
             method: 'POST',
             headers,
             body: JSON.stringify(upstreamBody),
@@ -626,7 +672,7 @@ export async function executeChatCompletions(options: {
         } catch (err) {
           releaseLease();
           const msg = err instanceof Error ? err.message : String(err);
-          const safeMsg = redactSecretsInText(`Network error: ${msg}`);
+          const safeMsg = redactSecretsInText(`Network/tunnel error: ${msg}`);
           markKeyFailure(db, key.id, null, safeMsg, null, Math.floor(now() / 1000));
 
           const hasMore = candidates.some(
@@ -637,8 +683,8 @@ export async function executeChatCompletions(options: {
               db,
               'warn',
               logCategoryOnRetry,
-              `Key "${key.label}" (…${key.last4}) failed with network error on "${providerId}"; trying next available key`,
-              { providerId, failedKeyId: key.id, reason: safeMsg },
+              `Key "${key.label}" (…${key.last4}) failed with network/tunnel error on "${providerId}"; trying next available key`,
+              { providerId, failedKeyId: key.id, nodeId: key.node_id, reason: safeMsg },
               Math.floor(now() / 1000),
             );
           }
@@ -663,7 +709,7 @@ export async function executeChatCompletions(options: {
               'warn',
               logCategoryOnRetry,
               `Key "${key.label}" (…${key.last4}) returned HTTP ${status} on "${providerId}"; failing over to next key`,
-              { providerId, failedKeyId: key.id, httpStatus: status },
+              { providerId, failedKeyId: key.id, nodeId: key.node_id, httpStatus: status },
               Math.floor(now() / 1000),
             );
           }
@@ -773,7 +819,6 @@ export async function executeChatCompletions(options: {
             try {
               parsed = JSON.parse(payload) as Record<string, unknown>;
             } catch {
-              // Forward non-JSON data payload verbatim if encountered
               controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
               return true;
             }
@@ -906,7 +951,6 @@ export async function executeChatCompletions(options: {
             break;
           }
 
-          // Stream dropped prematurely!
           const dropReason =
             streamFailureReason ?? 'Premature EOF before [DONE] on SSE stream';
           const dropSec = Math.floor(now() / 1000);
@@ -970,7 +1014,6 @@ export async function executeChatCompletions(options: {
             continue;
           }
 
-          // No backup key left to resume
           const errEndMs = now();
           const errSec = Math.floor(errEndMs / 1000);
           writeSystemLog(

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
 import type {
+  ExitNodeItem,
   MarketplaceCatalogState,
   ProviderKeyItem,
   ProviderManifest,
@@ -14,6 +15,7 @@ type ProvidersSubView = 'installed' | 'marketplace' | 'local-json';
 
 interface ProvidersTabProps {
   providers: ProviderSummary[];
+  nodes: ExitNodeItem[];
   loading: boolean;
   initialSubView?: ProvidersSubView;
   onInitialSubViewConsumed?: () => void;
@@ -50,11 +52,10 @@ function validateManifestJson(rawText: string): {
   }
 
   const obj = parsed as Record<string, unknown>;
-  if (obj.schemaVersion !== '1.0') {
-    return { error: 'Campo "schemaVersion" obligatorio (debe ser "1.0").' };
-  }
   if (typeof obj.id !== 'string' || !/^[a-z0-9-]+$/.test(obj.id)) {
-    return { error: 'Campo "id" obligatorio (solo minúsculas, dígitos y guiones, ej. "openrouter").' };
+    return {
+      error: 'Campo "id" obligatorio (solo minúsculas, dígitos y guiones, ej. "openrouter").',
+    };
   }
   if (typeof obj.name !== 'string' || obj.name.trim().length === 0) {
     return { error: 'Campo "name" obligatorio.' };
@@ -84,6 +85,7 @@ function validateManifestJson(rawText: string): {
 
 export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   providers,
+  nodes,
   loading,
   initialSubView,
   onInitialSubViewConsumed,
@@ -93,7 +95,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     initialSubView ?? (providers.length === 0 ? 'marketplace' : 'installed')
   );
 
-  // Marketplace catalog state (HU-06)
   const [catalog, setCatalog] = useState<MarketplaceCatalogState>({
     manifests: [],
     offline: false,
@@ -103,17 +104,14 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   const [installingId, setInstallingId] = useState<string | null>(null);
   const [adapterUrlsById, setAdapterUrlsById] = useState<Record<string, string>>({});
 
-  // Local JSON manifest state (HU-06)
   const [jsonText, setJsonText] = useState('');
   const [localAdapterUrl, setLocalAdapterUrl] = useState('');
   const [uploadingLocal, setUploadingLocal] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
 
-  // Keys & Models per installed provider (when GET /api/providers doesn't inline them)
   const [keysByProvider, setKeysByProvider] = useState<Record<string, ProviderKeyItem[]>>({});
   const [allModels, setAllModels] = useState<ProviderModelItem[]>([]);
 
-  // Feedback & HU-10 Confirmation Modals
   const [globalBanner, setGlobalBanner] = useState<string | null>(null);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [providerToDelete, setProviderToDelete] = useState<ProviderSummary | null>(null);
@@ -259,9 +257,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
       await refreshEverything();
       setJsonText('');
       setLocalAdapterUrl('');
-      setGlobalBanner(
-        `Ficha local «${validation.manifest.name}» instalada correctamente.`
-      );
+      setGlobalBanner(`Ficha local «${validation.manifest.name}» instalada correctamente.`);
       setSubView('installed');
     } catch (err) {
       setLocalError(
@@ -366,7 +362,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         </div>
       ) : null}
 
-      {/* SUBVIEW 1: Installed Providers + Encrypted Key Vault + Models (HU-07, HU-06b, HU-06c, HU-09) */}
       {subView === 'installed' ? (
         loading && providers.length === 0 ? (
           <section className="card">
@@ -419,7 +414,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
             {providers.map((prov) => {
               const pKeys = prov.keys ?? keysByProvider[prov.id] ?? [];
               const pModels =
-                prov.models ?? allModels.filter((m) => m.providerId === prov.id && m.active !== false);
+                prov.models ??
+                allModels.filter((m) => m.providerId === prov.id && m.active !== false);
 
               return (
                 <ProviderVaultCard
@@ -427,6 +423,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                   provider={prov}
                   keys={pKeys}
                   models={pModels}
+                  nodes={nodes}
                   onRefreshAll={refreshEverything}
                   onRequestDeleteProvider={(target) => setProviderToDelete(target)}
                   onRequestDeleteKey={(targetProv, targetKey) =>
@@ -439,7 +436,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         )
       ) : null}
 
-      {/* SUBVIEW 2: Marketplace Catalog (HU-06, graceful offline notice) */}
       {subView === 'marketplace' ? (
         <section style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
           {catalog.offline ? (
@@ -535,11 +531,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
               {filteredManifests.map((manifest) => {
                 const isInstalled = installedIds.has(manifest.id);
                 const isExperimental = manifest.packageType === 'experimental-adapter';
-                const defaultAdapterUrl =
-                  manifest.baseUrl ||
-                  (manifest.adapter?.defaultPort
-                    ? `http://127.0.0.1:${manifest.adapter.defaultPort}/v1`
-                    : '');
+                const defaultAdapterUrl = manifest.adapter?.defaultPort
+                  ? `http://127.0.0.1:${manifest.adapter.defaultPort}`
+                  : '';
 
                 return (
                   <article key={manifest.id} className="marketplace-card">
@@ -597,7 +591,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                             type="url"
                             className="input mono"
                             style={{ padding: '8px 11px', fontSize: '0.82rem' }}
-                            placeholder={defaultAdapterUrl || 'http://127.0.0.1:3100/v1'}
+                            placeholder={defaultAdapterUrl || 'http://127.0.0.1:3100'}
                             value={adapterUrlsById[manifest.id] ?? defaultAdapterUrl}
                             onChange={(e) =>
                               setAdapterUrlsById((prev) => ({
@@ -651,7 +645,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         </section>
       ) : null}
 
-      {/* SUBVIEW 3: Local JSON Manifest Upload / Paste (HU-06) */}
       {subView === 'local-json' ? (
         <section className="card" aria-labelledby="local-manifest-heading">
           <div className="card-header">
@@ -705,7 +698,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                 id="local-adapter-url"
                 type="url"
                 className="input mono"
-                placeholder="http://127.0.0.1:3100/v1 (opcional)"
+                placeholder="http://127.0.0.1:3100 (opcional)"
                 value={localAdapterUrl}
                 onChange={(e) => setLocalAdapterUrl(e.target.value)}
                 disabled={uploadingLocal}
@@ -729,7 +722,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         </section>
       ) : null}
 
-      {/* HU-10 Modal 1: Confirm Provider Deletion */}
       {providerToDelete ? (
         <div
           className="modal-backdrop"
@@ -776,7 +768,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         </div>
       ) : null}
 
-      {/* HU-10 Modal 2: Confirm Provider Key Removal */}
       {keyToDelete ? (
         <div
           className="modal-backdrop"

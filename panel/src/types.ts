@@ -27,6 +27,51 @@ export interface MeResponse {
   stats: DashboardStats;
 }
 
+/* Phase 3 — Exit Nodes (HU-11, HU-11b, HU-11c, HU-11d, HU-08, HU-12, HU-13) */
+
+export type NodeMode = 'tailscale' | 'public_ip';
+export type NodeStatus = 'online' | 'unresponsive' | 'offline';
+
+export interface NodeAssignedKeyRef {
+  id: string;
+  providerId: string;
+  providerName: string;
+  label: string;
+  last4: string;
+}
+
+export interface ExitNodeItem {
+  id: string;
+  name: string;
+  mode: NodeMode;
+  endpoint: string;
+  status: NodeStatus;
+  lastSeenAt: number | null;
+  lastRotatedAt: number | null;
+  createdAt?: number;
+  assignedKeysCount?: number;
+  assignedKeys?: NodeAssignedKeyRef[];
+}
+
+export interface CreateNodeInput {
+  name: string;
+  mode: NodeMode;
+  endpoint: string;
+}
+
+export interface CreateNodeResult {
+  node: ExitNodeItem;
+  rawToken: string;
+  installCommand: string;
+}
+
+export interface RotateNodeTokenResult {
+  ok: boolean;
+  lastRotatedAt: number;
+  graceSeconds?: number;
+  rawToken?: string;
+}
+
 /* Phase 2 — Marketplace & Provider Schemas (HU-06, HU-06b, HU-06c, HU-07, HU-09, HU-10) */
 
 export type ProviderPackageType = 'official-json' | 'experimental-adapter';
@@ -114,7 +159,6 @@ export interface ProviderModelItem {
   };
   isFree?: boolean;
   firstSeenAt?: number;
-  upstreamCreatedAt?: number | null;
   active?: boolean;
 }
 
@@ -153,7 +197,6 @@ export interface ModelSyncDiff {
   addedCount: number;
   retiredCount: number;
   totalModels: number;
-  summary?: string;
   models?: ProviderModelItem[];
   syncedAt?: number;
 }
@@ -177,4 +220,4 @@ export interface CreateKeyResponse {
   rawKey: string;
 }
 
-export type ActiveTab = 'overview' | 'keys' | 'providers';
+export type ActiveTab = 'overview' | 'keys' | 'providers' | 'nodes';

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { api, ApiError } from '../api';
 import type {
+  ExitNodeItem,
   ModelSyncDiff,
   ProviderKeyItem,
   ProviderModelItem,
@@ -12,9 +13,16 @@ interface ProviderVaultCardProps {
   provider: ProviderSummary;
   keys: ProviderKeyItem[];
   models: ProviderModelItem[];
+  nodes: ExitNodeItem[];
   onRefreshAll: () => Promise<void>;
   onRequestDeleteProvider: (provider: ProviderSummary) => void;
   onRequestDeleteKey: (provider: ProviderSummary, key: ProviderKeyItem) => void;
+}
+
+interface PendingCollisionConfirmation {
+  key: ProviderKeyItem;
+  targetNode: ExitNodeItem;
+  existingKeysOnNode: ProviderKeyItem[];
 }
 
 function formatLast4(last4: string): string {
@@ -32,9 +40,6 @@ function formatSyncDate(ts: number | null | undefined): string {
 }
 
 function formatDiffLabel(diff: ModelSyncDiff): string {
-  if (diff.summary && diff.summary.trim().length > 0) {
-    return diff.summary;
-  }
   const addedWord = diff.addedCount === 1 ? 'nuevo' : 'nuevos';
   const retiredWord = diff.retiredCount === 1 ? 'retirado' : 'retirados';
   return `${diff.addedCount} ${addedWord}, ${diff.retiredCount} ${retiredWord}`;
@@ -47,7 +52,7 @@ function statusBadgeLabel(status: ProviderKeyItem['status']): string {
     case 'rate_limited':
       return 'Rate limit';
     case 'no_node':
-      return 'Sin nodo';
+      return 'Sin servicio';
     case 'error':
     default:
       return 'Error';
@@ -58,6 +63,7 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
   provider,
   keys,
   models,
+  nodes,
   onRefreshAll,
   onRequestDeleteProvider,
   onRequestDeleteKey,
@@ -67,6 +73,10 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
   const [secret, setSecret] = useState('');
   const [quotaInput, setQuotaInput] = useState('');
   const [savingKey, setSavingKey] = useState(false);
+
+  // HU-08 & HU-11d Node Assignment & IP-Sharing Warning state
+  const [updatingKeyNodeId, setUpdatingKeyNodeId] = useState<string | null>(null);
+  const [collisionPrompt, setCollisionPrompt] = useState<PendingCollisionConfirmation | null>(null);
 
   const [syncingModels, setSyncingModels] = useState(false);
   const [reloadDiff, setReloadDiff] = useState<ModelSyncDiff | null>(null);
@@ -124,6 +134,86 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
     } finally {
       setSavingKey(false);
     }
+  }
+
+  async function executeNodeAssignment(
+    key: ProviderKeyItem,
+    targetNodeId: string | null,
+    confirmForce: boolean
+  ) {
+    setCardError(null);
+    setUpdatingKeyNodeId(key.id);
+
+    try {
+      await api.assignKeyNode(provider.id, key.id, targetNodeId, confirmForce);
+      setCollisionPrompt(null);
+      await onRefreshAll();
+    } catch (err) {
+      // If backend responds 409 / requiresConfirmation for same-provider IP sharing, trigger HU-11d modal
+      if (
+        !confirmForce &&
+        targetNodeId &&
+        err instanceof ApiError &&
+        (err.status === 409 || Boolean(err.data.requiresConfirmation))
+      ) {
+        const foundNode = nodes.find((n) => n.id === targetNodeId) ?? {
+          id: targetNodeId,
+          name: targetNodeId,
+          mode: 'tailscale',
+          endpoint: '',
+          status: 'online',
+          lastSeenAt: null,
+          lastRotatedAt: null,
+        };
+        const siblings = keys.filter((other) => other.id !== key.id && other.nodeId === targetNodeId);
+        setCollisionPrompt({
+          key,
+          targetNode: foundNode,
+          existingKeysOnNode: siblings,
+        });
+      } else {
+        setCardError(
+          err instanceof ApiError
+            ? err.message
+            : 'No fue posible actualizar el nodo asignado a la clave.'
+        );
+      }
+    } finally {
+      setUpdatingKeyNodeId(null);
+    }
+  }
+
+  function handleSelectKeyNode(key: ProviderKeyItem, rawValue: string) {
+    const nextNodeId = rawValue === '' ? null : rawValue;
+    if (nextNodeId === (key.nodeId ?? null)) {
+      return;
+    }
+
+    // HU-11d: Check if target node already holds another key of THIS same provider
+    if (nextNodeId !== null) {
+      const existingSameProviderKeys = keys.filter(
+        (other) => other.id !== key.id && other.nodeId === nextNodeId
+      );
+      if (existingSameProviderKeys.length > 0) {
+        const targetNode = nodes.find((n) => n.id === nextNodeId) ?? {
+          id: nextNodeId,
+          name: nextNodeId,
+          mode: 'tailscale',
+          endpoint: '',
+          status: 'online',
+          lastSeenAt: null,
+          lastRotatedAt: null,
+        };
+        setCollisionPrompt({
+          key,
+          targetNode,
+          existingKeysOnNode: existingSameProviderKeys,
+        });
+        return;
+      }
+    }
+
+    void executeNodeAssignment(key, nextNodeId, false);
   }
 
   async function handleDetectModels() {
@@ -187,7 +277,11 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-            <h2 id={`prov-heading-${provider.id}`} className="card-title" style={{ fontSize: '1.22rem' }}>
+            <h2
+              id={`prov-heading-${provider.id}`}
+              className="card-title"
+              style={{ fontSize: '1.22rem' }}
+            >
               {provider.name}
             </h2>
             <code className="key-prefix-pill">{provider.id}</code>
@@ -243,7 +337,7 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
         </div>
       ) : null}
 
-      {/* Section 1: Encrypted Accounts / Keys Vault (HU-07 & HU-09) */}
+      {/* Section 1: Encrypted Accounts / Keys Vault + Node Binding (HU-07, HU-08, HU-09, HU-11d) */}
       <section className="provider-section" aria-label={`Claves de ${provider.name}`}>
         <div
           style={{
@@ -258,7 +352,7 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
             <h3 style={{ fontSize: '0.98rem' }}>
               Cuentas y claves cifradas ({keys.length})
             </h3>
-            <InfoTip text="Tus claves reales se cifran con AES-256-GCM usando master.key en core/. El panel solo recibe los últimos 4 caracteres (last4) y el estado de failover." />
+            <InfoTip text="Cada clave nueva se asigna automáticamente al nodo en línea con menos claves de este proveedor (reparto equitativo). Puedes cambiar el nodo manualmente en la tabla." />
           </div>
 
           <button
@@ -363,73 +457,106 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
             la detección de modelos y el failover automático.
           </p>
         ) : (
-          <div className="table-wrap" style={{ background: '#ffffff', borderRadius: 12, border: '1px solid var(--line)' }}>
+          <div
+            className="table-wrap"
+            style={{
+              background: '#ffffff',
+              borderRadius: 12,
+              border: '1px solid var(--line)',
+            }}
+          >
             <table className="bf-table">
               <thead>
                 <tr>
                   <th>Etiqueta</th>
-                  <th> Terminación</th>
-                  <th>Nodo de salida</th>
+                  <th>Terminación</th>
+                  <th>Nodo de salida asignado</th>
                   <th>Estado</th>
                   <th style={{ textAlign: 'right' }}>Acción</th>
                 </tr>
               </thead>
               <tbody>
-                {keys.map((k) => (
-                  <tr key={k.id}>
-                    <td style={{ fontWeight: 700 }}>
-                      {k.label}
-                      {typeof k.dailyQuotaLimit === 'number' && k.dailyQuotaLimit > 0 ? (
-                        <span className="field-hint" style={{ display: 'block', fontWeight: 500 }}>
-                          Tope diario: {k.dailyQuotaLimit.toLocaleString('es-ES')}
-                        </span>
-                      ) : null}
-                    </td>
-                    <td>
-                      <code className="key-prefix-pill">{formatLast4(k.last4)}</code>
-                    </td>
-                    <td>
-                      {k.nodeId ? (
-                        <code className="key-prefix-pill">{k.nodeId}</code>
-                      ) : (
-                        <span style={{ color: 'var(--sub)', fontSize: '0.86rem' }}>
-                          Directo / Sin nodo
-                        </span>
-                      )}
-                    </td>
-                    <td>
-                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
-                        <span className={`status-badge ${k.status}`}>
-                          <span
-                            className={`status-dot ${
-                              k.status === 'active'
-                                ? 'ok'
-                                : k.status === 'rate_limited'
-                                  ? 'partial'
-                                  : 'err'
-                            }`}
-                          />
-                          {statusBadgeLabel(k.status)}
-                        </span>
-                        {k.lastError ? (
-                          <InfoTip
-                            label={`Detalle de error en ${k.label}`}
-                            text={`Último motivo reportado: ${k.lastError}`}
-                          />
+                {keys.map((k) => {
+                  const assignedNode = k.nodeId
+                    ? nodes.find((n) => n.id === k.nodeId) ?? null
+                    : null;
+
+                  return (
+                    <tr key={k.id}>
+                      <td style={{ fontWeight: 700 }}>
+                        {k.label}
+                        {typeof k.dailyQuotaLimit === 'number' && k.dailyQuotaLimit > 0 ? (
+                          <span className="field-hint" style={{ display: 'block', fontWeight: 500 }}>
+                            Tope diario: {k.dailyQuotaLimit.toLocaleString('es-ES')}
+                          </span>
                         ) : null}
-                      </div>
-                    </td>
-                    <td style={{ textAlign: 'right' }}>
-                      <button
-                        type="button"
-                        className="btn btn-danger btn-sm"
-                        onClick={() => onRequestDeleteKey(provider, k)}
-                      >
-                        Quitar clave
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td>
+                        <code className="key-prefix-pill">{formatLast4(k.last4)}</code>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                          <select
+                            aria-label={`Nodo asignado para ${k.label}`}
+                            className="select-compact"
+                            value={k.nodeId ?? ''}
+                            disabled={updatingKeyNodeId === k.id}
+                            onChange={(e) => handleSelectKeyNode(k, e.target.value)}
+                          >
+                            <option value="">Directo / Sin nodo</option>
+                            {nodes.map((nodeOpt) => (
+                              <option key={nodeOpt.id} value={nodeOpt.id}>
+                                {nodeOpt.name} ({nodeOpt.endpoint}) —{' '}
+                                {nodeOpt.status === 'online'
+                                  ? 'En línea'
+                                  : nodeOpt.status === 'unresponsive'
+                                    ? 'Sin respuesta'
+                                    : 'Desconectado'}
+                              </option>
+                            ))}
+                            {k.nodeId && !assignedNode ? (
+                              <option value={k.nodeId}>{k.nodeId} (no disponible)</option>
+                            ) : null}
+                          </select>
+                          {k.forcedNode ? (
+                            <InfoTip text="Asignación manual forzada: este nodo comparte IP con otra clave del mismo proveedor." />
+                          ) : null}
+                        </div>
+                      </td>
+                      <td>
+                        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
+                          <span className={`status-badge ${k.status}`}>
+                            <span
+                              className={`status-dot ${
+                                k.status === 'active'
+                                  ? 'ok'
+                                  : k.status === 'rate_limited'
+                                    ? 'partial'
+                                    : 'err'
+                              }`}
+                            />
+                            {statusBadgeLabel(k.status)}
+                          </span>
+                          {k.lastError ? (
+                            <InfoTip
+                              label={`Detalle de error en ${k.label}`}
+                              text={`Último motivo reportado: ${k.lastError}`}
+                            />
+                          ) : null}
+                        </div>
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          onClick={() => onRequestDeleteKey(provider, k)}
+                        >
+                          Quitar clave
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -504,7 +631,6 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
           ) : null}
         </div>
 
-        {/* HU-06c Diff Banner */}
         {reloadDiff ? (
           <div className="diff-banner" role="status">
             <span>
@@ -592,6 +718,77 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
           </>
         )}
       </section>
+
+      {/* HU-11d Explicit IP-Sharing Ban Risk Warning Modal */}
+      {collisionPrompt ? (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={`ip-ban-risk-title-${provider.id}`}
+          onClick={() => {
+            if (!updatingKeyNodeId) setCollisionPrompt(null);
+          }}
+        >
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <h2
+              id={`ip-ban-risk-title-${provider.id}`}
+              className="card-title"
+              style={{ color: 'var(--err)' }}
+            >
+              Riesgo de baneo por IP compartida ({provider.name})
+            </h2>
+
+            <div className="alert alert-warning" role="alert">
+              <span>
+                El nodo <strong>{collisionPrompt.targetNode.name}</strong> ya tiene vinculada otra
+                clave de <strong>{provider.name}</strong>. Usar múltiples cuentas gratuitas desde
+                la misma IP de salida puede provocar bloqueos o suspensión de cuentas en el
+                proveedor.
+              </span>
+            </div>
+
+            {collisionPrompt.existingKeysOnNode.length > 0 ? (
+              <div style={{ fontSize: '0.88rem', color: 'var(--sub)' }}>
+                Claves de {provider.name} ya activas en ese nodo:
+                <ul style={{ margin: '6px 0 0', paddingLeft: 20 }}>
+                  {collisionPrompt.existingKeysOnNode.map((existing) => (
+                    <li key={existing.id}>
+                      <strong>{existing.label}</strong> (
+                      <code className="mono">{formatLast4(existing.last4)}</code>)
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                disabled={Boolean(updatingKeyNodeId)}
+                onClick={() => setCollisionPrompt(null)}
+              >
+                Cancelar cambio
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                disabled={Boolean(updatingKeyNodeId)}
+                onClick={() =>
+                  void executeNodeAssignment(
+                    collisionPrompt.key,
+                    collisionPrompt.targetNode.id,
+                    true
+                  )
+                }
+              >
+                {updatingKeyNodeId ? 'Forzando asignación…' : 'Asumir riesgo y compartir nodo'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </article>
   );
 };

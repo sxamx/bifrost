@@ -2,25 +2,32 @@ import type {
   AddProviderKeyInput,
   AuthSuccessResponse,
   CreateKeyResponse,
+  CreateNodeInput,
+  CreateNodeResult,
+  ExitNodeItem,
   KeysListResponse,
   MarketplaceCatalogState,
   MeResponse,
   ModelSyncDiff,
+  NodeAssignedKeyRef,
   ProviderKeyItem,
   ProviderManifest,
   ProviderModelItem,
   ProviderSummary,
   ProvidersResponse,
+  RotateNodeTokenResult,
   StatusResponse,
 } from './types';
 
 export class ApiError extends Error {
   public readonly status: number;
+  public readonly data: Record<string, unknown>;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, data: Record<string, unknown> = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.data = data;
   }
 }
 
@@ -65,7 +72,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       (typeof errObj.error === 'string' && errObj.error) ||
       (typeof errObj.message === 'string' && errObj.message) ||
       `Error HTTP ${response.status}`;
-    throw new ApiError(serverMsg, response.status);
+    throw new ApiError(serverMsg, response.status, errObj);
   }
 
   return payload as T;
@@ -73,6 +80,67 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 function asRecord(val: unknown): Record<string, unknown> {
   return val && typeof val === 'object' ? (val as Record<string, unknown>) : {};
+}
+
+function normalizeExitNode(raw: unknown): ExitNodeItem {
+  const r = asRecord(raw);
+  const rawMode = r.mode === 'public_ip' ? 'public_ip' : 'tailscale';
+  const rawStatus =
+    r.status === 'online' || r.status === 'unresponsive' || r.status === 'offline'
+      ? r.status
+      : 'offline';
+
+  const assignedKeysRaw = Array.isArray(r.assignedKeys)
+    ? r.assignedKeys
+    : Array.isArray(r.assigned_keys)
+      ? r.assigned_keys
+      : undefined;
+
+  const assignedKeys: NodeAssignedKeyRef[] | undefined = assignedKeysRaw?.map((item) => {
+    const k = asRecord(item);
+    return {
+      id: String(k.id ?? ''),
+      providerId: String(k.providerId ?? k.provider_id ?? ''),
+      providerName: String(
+        k.providerName ?? k.provider_name ?? k.providerId ?? k.provider_id ?? ''
+      ),
+      label: String(k.label ?? 'Clave'),
+      last4: String(k.last4 ?? '••••'),
+    };
+  });
+
+  return {
+    id: String(r.id ?? ''),
+    name: String(r.name ?? 'Nodo'),
+    mode: rawMode,
+    endpoint: String(r.endpoint ?? ''),
+    status: rawStatus,
+    lastSeenAt:
+      typeof r.lastSeenAt === 'number'
+        ? r.lastSeenAt
+        : typeof r.last_seen_at === 'number'
+          ? r.last_seen_at
+          : null,
+    lastRotatedAt:
+      typeof r.lastRotatedAt === 'number'
+        ? r.lastRotatedAt
+        : typeof r.last_rotated_at === 'number'
+          ? r.last_rotated_at
+          : null,
+    createdAt:
+      typeof r.createdAt === 'number'
+        ? r.createdAt
+        : typeof r.created_at === 'number'
+          ? r.created_at
+          : undefined,
+    assignedKeysCount:
+      typeof r.assignedKeysCount === 'number'
+        ? r.assignedKeysCount
+        : typeof r.assigned_keys_count === 'number'
+          ? r.assigned_keys_count
+          : assignedKeys?.length,
+    assignedKeys,
+  };
 }
 
 function normalizeProviderKey(raw: unknown): ProviderKeyItem {
@@ -85,7 +153,10 @@ function normalizeProviderKey(raw: unknown): ProviderKeyItem {
 
   return {
     id: String(r.id ?? ''),
-    providerId: typeof r.providerId === 'string' ? r.providerId : (r.provider_id as string | undefined),
+    providerId:
+      typeof r.providerId === 'string'
+        ? r.providerId
+        : (r.provider_id as string | undefined),
     label: String(r.label ?? r.name ?? 'Clave sin etiqueta'),
     last4: String(r.last4 ?? '••••'),
     nodeId:
@@ -133,16 +204,10 @@ function normalizeProviderModel(raw: unknown): ProviderModelItem {
   const r = asRecord(raw);
   const providerId = String(r.providerId ?? r.provider_id ?? '');
   const modelId = String(r.modelId ?? r.model_id ?? r.id ?? '');
-  const fullId = String(r.fullId ?? r.full_id ?? (providerId ? `${providerId}/${modelId}` : modelId));
+  const fullId = String(
+    r.fullId ?? r.full_id ?? (providerId ? `${providerId}/${modelId}` : modelId)
+  );
   const caps = asRecord(r.capabilities);
-  const mods = asRecord(r.modalities);
-  const modalities =
-    Array.isArray(mods.input) && Array.isArray(mods.output)
-      ? {
-          input: mods.input.map(String),
-          output: mods.output.map(String),
-        }
-      : undefined;
 
   return {
     fullId,
@@ -167,7 +232,6 @@ function normalizeProviderModel(raw: unknown): ProviderModelItem {
         : typeof r.max_output === 'number'
           ? r.max_output
           : null,
-    modalities,
     capabilities: {
       tools: Boolean(caps.tools),
       reasoning: Boolean(caps.reasoning),
@@ -180,12 +244,6 @@ function normalizeProviderModel(raw: unknown): ProviderModelItem {
         : typeof r.first_seen_at === 'number'
           ? r.first_seen_at
           : undefined,
-    upstreamCreatedAt:
-      typeof r.upstreamCreatedAt === 'number'
-        ? r.upstreamCreatedAt
-        : typeof r.upstream_created_at === 'number'
-          ? r.upstream_created_at
-          : null,
     active: r.active !== undefined ? Boolean(r.active) : true,
   };
 }
@@ -287,13 +345,11 @@ function parseModelSyncDiff(raw: unknown, previousCount?: number): ModelSyncDiff
   const totalModels =
     typeof r.total === 'number'
       ? r.total
-      : typeof r.totalActive === 'number'
-        ? r.totalActive
-        : typeof r.modelsCount === 'number'
-          ? r.modelsCount
-          : models
-            ? models.length
-            : previousCount ?? 0;
+      : typeof r.modelsCount === 'number'
+        ? r.modelsCount
+        : models
+          ? models.length
+          : previousCount ?? 0;
 
   const addedCount =
     countDiffEntry(r.added) ??
@@ -318,7 +374,6 @@ function parseModelSyncDiff(raw: unknown, previousCount?: number): ModelSyncDiff
     addedCount,
     retiredCount,
     totalModels,
-    summary: typeof r.summary === 'string' && r.summary.trim().length > 0 ? r.summary : undefined,
     models,
     syncedAt: typeof r.syncedAt === 'number' ? r.syncedAt : Math.floor(Date.now() / 1000),
   };
@@ -351,6 +406,99 @@ export const api = {
 
   getMe(): Promise<MeResponse> {
     return request<MeResponse>('/api/auth/me', { method: 'GET' });
+  },
+
+  /* Exit Nodes (Phase 3: HU-11, HU-11b, HU-11c, HU-11d, HU-08, HU-12, HU-13) */
+
+  async getNodes(): Promise<ExitNodeItem[]> {
+    const raw = await request<unknown>('/api/nodes', { method: 'GET' });
+    const r = asRecord(raw);
+    const list = Array.isArray(r.nodes) ? r.nodes : Array.isArray(raw) ? raw : [];
+    return list.map(normalizeExitNode);
+  },
+
+  async createNode(input: CreateNodeInput): Promise<CreateNodeResult> {
+    const raw = await request<unknown>('/api/nodes', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: input.name.trim(),
+        mode: input.mode,
+        endpoint: input.endpoint.trim(),
+      }),
+    });
+    const r = asRecord(raw);
+    const node = normalizeExitNode(r.node ?? raw);
+    const rawToken = String(r.rawToken ?? r.nodeToken ?? r.token ?? r.node_token ?? '');
+    const defaultScriptUrl = `${window.location.origin}/install-node.sh`;
+    const installCommand =
+      typeof r.installCommand === 'string' && r.installCommand.length > 0
+        ? r.installCommand
+        : typeof r.install_command === 'string' && r.install_command.length > 0
+          ? r.install_command
+          : `curl -fsSL ${defaultScriptUrl} | sudo bash -s -- --mode ${node.mode} --endpoint "${node.endpoint}" --token "${rawToken}"`;
+
+    return {
+      node,
+      rawToken,
+      installCommand,
+    };
+  },
+
+  async rotateNodeToken(nodeId: string): Promise<RotateNodeTokenResult> {
+    const raw = await request<unknown>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/rotate`,
+      { method: 'POST' }
+    );
+    const r = asRecord(raw);
+    return {
+      ok: r.ok !== undefined ? Boolean(r.ok) : true,
+      lastRotatedAt:
+        typeof r.lastRotatedAt === 'number'
+          ? r.lastRotatedAt
+          : typeof r.last_rotated_at === 'number'
+            ? r.last_rotated_at
+            : Math.floor(Date.now() / 1000),
+      graceSeconds:
+        typeof r.graceSeconds === 'number'
+          ? r.graceSeconds
+          : typeof r.grace_seconds === 'number'
+            ? r.grace_seconds
+            : 300,
+      rawToken:
+        typeof r.rawToken === 'string'
+          ? r.rawToken
+          : typeof r.nodeToken === 'string'
+            ? r.nodeToken
+            : typeof r.token === 'string'
+              ? r.token
+              : undefined,
+    };
+  },
+
+  deleteNode(nodeId: string): Promise<{ ok: boolean }> {
+    return request<{ ok: boolean }>(`/api/nodes/${encodeURIComponent(nodeId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async assignKeyNode(
+    providerId: string,
+    keyId: string,
+    nodeId: string | null,
+    confirmForce?: boolean
+  ): Promise<ProviderKeyItem> {
+    const raw = await request<unknown>(
+      `/api/providers/${encodeURIComponent(providerId)}/keys/${encodeURIComponent(keyId)}/node`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          nodeId,
+          confirmForce: Boolean(confirmForce),
+        }),
+      }
+    );
+    const r = asRecord(raw);
+    return normalizeProviderKey(r.key ?? raw);
   },
 
   /* Providers & Marketplace (Phase 2: HU-06, HU-06b, HU-06c, HU-07, HU-09, HU-10) */
@@ -386,7 +534,6 @@ export const api = {
         notice,
       };
     } catch (err) {
-      // HU-06: Handle offline or unreachable marketplace gracefully without crashing
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
         throw err;
       }
@@ -425,16 +572,31 @@ export const api = {
     manifest: ProviderManifest,
     adapterUrl?: string
   ): Promise<ProviderSummary> {
-    const payload: Record<string, unknown> = { manifest };
+    const body: Record<string, unknown> = {
+      manifest,
+      ...manifest,
+    };
     if (adapterUrl && adapterUrl.trim().length > 0) {
-      payload.adapterUrl = adapterUrl.trim();
+      body.adapterUrl = adapterUrl.trim();
     }
-    const raw = await request<unknown>('/api/providers', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-    const r = asRecord(raw);
-    return normalizeProviderSummary(r.provider ?? raw);
+    try {
+      const raw = await request<unknown>('/api/marketplace/install', {
+        method: 'POST',
+        body: JSON.stringify({ manifest, adapterUrl: body.adapterUrl }),
+      });
+      const r = asRecord(raw);
+      return normalizeProviderSummary(r.provider ?? raw);
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 404 || err.status === 400)) {
+        const rawFallback = await request<unknown>('/api/providers', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        const rFallback = asRecord(rawFallback);
+        return normalizeProviderSummary(rFallback.provider ?? rawFallback);
+      }
+      throw err;
+    }
   },
 
   async getProviders(): Promise<ProvidersResponse> {
@@ -467,7 +629,7 @@ export const api = {
     if (typeof input.dailyQuotaLimit === 'number' && input.dailyQuotaLimit > 0) {
       payload.dailyQuotaLimit = input.dailyQuotaLimit;
     }
-    if (input.nodeId) {
+    if (input.nodeId !== undefined) {
       payload.nodeId = input.nodeId;
     }
     const raw = await request<unknown>(
