@@ -17,6 +17,7 @@ EnvironmentFile=-/etc/default/bifrost
 ExecStart=/usr/bin/env node /opt/bifrost/core/dist/index.js
 Restart=always
 RestartSec=3
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=bifrost

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ==============================================================================
-# Stage 1: Build panel (React + Vite) and core (Hono + TypeScript)
+# Stage 1: Build panel (React + Vite PWA) and core (Hono + TypeScript)
 # ==============================================================================
 FROM node:24-bookworm-slim AS builder
 
@@ -22,7 +22,7 @@ RUN if [ -f core/package-lock.json ]; then \
       npm --prefix core install; \
     fi
 
-# Copy root manifest, JSON schemas, and sources
+# Copy root manifest, JSON schemas, node installer, and sources
 COPY package.json ./package.json
 COPY schemas ./schemas
 COPY nodes/install-node.sh ./nodes/install-node.sh
@@ -62,6 +62,8 @@ COPY --from=builder --chown=node:node /app/core/package.json /app/core/package.j
 COPY --from=builder --chown=node:node /app/core/node_modules /app/core/node_modules
 COPY --from=builder --chown=node:node /app/core/dist /app/core/dist
 
+RUN chmod 0755 /app/nodes/install-node.sh
+
 VOLUME ["/data"]
 
 USER node
@@ -72,6 +74,6 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8080) + '/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-# Generate 32-byte master.key (0600) ONLY on a brand-new empty /data volume (HU-01).
-# Never auto-generate or overwrite if bifrost.db or master.key already exists (HU-26).
-CMD ["sh", "-c", "if [ -z \"${BIFROST_MASTER_KEY:-}\" ] && [ ! -e \"${DATA_DIR:-/data}/master.key\" ] && [ ! -e \"${DATA_DIR:-/data}/bifrost.db\" ]; then node -e 'const fs=require(\"node:fs\"),crypto=require(\"node:crypto\"),dir=process.env.DATA_DIR||\"/data\";fs.mkdirSync(dir,{recursive:true,mode:0o700});fs.writeFileSync(dir+\"/master.key\",crypto.randomBytes(32),{mode:0o600});'; fi && exec node dist/index.js"]
+# Enforce 0700 on DATA_DIR and 0600 on master.key.
+# Generate a 32-byte master.key ONLY on a brand-new empty volume; never overwrite or regenerate if bifrost.db already exists.
+CMD ["sh", "-c", "DATA_PATH=\"${DATA_DIR:-/data}\" && mkdir -p \"${DATA_PATH}\" && (chmod 0700 \"${DATA_PATH}\" 2>/dev/null || true) && if [ -z \"${BIFROST_MASTER_KEY:-}\" ] && [ ! -e \"${DATA_PATH}/master.key\" ] && [ ! -e \"${DATA_PATH}/bifrost.db\" ] && [ ! -e \"${DATA_PATH}/bifrost.db-wal\" ] && [ ! -e \"${DATA_PATH}/bifrost.db-shm\" ]; then node -e 'const fs=require(\"node:fs\"),crypto=require(\"node:crypto\"),dir=process.env.DATA_DIR||\"/data\",keyFile=dir+\"/master.key\";fs.mkdirSync(dir,{recursive:true,mode:0o700});try{fs.chmodSync(dir,0o700);}catch{}fs.writeFileSync(keyFile,crypto.randomBytes(32),{mode:0o600,flag:\"wx\"});fs.chmodSync(keyFile,0o600);'; elif [ -f \"${DATA_PATH}/master.key\" ]; then chmod 0600 \"${DATA_PATH}/master.key\" 2>/dev/null || true; fi && exec node dist/index.js"]

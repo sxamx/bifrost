@@ -39,10 +39,12 @@ CREATE TABLE IF NOT EXISTS invitations (
   id TEXT PRIMARY KEY,
   token_hash TEXT UNIQUE NOT NULL,
   daily_token_limit INTEGER NOT NULL,
+  quota_reset_mode TEXT NOT NULL DEFAULT 'utc_midnight' CHECK (quota_reset_mode IN ('utc_midnight', 'rolling_24h')),
   allowed_models_json TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   used_at INTEGER,
-  created_by TEXT NOT NULL REFERENCES users(id)
+  created_by TEXT NOT NULL REFERENCES users(id),
+  created_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS user_model_access (
@@ -187,12 +189,29 @@ function ensureNodesColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureInvitationsColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare(`PRAGMA table_info(invitations)`)
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+
+  if (!colNames.has('quota_reset_mode')) {
+    db.exec(
+      `ALTER TABLE invitations ADD COLUMN quota_reset_mode TEXT NOT NULL DEFAULT 'utc_midnight' CHECK (quota_reset_mode IN ('utc_midnight', 'rolling_24h'));`,
+    );
+  }
+  if (!colNames.has('created_at')) {
+    db.exec(`ALTER TABLE invitations ADD COLUMN created_at INTEGER;`);
+  }
+}
+
 export function initDatabase(db: DatabaseSync): DatabaseSync {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA_SQL);
   ensureNodesColumns(db);
+  ensureInvitationsColumns(db);
   return db;
 }
 
@@ -205,13 +224,14 @@ export function openDatabase(dbPath: string): DatabaseSync {
 }
 
 const SENSITIVE_FIELD_RE =
-  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|x-api-key|x-goog-api-key|token|token_hash|tokenHash|prev_token_hash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|encrypted_token|encryptedToken|masterKey|master_key|authorization|proxy-authorization|proxy_authorization|cookie)$/i;
+  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|x-api-key|x-goog-api-key|token|token_hash|tokenHash|prev_token_hash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|inviteUrl|invite_url|encrypted_token|encryptedToken|masterKey|master_key|authorization|proxy-authorization|proxy_authorization|cookie)$/i;
 
 export function redactSecretsInText(text: string): string {
   return text
     .replace(/sk-bf-[A-Za-z0-9_-]{6,}/g, 'sk-bf-[REDACTED]')
     .replace(/bfnode_[A-Za-z0-9_-]{6,}/g, 'bfnode_[REDACTED]')
     .replace(/bfn_[A-Za-z0-9_-]{6,}/g, 'bfn_[REDACTED]')
+    .replace(/bfi_[A-Za-z0-9_-]{6,}/g, 'bfi_[REDACTED]')
     .replace(/sk-[A-Za-z0-9_-]{10,}/g, 'sk-[REDACTED]')
     .replace(/nvapi-[A-Za-z0-9_-]{10,}/g, 'nvapi-[REDACTED]')
     .replace(/gsk_[A-Za-z0-9_-]{10,}/g, 'gsk_[REDACTED]')

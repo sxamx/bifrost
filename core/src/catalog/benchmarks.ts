@@ -142,6 +142,8 @@ export interface ArtificialWatchSnapshot {
   models: ArtificialWatchFilteredModel[];
 }
 
+const FORBIDDEN_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 export function filterArtificialWatchPayload(
   raw: unknown,
   kind: 'bench' | 'coding',
@@ -160,10 +162,11 @@ export function filterArtificialWatchPayload(
     if (typeof m.id !== 'string' || typeof m.name !== 'string') continue;
     if (typeof m.index !== 'number' || !Number.isFinite(m.index)) continue;
 
-    // Actively strip `raw` from every board score — keep ONLY `percentile`!
-    const cleanScores: Record<string, { percentile: number }> = {};
+    // Actively strip `raw` from every board score — keep ONLY `percentile` on a null-prototype map!
+    const cleanScores = Object.create(null) as Record<string, { percentile: number }>;
     if (m.scores && typeof m.scores === 'object' && !Array.isArray(m.scores)) {
       for (const [boardKey, boardVal] of Object.entries(m.scores as Record<string, unknown>)) {
+        if (FORBIDDEN_OBJECT_KEYS.has(boardKey)) continue;
         if (boardVal && typeof boardVal === 'object') {
           const pct = (boardVal as Record<string, unknown>).percentile;
           if (typeof pct === 'number' && Number.isFinite(pct)) {
@@ -201,8 +204,9 @@ export function filterArtificialWatchPayload(
 
   let cleanSources: Record<string, { name?: string }> | null = null;
   if (obj.sources && typeof obj.sources === 'object' && !Array.isArray(obj.sources)) {
-    cleanSources = {};
+    cleanSources = Object.create(null) as Record<string, { name?: string }>;
     for (const [k, v] of Object.entries(obj.sources as Record<string, unknown>)) {
+      if (FORBIDDEN_OBJECT_KEYS.has(k)) continue;
       if (v && typeof v === 'object') {
         const name = (v as Record<string, unknown>).name;
         cleanSources[k] = typeof name === 'string' ? { name } : {};
@@ -647,13 +651,74 @@ export async function syncArtificialWatchBenchmarks(
   return { bench, coding };
 }
 
+export const MAX_EPOCH_ZIP_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+
+export async function readResponseBufferWithLimit(
+  res: Response,
+  maxBytes = MAX_EPOCH_ZIP_DOWNLOAD_BYTES,
+): Promise<Buffer> {
+  const contentLengthHeader = res.headers.get('content-length');
+  if (contentLengthHeader !== null) {
+    const declaredBytes = Number(contentLengthHeader);
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+      if (res.body) {
+        await res.body.cancel().catch(() => {});
+      }
+      throw new Error(
+        `Response Content-Length (${declaredBytes} bytes) exceeds maximum allowed (${maxBytes} bytes).`,
+      );
+    }
+  }
+
+  if (!res.body) {
+    const ab = await res.arrayBuffer();
+    if (ab.byteLength > maxBytes) {
+      throw new Error(
+        `Response body (${ab.byteLength} bytes) exceeds maximum allowed (${maxBytes} bytes).`,
+      );
+    }
+    return Buffer.from(ab);
+  }
+
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error(
+          `Streamed response body exceeded maximum allowed size (${maxBytes} bytes).`,
+        );
+      }
+      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks, totalBytes);
+}
+
 export async function syncEpochAiBenchmarks(
   db: DatabaseSync,
-  options: { fetchFn?: FetchLike; nowSec?: number; ttlSec?: number; forceRefresh?: boolean } = {},
+  options: {
+    fetchFn?: FetchLike;
+    nowSec?: number;
+    ttlSec?: number;
+    forceRefresh?: boolean;
+    maxDownloadBytes?: number;
+  } = {},
 ): Promise<EpochAiSnapshot | null> {
   const fetchFn = options.fetchFn ?? globalThis.fetch;
   const nowSec = options.nowSec ?? Math.floor(Date.now() / 1000);
   const ttlSec = options.ttlSec ?? DEFAULT_CACHE_TTL_SEC;
+  const maxDownloadBytes = options.maxDownloadBytes ?? MAX_EPOCH_ZIP_DOWNLOAD_BYTES;
 
   const existing = readExternalCache<EpochAiSnapshot>(db, CACHE_KEY_EPOCH_INTERNAL);
   if (existing && !options.forceRefresh && nowSec - existing.fetchedAt < ttlSec) {
@@ -680,11 +745,8 @@ export async function syncEpochAiBenchmarks(
       return existing ? existing.data : null;
     }
 
-    const zipArrayBuf = await res.arrayBuffer();
-    const filtered = parseAndFilterEpochZip(
-      Buffer.from(zipArrayBuf),
-      new Date(nowSec * 1000).toISOString(),
-    );
+    const zipBuf = await readResponseBufferWithLimit(res, maxDownloadBytes);
+    const filtered = parseAndFilterEpochZip(zipBuf, new Date(nowSec * 1000).toISOString());
     writeExternalCache(db, CACHE_KEY_EPOCH_INTERNAL, filtered, res.headers.get('etag'), nowSec);
     return filtered;
   } catch {

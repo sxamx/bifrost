@@ -11,6 +11,8 @@ const EOCD_SIGNATURE = 0x06054b50;
 const CEN_SIGNATURE = 0x02014b50;
 const LOC_SIGNATURE = 0x04034b50;
 
+export const MAX_ZIP_ENTRIES = 512;
+
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let i = 0; i < 256; i += 1) {
@@ -35,6 +37,13 @@ export function crc32(buf: Buffer): number {
  * Zero-dependency in-memory PKZIP reader reading the Central Directory so even
  * entries using data descriptors (bit 3) are parsed reliably, with lazy per-entry
  * decompression so excluded files (like `*_external.csv`) never even get inflated.
+ *
+ * Security hardening (VULN-07):
+ * - Enforces `MAX_ZIP_ENTRIES = 512` and cumulative `MAX_TOTAL_UNCOMPRESSED_BYTES`.
+ * - Rejects Central Directory headers/filenames extending past `centralDirEnd` or containing `\0`.
+ * - Rejects overlapping `localHeaderOffset` / payload byte ranges (`zbsm.zip` style bombs).
+ * - Enforces `maxEntryUncompressedBytes` on both stored (`method = 0`) `compressedSize` and deflate (`method = 8`).
+ * - Verifies IEEE 802.3 CRC-32 and exact uncompressed length on every extracted entry.
  */
 export function readZipArchive(
   zipBuffer: Buffer,
@@ -60,20 +69,32 @@ export function readZipArchive(
   const totalEntries = zipBuffer.readUInt16LE(eocdOffset + 10);
   const centralDirSize = zipBuffer.readUInt32LE(eocdOffset + 12);
   const centralDirOffset = zipBuffer.readUInt32LE(eocdOffset + 16);
+  const centralDirEnd = centralDirOffset + centralDirSize;
 
-  if (centralDirOffset + centralDirSize > zipBuffer.length) {
+  if (totalEntries > MAX_ZIP_ENTRIES) {
+    throw new Error(
+      `Invalid ZIP buffer: entry count (${totalEntries}) exceeds maximum allowed (${MAX_ZIP_ENTRIES}).`,
+    );
+  }
+
+  if (centralDirEnd > eocdOffset || centralDirEnd > zipBuffer.length) {
     throw new Error('Invalid ZIP buffer: Central Directory bounds exceed archive size.');
   }
+
+  const MAX_TOTAL_UNCOMPRESSED_BYTES = maxEntryUncompressedBytes * 2;
+  let totalUncompressedRead = 0;
+  const seenLocalOffsets = new Set<number>();
 
   const entries: ZipEntry[] = [];
   let cursor = centralDirOffset;
 
   for (let i = 0; i < totalEntries; i += 1) {
-    if (cursor + 46 > zipBuffer.length || zipBuffer.readUInt32LE(cursor) !== CEN_SIGNATURE) {
+    if (cursor + 46 > centralDirEnd || zipBuffer.readUInt32LE(cursor) !== CEN_SIGNATURE) {
       throw new Error('Invalid ZIP buffer: corrupt Central Directory file header.');
     }
 
     const compressionMethod = zipBuffer.readUInt16LE(cursor + 10);
+    const expectedCrc = zipBuffer.readUInt32LE(cursor + 16);
     const compressedSize = zipBuffer.readUInt32LE(cursor + 20);
     const uncompressedSize = zipBuffer.readUInt32LE(cursor + 24);
     const fileNameLen = zipBuffer.readUInt16LE(cursor + 28);
@@ -81,46 +102,103 @@ export function readZipArchive(
     const commentLen = zipBuffer.readUInt16LE(cursor + 32);
     const localHeaderOffset = zipBuffer.readUInt32LE(cursor + 42);
 
+    const nextCursor = cursor + 46 + fileNameLen + extraLen + commentLen;
+    if (nextCursor > centralDirEnd) {
+      throw new Error(
+        'Invalid ZIP buffer: Central Directory entry variable fields exceed directory bounds.',
+      );
+    }
+
     const filename = zipBuffer
       .subarray(cursor + 46, cursor + 46 + fileNameLen)
       .toString('utf8');
 
-    cursor += 46 + fileNameLen + extraLen + commentLen;
+    if (filename.includes('\0')) {
+      throw new Error('Invalid ZIP buffer: null byte in entry filename.');
+    }
+
+    cursor = nextCursor;
 
     if (filename.endsWith('/')) {
       continue;
     }
 
+    if (seenLocalOffsets.has(localHeaderOffset)) {
+      throw new Error(
+        `Invalid ZIP buffer: overlapping local header offset (${localHeaderOffset}) detected.`,
+      );
+    }
+    seenLocalOffsets.add(localHeaderOffset);
+
     const readBuffer = (): Buffer => {
-      if (uncompressedSize > maxEntryUncompressedBytes) {
+      if (
+        uncompressedSize > maxEntryUncompressedBytes ||
+        (compressionMethod === 0 && compressedSize > maxEntryUncompressedBytes)
+      ) {
         throw new Error(
           `ZIP entry "${filename}" exceeds maximum allowed uncompressed size (${maxEntryUncompressedBytes} bytes).`,
         );
       }
+      if (compressionMethod === 0 && compressedSize !== uncompressedSize) {
+        throw new Error(
+          `ZIP stored entry "${filename}" has mismatched compressedSize (${compressedSize}) and uncompressedSize (${uncompressedSize}).`,
+        );
+      }
       if (
+        localHeaderOffset + 30 > centralDirOffset ||
         localHeaderOffset + 30 > zipBuffer.length ||
         zipBuffer.readUInt32LE(localHeaderOffset) !== LOC_SIGNATURE
       ) {
         throw new Error(`Invalid local file header for ZIP entry "${filename}".`);
       }
+
       const localNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
       const localExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
       const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
       const dataEnd = dataStart + compressedSize;
-      if (dataEnd > zipBuffer.length) {
+      if (dataEnd > centralDirOffset || dataEnd > zipBuffer.length) {
         throw new Error(`Truncated compressed payload for ZIP entry "${filename}".`);
       }
 
+      if (totalUncompressedRead + uncompressedSize > MAX_TOTAL_UNCOMPRESSED_BYTES) {
+        throw new Error(
+          `ZIP archive exceeds maximum total uncompressed byte budget (${MAX_TOTAL_UNCOMPRESSED_BYTES} bytes).`,
+        );
+      }
+
       const slice = zipBuffer.subarray(dataStart, dataEnd);
+      let out: Buffer;
       if (compressionMethod === 0) {
-        return Buffer.from(slice);
+        out = Buffer.from(slice);
+      } else if (compressionMethod === 8) {
+        out = zlib.inflateRawSync(slice, { maxOutputLength: maxEntryUncompressedBytes });
+      } else {
+        throw new Error(
+          `Unsupported ZIP compression method ${compressionMethod} for entry "${filename}".`,
+        );
       }
-      if (compressionMethod === 8) {
-        return zlib.inflateRawSync(slice, { maxOutputLength: maxEntryUncompressedBytes });
+
+      if (out.length !== uncompressedSize) {
+        throw new Error(
+          `ZIP entry "${filename}" uncompressed size mismatch (expected ${uncompressedSize}, got ${out.length}).`,
+        );
       }
-      throw new Error(
-        `Unsupported ZIP compression method ${compressionMethod} for entry "${filename}".`,
-      );
+
+      totalUncompressedRead += out.length;
+      if (totalUncompressedRead > MAX_TOTAL_UNCOMPRESSED_BYTES) {
+        throw new Error(
+          `ZIP archive exceeds maximum total uncompressed byte budget (${MAX_TOTAL_UNCOMPRESSED_BYTES} bytes).`,
+        );
+      }
+
+      const actualCrc = crc32(out);
+      if (actualCrc !== expectedCrc) {
+        throw new Error(
+          `CRC32 integrity check failed for ZIP entry "${filename}" (expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}).`,
+        );
+      }
+
+      return out;
     };
 
     entries.push({
