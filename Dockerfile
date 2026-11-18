@@ -25,6 +25,7 @@ RUN if [ -f core/package-lock.json ]; then \
 # Copy root manifest, JSON schemas, and sources
 COPY package.json ./package.json
 COPY schemas ./schemas
+COPY nodes/install-node.sh ./nodes/install-node.sh
 COPY panel ./panel
 COPY core ./core
 
@@ -49,12 +50,13 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-RUN mkdir -p /data /app/core /app/panel /app/schemas \
+RUN mkdir -p /data /app/core /app/panel /app/schemas /app/nodes \
  && chmod 0700 /data \
  && chown -R node:node /data /app
 
 COPY --from=builder --chown=node:node /app/package.json /app/package.json
 COPY --from=builder --chown=node:node /app/schemas /app/schemas
+COPY --from=builder --chown=node:node /app/nodes/install-node.sh /app/nodes/install-node.sh
 COPY --from=builder --chown=node:node /app/panel/dist /app/panel/dist
 COPY --from=builder --chown=node:node /app/core/package.json /app/core/package.json
 COPY --from=builder --chown=node:node /app/core/node_modules /app/core/node_modules

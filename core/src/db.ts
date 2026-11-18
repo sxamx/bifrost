@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   mode TEXT NOT NULL CHECK (mode IN ('tailscale', 'public_ip')),
   endpoint TEXT NOT NULL,
   token_hash TEXT NOT NULL,
+  encrypted_token BLOB,
+  tls_fingerprint TEXT,
   prev_token_hash TEXT,
   prev_token_expires_at INTEGER,
   last_seen_at INTEGER,
@@ -171,11 +173,26 @@ CREATE TABLE IF NOT EXISTS external_cache (
 );
 `;
 
+function ensureNodesColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare(`PRAGMA table_info(nodes)`)
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+
+  if (!colNames.has('encrypted_token')) {
+    db.exec(`ALTER TABLE nodes ADD COLUMN encrypted_token BLOB;`);
+  }
+  if (!colNames.has('tls_fingerprint')) {
+    db.exec(`ALTER TABLE nodes ADD COLUMN tls_fingerprint TEXT;`);
+  }
+}
+
 export function initDatabase(db: DatabaseSync): DatabaseSync {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA_SQL);
+  ensureNodesColumns(db);
   return db;
 }
 
@@ -188,7 +205,7 @@ export function openDatabase(dbPath: string): DatabaseSync {
 }
 
 const SENSITIVE_FIELD_RE =
-  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|token|token_hash|tokenHash|masterKey|master_key|authorization|cookie)$/i;
+  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|token|token_hash|tokenHash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|encrypted_token|encryptedToken|masterKey|master_key|authorization|proxy-authorization|cookie)$/i;
 
 export function redactSecretsInText(text: string): string {
   return text

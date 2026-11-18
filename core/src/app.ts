@@ -14,6 +14,17 @@ import {
 } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
 import { ModelSyncHttpError, formatModelRow, syncProviderModels } from './models-sync.js';
+import {
+  NodeOperationError,
+  PUBLIC_IP_WARNING_MESSAGE,
+  type UpstreamTlsOptions,
+  buildNodeInstallCommand,
+  generateNodeToken,
+  normalizeHexFingerprint,
+  parseNodeEndpoint,
+  rotateNodeToken,
+  runNodesHealthTick,
+} from './nodes.js';
 import { DrainingRegistry, executeChatCompletions } from './router.js';
 import {
   type ProviderManifest,
@@ -21,6 +32,8 @@ import {
   loadSeedManifests,
   validateProviderManifest,
 } from './schema.js';
+
+export { runNodesHealthTick };
 
 const SESSION_COOKIE_NAME = 'bifrost_session';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
@@ -51,6 +64,7 @@ export interface CreateAppOptions {
   schemasDir?: string;
   marketplaceUrl?: string;
   fetchImpl?: typeof fetch;
+  upstreamTls?: UpstreamTlsOptions;
   now?: () => number;
 }
 
@@ -903,35 +917,99 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       dailyQuotaLimit = parsedLimit;
     }
 
+    const getNodeAssignedKeys = (targetNodeId: string, excludeKeyId?: string) => {
+      const rows = db
+        .prepare(
+          `SELECT pk.id, pk.provider_id, p.name AS provider_name, pk.label, pk.last4
+           FROM provider_keys pk
+           JOIN providers p ON p.id = pk.provider_id
+           WHERE pk.node_id = ?
+           ORDER BY pk.created_at ASC`,
+        )
+        .all(targetNodeId) as Array<Record<string, unknown>>;
+
+      return rows
+        .filter((r) => {
+          const id = String(r.id);
+          if (excludeKeyId && id === excludeKeyId) return false;
+          return !registry.isKeyDraining(id) && !registry.isProviderDraining(String(r.provider_id));
+        })
+        .map((r) => ({
+          id: String(r.id),
+          providerId: String(r.provider_id),
+          providerName: String(r.provider_name),
+          label: String(r.label),
+          last4: String(r.last4),
+        }));
+    };
+
     let assignedNodeId: string | null = null;
     let forcedNode = 0;
+    let initialKeyStatus: 'active' | 'no_node' = 'active';
+    let initialLastError: string | null = null;
 
     if (typeof body.nodeId === 'string' && body.nodeId.trim().length > 0) {
       const targetNodeId = body.nodeId.trim();
       const nodeRow = db
-        .prepare(`SELECT id FROM nodes WHERE id = ?`)
-        .get(targetNodeId) as { id: string } | undefined;
+        .prepare(`SELECT id, name, status FROM nodes WHERE id = ?`)
+        .get(targetNodeId) as { id: string; name: string; status: string } | undefined;
       if (!nodeRow) {
         return c.json({ error: `Node "${targetNodeId}" not found.` }, 400);
       }
-      assignedNodeId = targetNodeId;
-      forcedNode = body.forcedNode ? 1 : 0;
-    } else {
-      // Auto-assign to online node with fewest keys for this provider
-      const autoNode = db
-        .prepare(
-          `SELECT n.id,
-                  (SELECT COUNT(*) FROM provider_keys pk WHERE pk.node_id = n.id AND pk.provider_id = ?) AS prov_keys,
-                  (SELECT COUNT(*) FROM provider_keys pk WHERE pk.node_id = n.id) AS total_keys
-           FROM nodes n
-           WHERE n.status = 'online'
-           ORDER BY prov_keys ASC, total_keys ASC, n.created_at ASC
-           LIMIT 1`,
-        )
-        .get(providerId) as { id: string } | undefined;
 
-      if (autoNode) {
-        assignedNodeId = autoNode.id;
+      const sameProviderKeys = getNodeAssignedKeys(targetNodeId).filter(
+        (k) => k.providerId === providerId,
+      );
+      const confirmForce = body.confirmForce === true || body.forcedNode === true;
+      if (sameProviderKeys.length > 0 && !confirmForce) {
+        const collisionMsg = `Node "${nodeRow.name}" already holds ${sameProviderKeys.length} key(s) for provider "${prov.name}". Sharing the same exit IP increases ban risk.`;
+        return c.json(
+          {
+            message: collisionMsg,
+            code: 'NODE_PROVIDER_COLLISION',
+            requiresConfirmation: true,
+            existingKeys: sameProviderKeys,
+            error: {
+              message: collisionMsg,
+              code: 'NODE_PROVIDER_COLLISION',
+              requiresConfirmation: true,
+              existingKeys: sameProviderKeys,
+            },
+          },
+          409,
+        );
+      }
+
+      assignedNodeId = targetNodeId;
+      forcedNode = sameProviderKeys.length > 0 ? 1 : 0;
+      if (nodeRow.status !== 'online') {
+        initialKeyStatus = 'no_node';
+        initialLastError = `Assigned exit node "${nodeRow.name}" is ${nodeRow.status}`;
+      }
+    } else {
+      // HU-08: Auto-assign to online node with fewest keys for this specific provider
+      const onlineNodes = db
+        .prepare(`SELECT id, created_at FROM nodes WHERE status = 'online' ORDER BY created_at ASC`)
+        .all() as Array<{ id: string; created_at: number }>;
+
+      if (onlineNodes.length > 0) {
+        const scored = onlineNodes.map((n) => {
+          const assigned = getNodeAssignedKeys(n.id);
+          const provKeys = assigned.filter((k) => k.providerId === providerId).length;
+          return {
+            id: n.id,
+            provKeys,
+            totalKeys: assigned.length,
+            createdAt: Number(n.created_at),
+          };
+        });
+        scored.sort(
+          (a, b) =>
+            a.provKeys - b.provKeys ||
+            a.totalKeys - b.totalKeys ||
+            a.createdAt - b.createdAt,
+        );
+        assignedNodeId = scored[0]!.id;
       }
     }
 
@@ -946,7 +1024,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
          node_id, forced_node, daily_quota_limit,
          ratelimit_remaining, ratelimit_reset_at,
          status, last_error, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'active', NULL, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
     ).run(
       keyId,
       providerId,
@@ -956,17 +1034,30 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       assignedNodeId,
       forcedNode,
       dailyQuotaLimit,
+      initialKeyStatus,
+      initialLastError,
       createdAt,
     );
 
-    writeSystemLog(
-      db,
-      'info',
-      'system',
-      `Key "${label}" (…${last4}) registered on provider "${providerId}"`,
-      { providerId, keyId, last4, nodeId: assignedNodeId },
-      createdAt,
-    );
+    if (forcedNode === 1 && assignedNodeId) {
+      writeSystemLog(
+        db,
+        'warn',
+        'node',
+        `Key "${label}" (…${last4}) forcibly assigned to node "${assignedNodeId}" sharing IP with existing "${providerId}" key(s)`,
+        { providerId, keyId, last4, nodeId: assignedNodeId, forcedNode: true },
+        createdAt,
+      );
+    } else {
+      writeSystemLog(
+        db,
+        'info',
+        'system',
+        `Key "${label}" (…${last4}) registered on provider "${providerId}"`,
+        { providerId, keyId, last4, nodeId: assignedNodeId },
+        createdAt,
+      );
+    }
 
     const inserted = db
       .prepare(
@@ -979,6 +1070,206 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       .get(keyId) as Record<string, unknown>;
 
     return c.json({ key: formatProviderKeyRow(inserted) }, 201);
+  });
+
+  // --- Key-to-Node Assignment & Same-Provider Collision Confirmation (HU-08, HU-11d) ---
+
+  app.patch('/api/providers/:id/keys/:keyId/node', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const providerId = c.req.param('id');
+    const keyId = c.req.param('keyId');
+
+    if (registry.isProviderDraining(providerId) || registry.isKeyDraining(keyId)) {
+      return c.json({ error: 'Provider key not found.' }, 404);
+    }
+
+    const prov = db
+      .prepare(`SELECT id, name FROM providers WHERE id = ?`)
+      .get(providerId) as { id: string; name: string } | undefined;
+    if (!prov) {
+      return c.json({ error: `Provider "${providerId}" not found.` }, 404);
+    }
+
+    const existingKey = db
+      .prepare(
+        `SELECT id, provider_id, label, last4, node_id, forced_node, status, last_error
+         FROM provider_keys
+         WHERE id = ? AND provider_id = ?`,
+      )
+      .get(keyId, providerId) as
+      | {
+          id: string;
+          provider_id: string;
+          label: string;
+          last4: string;
+          node_id: string | null;
+          forced_node: number;
+          status: string;
+          last_error: string | null;
+        }
+      | undefined;
+
+    if (!existingKey) {
+      return c.json({ error: 'Provider key not found.' }, 404);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const rawNodeId = body.nodeId;
+    const confirmForce = body.confirmForce === true;
+    const nowSec = nowSeconds();
+
+    if (rawNodeId === null || rawNodeId === '') {
+      const nextStatus = existingKey.status === 'no_node' ? 'active' : existingKey.status;
+      const nextLastError = existingKey.status === 'no_node' ? null : existingKey.last_error;
+
+      db.prepare(
+        `UPDATE provider_keys
+         SET node_id = NULL, forced_node = 0, status = ?, last_error = ?
+         WHERE id = ? AND provider_id = ?`,
+      ).run(nextStatus, nextLastError, keyId, providerId);
+
+      writeSystemLog(
+        db,
+        'info',
+        'node',
+        `Key "${existingKey.label}" (…${existingKey.last4}) unassigned from exit node (direct server egress)`,
+        { providerId, keyId, previousNodeId: existingKey.node_id },
+        nowSec,
+      );
+
+      const updated = db
+        .prepare(
+          `SELECT id, provider_id, label, last4, node_id, forced_node,
+                  daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
+                  status, last_error, created_at
+           FROM provider_keys
+           WHERE id = ?`,
+        )
+        .get(keyId) as Record<string, unknown>;
+
+      return c.json({ key: formatProviderKeyRow(updated) });
+    }
+
+    if (typeof rawNodeId !== 'string' || !rawNodeId.trim()) {
+      return c.json({ error: 'nodeId must be a valid node ID string or null.' }, 400);
+    }
+
+    const targetNodeId = rawNodeId.trim();
+    const targetNode = db
+      .prepare(`SELECT id, name, status FROM nodes WHERE id = ?`)
+      .get(targetNodeId) as { id: string; name: string; status: string } | undefined;
+
+    if (!targetNode) {
+      return c.json({ error: `Node "${targetNodeId}" not found.` }, 404);
+    }
+
+    const siblingRows = db
+      .prepare(
+        `SELECT id, label, last4
+         FROM provider_keys
+         WHERE node_id = ? AND provider_id = ? AND id != ?
+         ORDER BY created_at ASC`,
+      )
+      .all(targetNodeId, providerId, keyId) as Array<{
+      id: string;
+      label: string;
+      last4: string;
+    }>;
+
+    const activeSiblings = siblingRows
+      .filter((s) => !registry.isKeyDraining(s.id))
+      .map((s) => ({
+        id: s.id,
+        providerId,
+        providerName: prov.name,
+        label: s.label,
+        last4: s.last4,
+      }));
+
+    if (activeSiblings.length > 0 && !confirmForce) {
+      const collisionMessage = `Node "${targetNode.name}" already holds ${activeSiblings.length} key(s) for provider "${prov.name}". Sharing the same exit IP increases ban risk.`;
+      return c.json(
+        {
+          message: collisionMessage,
+          code: 'NODE_PROVIDER_COLLISION',
+          requiresConfirmation: true,
+          existingKeys: activeSiblings,
+          error: {
+            message: collisionMessage,
+            code: 'NODE_PROVIDER_COLLISION',
+            requiresConfirmation: true,
+            existingKeys: activeSiblings,
+          },
+        },
+        409,
+      );
+    }
+
+    const forcedFlag = activeSiblings.length > 0 ? 1 : 0;
+    let nextStatus = existingKey.status;
+    let nextLastError = existingKey.last_error;
+
+    if (targetNode.status !== 'online') {
+      nextStatus = 'no_node';
+      nextLastError = `Assigned exit node "${targetNode.name}" is ${targetNode.status}`;
+    } else if (existingKey.status === 'no_node') {
+      nextStatus = 'active';
+      nextLastError = null;
+    }
+
+    db.prepare(
+      `UPDATE provider_keys
+       SET node_id = ?, forced_node = ?, status = ?, last_error = ?
+       WHERE id = ? AND provider_id = ?`,
+    ).run(targetNodeId, forcedFlag, nextStatus, nextLastError, keyId, providerId);
+
+    if (forcedFlag === 1) {
+      writeSystemLog(
+        db,
+        'warn',
+        'node',
+        `Admin confirmed same-provider IP collision: key "${existingKey.label}" (…${existingKey.last4}) assigned to node "${targetNode.name}" alongside ${activeSiblings.length} existing "${prov.name}" key(s)`,
+        {
+          providerId,
+          keyId,
+          nodeId: targetNodeId,
+          forcedNode: true,
+          collidingKeyIds: activeSiblings.map((k) => k.id),
+        },
+        nowSec,
+      );
+    } else {
+      writeSystemLog(
+        db,
+        'info',
+        'node',
+        `Key "${existingKey.label}" (…${existingKey.last4}) assigned to exit node "${targetNode.name}"`,
+        { providerId, keyId, nodeId: targetNodeId, forcedNode: false },
+        nowSec,
+      );
+    }
+
+    const updated = db
+      .prepare(
+        `SELECT id, provider_id, label, last4, node_id, forced_node,
+                daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
+                status, last_error, created_at
+         FROM provider_keys
+         WHERE id = ?`,
+      )
+      .get(keyId) as Record<string, unknown>;
+
+    return c.json({ key: formatProviderKeyRow(updated) });
   });
 
   app.delete('/api/providers/:id/keys/:keyId', (c) => {
@@ -1031,6 +1322,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       drainingKeys: registry.getDrainingKeys(),
       drainingProviders: registry.getDrainingProviders(),
       fetchImpl,
+      upstreamTls: options.upstreamTls,
       nowSec: nowSeconds(),
     });
   };
@@ -1202,6 +1494,295 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     );
 
     return c.json({ ok: true });
+  });
+
+  // --- Exit Nodes Management (HU-11, HU-11b, HU-11c, HU-13) ---
+
+  const listNodeAssignedKeys = (nodeId: string) => {
+    const rows = db
+      .prepare(
+        `SELECT pk.id, pk.provider_id, p.name AS provider_name, pk.label, pk.last4
+         FROM provider_keys pk
+         JOIN providers p ON p.id = pk.provider_id
+         WHERE pk.node_id = ?
+         ORDER BY pk.created_at ASC`,
+      )
+      .all(nodeId) as Array<Record<string, unknown>>;
+
+    return rows
+      .filter(
+        (r) =>
+          !registry.isKeyDraining(String(r.id)) &&
+          !registry.isProviderDraining(String(r.provider_id)),
+      )
+      .map((r) => ({
+        id: String(r.id),
+        providerId: String(r.provider_id),
+        providerName: String(r.provider_name),
+        label: String(r.label),
+        last4: String(r.last4),
+      }));
+  };
+
+  const formatNodeItem = (row: Record<string, unknown>) => {
+    const nodeId = String(row.id);
+    const assignedKeys = listNodeAssignedKeys(nodeId);
+    return {
+      id: nodeId,
+      name: String(row.name),
+      mode: row.mode === 'public_ip' ? ('public_ip' as const) : ('tailscale' as const),
+      endpoint: String(row.endpoint),
+      tlsFingerprint:
+        row.tls_fingerprint === null || row.tls_fingerprint === undefined
+          ? null
+          : String(row.tls_fingerprint),
+      status:
+        row.status === 'online' || row.status === 'unresponsive'
+          ? (String(row.status) as 'online' | 'unresponsive')
+          : ('offline' as const),
+      lastSeenAt:
+        row.last_seen_at === null || row.last_seen_at === undefined
+          ? null
+          : Number(row.last_seen_at),
+      lastRotatedAt:
+        row.last_rotated_at === null || row.last_rotated_at === undefined
+          ? null
+          : Number(row.last_rotated_at),
+      createdAt: Number(row.created_at),
+      assignedKeysCount: assignedKeys.length,
+      assignedKeys,
+      affectedKeys: assignedKeys,
+    };
+  };
+
+  app.get('/api/nodes', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const rows = db
+      .prepare(
+        `SELECT id, name, mode, endpoint, tls_fingerprint,
+                last_seen_at, last_rotated_at, status, created_at
+         FROM nodes
+         ORDER BY created_at ASC`,
+      )
+      .all() as Array<Record<string, unknown>>;
+
+    return c.json({ nodes: rows.map(formatNodeItem) });
+  });
+
+  app.post('/api/nodes', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const mode = body.mode;
+    const rawEndpoint = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
+
+    if (!name || name.length > 100) {
+      return c.json({ error: 'Node name must be between 1 and 100 characters.' }, 400);
+    }
+    if (mode !== 'tailscale' && mode !== 'public_ip') {
+      return c.json({ error: 'Node mode must be "tailscale" or "public_ip".' }, 400);
+    }
+
+    const parsedEndpoint = parseNodeEndpoint(rawEndpoint);
+    if (!parsedEndpoint) {
+      return c.json(
+        {
+          error:
+            'Invalid node endpoint. Expected "<host>:<port>" or "<host>" (default port 9443).',
+        },
+        400,
+      );
+    }
+
+    let tlsFingerprint: string | null = null;
+    if (typeof body.tlsFingerprint === 'string' && body.tlsFingerprint.trim().length > 0) {
+      const normFp = normalizeHexFingerprint(body.tlsFingerprint);
+      if (!/^[0-9A-F]{64}$/.test(normFp)) {
+        return c.json(
+          { error: 'tlsFingerprint must be a valid 64-character SHA-256 hex digest.' },
+          400,
+        );
+      }
+      tlsFingerprint = normFp;
+    }
+
+    const existingEndpoint = db
+      .prepare(`SELECT id, name FROM nodes WHERE endpoint = ?`)
+      .get(parsedEndpoint.normalized) as { id: string; name: string } | undefined;
+    if (existingEndpoint) {
+      return c.json(
+        {
+          error: `An exit node ("${existingEndpoint.name}") is already registered for endpoint "${parsedEndpoint.normalized}".`,
+        },
+        409,
+      );
+    }
+
+    const nodeId = randomUUID();
+    const createdAt = nowSeconds();
+    const { rawToken, tokenHash } = generateNodeToken();
+    const encryptedToken = encryptSecret(rawToken, masterKey);
+
+    db.prepare(
+      `INSERT INTO nodes (
+         id, name, mode, endpoint, token_hash, encrypted_token,
+         prev_token_hash, prev_token_expires_at, tls_fingerprint,
+         last_seen_at, last_rotated_at, status, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, 'offline', ?)`,
+    ).run(
+      nodeId,
+      name,
+      mode,
+      parsedEndpoint.normalized,
+      tokenHash,
+      encryptedToken,
+      tlsFingerprint,
+      createdAt,
+      createdAt,
+    );
+
+    let serverOrigin: string | undefined;
+    try {
+      serverOrigin = new URL(c.req.url).origin;
+    } catch {
+      serverOrigin = undefined;
+    }
+
+    const installCommand = buildNodeInstallCommand({
+      mode,
+      endpoint: parsedEndpoint.normalized,
+      rawToken,
+      serverOrigin,
+    });
+    const publicIpWarning = mode === 'public_ip' ? PUBLIC_IP_WARNING_MESSAGE : null;
+
+    writeSystemLog(
+      db,
+      mode === 'public_ip' ? 'warn' : 'info',
+      'node',
+      `Exit node "${name}" (${parsedEndpoint.normalized}) registered in ${mode} mode`,
+      {
+        nodeId,
+        name,
+        mode,
+        endpoint: parsedEndpoint.normalized,
+        hasPinnedTlsFingerprint: tlsFingerprint !== null,
+      },
+      createdAt,
+    );
+
+    const insertedRow = db
+      .prepare(
+        `SELECT id, name, mode, endpoint, tls_fingerprint,
+                last_seen_at, last_rotated_at, status, created_at
+         FROM nodes
+         WHERE id = ?`,
+      )
+      .get(nodeId) as Record<string, unknown>;
+
+    return c.json(
+      {
+        node: formatNodeItem(insertedRow),
+        rawToken,
+        installCommand,
+        publicIpWarning,
+      },
+      201,
+    );
+  });
+
+  app.post('/api/nodes/:id/rotate', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const nodeId = c.req.param('id');
+    try {
+      const result = await rotateNodeToken({
+        db,
+        masterKey,
+        nodeId,
+        nowSec: nowSeconds(),
+      });
+      return c.json(result);
+    } catch (err) {
+      if (err instanceof NodeOperationError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.delete('/api/nodes/:id', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const nodeId = c.req.param('id');
+    const existingNode = db
+      .prepare(`SELECT id, name, endpoint FROM nodes WHERE id = ?`)
+      .get(nodeId) as { id: string; name: string; endpoint: string } | undefined;
+
+    if (!existingNode) {
+      return c.json({ error: `Node "${nodeId}" not found.` }, 404);
+    }
+
+    const affectedKeys = listNodeAssignedKeys(nodeId);
+    const nowSec = nowSeconds();
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare(
+        `UPDATE provider_keys
+         SET node_id = NULL,
+             forced_node = 0,
+             status = 'no_node',
+             last_error = 'Assigned exit node was removed'
+         WHERE node_id = ?`,
+      ).run(nodeId);
+
+      db.prepare(`DELETE FROM nodes WHERE id = ?`).run(nodeId);
+
+      writeSystemLog(
+        db,
+        affectedKeys.length > 0 ? 'warn' : 'info',
+        'node',
+        `Exit node "${existingNode.name}" (${existingNode.endpoint}) removed${affectedKeys.length > 0 ? `; ${affectedKeys.length} key(s) marked as no_node` : ''}`,
+        {
+          nodeId,
+          affectedKeysCount: affectedKeys.length,
+          affectedKeyIds: affectedKeys.map((k) => k.id),
+        },
+        nowSec,
+      );
+
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+
+    return c.json({
+      ok: true,
+      affectedKeysCount: affectedKeys.length,
+      affectedKeys,
+    });
   });
 
   app.all('/api/*', (c) => {
@@ -1485,6 +2066,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       masterKey,
       registry,
       fetchImpl,
+      upstreamTls: options.upstreamTls,
       now,
       userId: user.id,
       modelFullId: modelRow.full_id,
@@ -1503,6 +2085,17 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       ),
       404,
     );
+  });
+
+  // --- Egress Node One-Command Installer Script (HU-11) ---
+
+  app.get('/install-node.sh', (c) => {
+    const candidateScript = path.resolve(import.meta.dirname, '../../nodes/install-node.sh');
+    if (fs.existsSync(candidateScript) && fs.statSync(candidateScript).isFile()) {
+      const script = fs.readFileSync(candidateScript, 'utf8');
+      return c.body(script, 200, { 'Content-Type': 'text/x-shellscript; charset=utf-8' });
+    }
+    return c.json({ error: 'Node installer script not found on this server.' }, 404);
   });
 
   // --- Static SPA serving from panel/dist ---

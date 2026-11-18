@@ -2,6 +2,11 @@ import type { DatabaseSync } from 'node:sqlite';
 import { decryptSecret } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
 import {
+  type NodeMode,
+  type UpstreamTlsOptions,
+  fetchViaExitNode,
+} from './nodes.js';
+import {
   type ProviderFreeRule,
   type ProviderManifest,
   buildProviderAuthHeaders,
@@ -89,7 +94,6 @@ function matchesFreeRule(rawModel: Record<string, unknown>, freeRule?: ProviderF
   const modelId = typeof rawModel.id === 'string' ? rawModel.id.trim() : '';
   if (!modelId) return false;
 
-  // Exclude obvious non-chat model types
   const modelType = typeof rawModel.type === 'string' ? rawModel.type.toLowerCase() : '';
   if (
     modelType === 'embedding' ||
@@ -349,10 +353,19 @@ export async function syncProviderModels(options: {
   drainingKeys: ReadonlySet<string>;
   drainingProviders: ReadonlySet<string>;
   fetchImpl: typeof fetch;
+  upstreamTls?: UpstreamTlsOptions;
   nowSec: number;
 }): Promise<ModelSyncResult> {
-  const { db, masterKey, providerId, drainingKeys, drainingProviders, fetchImpl, nowSec } =
-    options;
+  const {
+    db,
+    masterKey,
+    providerId,
+    drainingKeys,
+    drainingProviders,
+    fetchImpl,
+    upstreamTls,
+    nowSec,
+  } = options;
 
   if (drainingProviders.has(providerId)) {
     throw new ModelSyncHttpError(`Provider "${providerId}" not found.`, 404);
@@ -368,28 +381,44 @@ export async function syncProviderModels(options: {
 
   const manifest = JSON.parse(String(providerRow.schema_json)) as ProviderManifest;
 
-  const keyRows = (
+  const allKeyRows = (
     db
       .prepare(
-        `SELECT id, label, encrypted_secret, status
-         FROM provider_keys
-         WHERE provider_id = ?
-         ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, created_at ASC`,
+        `SELECT pk.id, pk.label, pk.encrypted_secret, pk.status, pk.node_id,
+                n.name AS node_name, n.mode AS node_mode, n.endpoint AS node_endpoint,
+                n.encrypted_token AS node_encrypted_token, n.tls_fingerprint AS node_tls_fingerprint,
+                n.status AS node_status
+         FROM provider_keys pk
+         LEFT JOIN nodes n ON n.id = pk.node_id
+         WHERE pk.provider_id = ?
+         ORDER BY CASE WHEN pk.status = 'active' THEN 0 ELSE 1 END, pk.created_at ASC`,
       )
       .all(providerId) as Array<Record<string, unknown>>
   ).filter((k) => !drainingKeys.has(String(k.id)));
 
-  if (keyRows.length === 0) {
+  if (allKeyRows.length === 0) {
     throw new ModelSyncHttpError(
       `Provider "${manifest.name}" requires at least one configured API key before detecting models.`,
       400,
     );
   }
 
+  const keyRows = allKeyRows.filter(
+    (k) =>
+      k.status !== 'no_node' &&
+      (k.node_id === null || k.node_id === undefined || k.node_status === 'online'),
+  );
+
+  if (keyRows.length === 0) {
+    throw new ModelSyncHttpError(
+      `All configured keys for provider "${manifest.name}" are assigned to offline or unresponsive exit nodes.`,
+      502,
+    );
+  }
+
   let candidates: NormalizedCandidateModel[] = [];
 
   if (manifest.modelsSource === 'static') {
-    // Decrypt at least one key to verify key integrity with masterKey
     decryptSecret(keyRows[0]!.encrypted_secret as Uint8Array, masterKey);
 
     candidates = (manifest.staticModels ?? []).map((sm) => ({
@@ -424,10 +453,36 @@ export async function syncProviderModels(options: {
       const rawSecret = decryptSecret(kRow.encrypted_secret as Uint8Array, masterKey);
       const headers = buildProviderAuthHeaders(manifest.auth, rawSecret);
       try {
-        const res = await fetchImpl(modelsUrl, {
-          method: 'GET',
-          headers,
-        });
+        let res: Response;
+        if (
+          typeof kRow.node_id === 'string' &&
+          kRow.node_id.length > 0 &&
+          kRow.node_encrypted_token
+        ) {
+          const nodeToken = decryptSecret(kRow.node_encrypted_token as Uint8Array, masterKey);
+          res = await fetchViaExitNode(
+            modelsUrl,
+            { method: 'GET', headers },
+            {
+              id: kRow.node_id,
+              name: String(kRow.node_name ?? kRow.node_id),
+              mode: (kRow.node_mode === 'public_ip' ? 'public_ip' : 'tailscale') as NodeMode,
+              endpoint: String(kRow.node_endpoint),
+              rawToken: nodeToken,
+              tlsFingerprint:
+                kRow.node_tls_fingerprint === null || kRow.node_tls_fingerprint === undefined
+                  ? null
+                  : String(kRow.node_tls_fingerprint),
+            },
+            upstreamTls,
+          );
+        } else {
+          res = await fetchImpl(modelsUrl, {
+            method: 'GET',
+            headers,
+          });
+        }
+
         if (!res.ok) {
           lastErrMessage = `Upstream returned HTTP ${res.status}`;
           continue;

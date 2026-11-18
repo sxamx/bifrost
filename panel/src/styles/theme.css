@@ -1195,3 +1195,92 @@ button {
   border-color: var(--accent);
   box-shadow: 0 0 0 4px rgba(0, 87, 255, 0.13);
 }
+
+/* Phase 3 — Exit Nodes Styles (HU-11, HU-11b, HU-11c, HU-11d, HU-12, HU-13) */
+.status-badge.online {
+  background: var(--ok-soft);
+  color: var(--ok);
+  border: 1px solid rgba(11, 107, 92, 0.28);
+}
+
+.status-badge.unresponsive {
+  background: var(--err-soft);
+  color: var(--err);
+  border: 1px solid rgba(192, 57, 43, 0.34);
+}
+
+.status-badge.offline {
+  background: var(--surface-muted);
+  color: var(--sub);
+  border: 1px solid var(--line);
+}
+
+.status-dot.offline {
+  background: #8da2bc;
+}
+
+.mode-selector-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+}
+
+.mode-option-card {
+  text-align: left;
+  background: #ffffff;
+  border: 1.5px solid var(--line);
+  border-radius: 14px;
+  padding: 15px 17px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.mode-option-card:hover {
+  border-color: #9cb5d4;
+}
+
+.mode-option-card.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 3px rgba(0, 87, 255, 0.1);
+}
+
+.select-compact {
+  padding: 6px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: #ffffff;
+  color: var(--fg);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  max-width: 230px;
+}
+
+.select-compact:hover {
+  border-color: var(--accent);
+}
+
+.select-compact:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 87, 255, 0.12);
+}
+
+.affected-keys-list {
+  margin: 0;
+  padding: 12px 16px 12px 30px;
+  background: var(--err-soft);
+  border: 1px solid rgba(192, 57, 43, 0.28);
+  border-radius: 12px;
+  color: var(--fg);
+  font-size: 0.86rem;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+}

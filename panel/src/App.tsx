@@ -3,6 +3,7 @@ import { api, ApiError } from './api';
 import { ApiKeysTab } from './components/ApiKeysTab';
 import { BrandMark } from './components/BrandMark';
 import { LoginScreen } from './components/LoginScreen';
+import { NodesTab } from './components/NodesTab';
 import { OverviewTab } from './components/OverviewTab';
 import { ProvidersTab } from './components/ProvidersTab';
 import { SetupScreen } from './components/SetupScreen';
@@ -10,6 +11,7 @@ import type {
   ActiveTab,
   AuthUser,
   DashboardStats,
+  ExitNodeItem,
   InternalApiKey,
   ProviderSummary,
 } from './types';
@@ -22,6 +24,22 @@ const EMPTY_STATS: DashboardStats = {
   keysCount: 0,
 };
 
+async function enrichProvidersWithKeys(list: ProviderSummary[]): Promise<ProviderSummary[]> {
+  return Promise.all(
+    list.map(async (prov) => {
+      if (Array.isArray(prov.keys)) {
+        return prov;
+      }
+      try {
+        const fetchedKeys = await api.getProviderKeys(prov.id);
+        return { ...prov, keys: fetchedKeys };
+      } catch {
+        return prov;
+      }
+    })
+  );
+}
+
 export const App: React.FC = () => {
   const [stage, setStage] = useState<BootStage>('loading');
   const [bootError, setBootError] = useState<string | null>(null);
@@ -31,6 +49,9 @@ export const App: React.FC = () => {
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const [providersLoaded, setProvidersLoaded] = useState(false);
   const [providersLoading, setProvidersLoading] = useState(false);
+
+  const [nodes, setNodes] = useState<ExitNodeItem[]>([]);
+  const [nodesLoading, setNodesLoading] = useState(false);
 
   const [keys, setKeys] = useState<InternalApiKey[]>([]);
   const [keysLoading, setKeysLoading] = useState(false);
@@ -43,14 +64,23 @@ export const App: React.FC = () => {
   const [guestInfoModalOpen, setGuestInfoModalOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
 
-  const loadWorkspaceData = useCallback(async () => {
+  const loadWorkspaceData = useCallback(async (role: string) => {
     setProvidersLoading(true);
     setKeysLoading(true);
+    if (role === 'admin') {
+      setNodesLoading(true);
+    }
 
-    const [providersRes, keysRes] = await Promise.allSettled([api.getProviders(), api.getKeys()]);
+    const [providersRes, keysRes, nodesRes] = await Promise.allSettled([
+      api.getProviders(),
+      api.getKeys(),
+      role === 'admin' ? api.getNodes() : Promise.resolve([] as ExitNodeItem[]),
+    ]);
 
     if (providersRes.status === 'fulfilled' && Array.isArray(providersRes.value?.providers)) {
-      setProviders(providersRes.value.providers);
+      const baseList = providersRes.value.providers;
+      const hydrated = role === 'admin' ? await enrichProvidersWithKeys(baseList) : baseList;
+      setProviders(hydrated);
       setProvidersLoaded(true);
     } else {
       setProviders([]);
@@ -64,6 +94,13 @@ export const App: React.FC = () => {
       setKeys([]);
     }
     setKeysLoading(false);
+
+    if (nodesRes.status === 'fulfilled' && Array.isArray(nodesRes.value)) {
+      setNodes(nodesRes.value);
+    } else {
+      setNodes([]);
+    }
+    setNodesLoading(false);
   }, []);
 
   const bootstrap = useCallback(async () => {
@@ -90,10 +127,11 @@ export const App: React.FC = () => {
     }
 
     if (meResult.status === 'fulfilled') {
-      setUser(meResult.value.user);
+      const authedUser = meResult.value.user;
+      setUser(authedUser);
       setStats(meResult.value.stats ?? EMPTY_STATS);
       setStage('authenticated');
-      await loadWorkspaceData();
+      await loadWorkspaceData(authedUser.role);
       return;
     }
 
@@ -126,14 +164,26 @@ export const App: React.FC = () => {
     }
   }, []);
 
-  const refreshProvidersAndStats = useCallback(async () => {
+  const refreshProvidersNodesAndStats = useCallback(async () => {
     setProvidersLoading(true);
-    const [providersResult, meResult] = await Promise.allSettled([api.getProviders(), api.getMe()]);
+    setNodesLoading(true);
+    const [providersResult, nodesResult, meResult] = await Promise.allSettled([
+      api.getProviders(),
+      api.getNodes(),
+      api.getMe(),
+    ]);
+
     if (providersResult.status === 'fulfilled' && Array.isArray(providersResult.value?.providers)) {
-      setProviders(providersResult.value.providers);
+      const hydrated = await enrichProvidersWithKeys(providersResult.value.providers);
+      setProviders(hydrated);
       setProvidersLoaded(true);
     }
     setProvidersLoading(false);
+
+    if (nodesResult.status === 'fulfilled' && Array.isArray(nodesResult.value)) {
+      setNodes(nodesResult.value);
+    }
+    setNodesLoading(false);
 
     if (meResult.status === 'fulfilled') {
       setUser(meResult.value.user);
@@ -154,6 +204,7 @@ export const App: React.FC = () => {
       setLoggingOut(false);
       setUser(null);
       setProviders([]);
+      setNodes([]);
       setKeys([]);
       setActiveTab('overview');
       setStage('login');
@@ -231,16 +282,27 @@ export const App: React.FC = () => {
             </button>
 
             {isAdmin ? (
-              <button
-                type="button"
-                className={`nav-tab${activeTab === 'providers' ? ' active' : ''}`}
-                onClick={() => setActiveTab('providers')}
-              >
-                <span>Proveedores</span>
-                <span className="nav-tab-pill">
-                  {providersLoaded ? providers.length : stats.providersCount}
-                </span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  className={`nav-tab${activeTab === 'providers' ? ' active' : ''}`}
+                  onClick={() => setActiveTab('providers')}
+                >
+                  <span>Proveedores</span>
+                  <span className="nav-tab-pill">
+                    {providersLoaded ? providers.length : stats.providersCount}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`nav-tab${activeTab === 'nodes' ? ' active' : ''}`}
+                  onClick={() => setActiveTab('nodes')}
+                >
+                  <span>Nodos</span>
+                  <span className="nav-tab-pill">{nodes.length}</span>
+                </button>
+              </>
             ) : null}
           </nav>
 
@@ -295,15 +357,24 @@ export const App: React.FC = () => {
         {activeTab === 'providers' && isAdmin ? (
           <ProvidersTab
             providers={providers}
+            nodes={nodes}
             loading={providersLoading}
             initialSubView={providersSubView}
             onInitialSubViewConsumed={() => setProvidersSubView(undefined)}
-            onProvidersChanged={refreshProvidersAndStats}
+            onProvidersChanged={refreshProvidersNodesAndStats}
+          />
+        ) : null}
+
+        {activeTab === 'nodes' && isAdmin ? (
+          <NodesTab
+            nodes={nodes}
+            providers={providers}
+            loading={nodesLoading}
+            onNodesChanged={refreshProvidersNodesAndStats}
           />
         ) : null}
       </main>
 
-      {/* Info Modal for Guest Role clicking Add Provider */}
       {guestInfoModalOpen ? (
         <div
           className="modal-backdrop"
