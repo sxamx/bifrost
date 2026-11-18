@@ -3,15 +3,25 @@ import { api, ApiError } from '../api';
 import type {
   ExitNodeItem,
   MarketplaceCatalogState,
+  ProviderCategory,
   ProviderKeyItem,
   ProviderManifest,
   ProviderModelItem,
   ProviderSummary,
 } from '../types';
 import { InfoTip } from './InfoTip';
+import { ProviderLogo } from './ProviderLogo';
 import { ProviderVaultCard } from './ProviderVaultCard';
 
 type ProvidersSubView = 'installed' | 'marketplace' | 'local-json';
+type MarketplaceCategoryFilter = 'all' | ProviderCategory;
+
+function formatProviderCategoryLabel(cat?: ProviderCategory): string {
+  if (cat === 'aggregator') return 'Agregador';
+  if (cat === 'official-api') return 'API Oficial';
+  if (cat === 'experimental-adapter') return 'Adaptador Experimental';
+  return 'Catálogo';
+}
 
 interface ProvidersTabProps {
   providers: ProviderSummary[];
@@ -101,6 +111,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   });
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState<MarketplaceCategoryFilter>('all');
   const [installingId, setInstallingId] = useState<string | null>(null);
   const [adapterUrlsById, setAdapterUrlsById] = useState<Record<string, string>>({});
 
@@ -190,14 +201,22 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
 
   const filteredManifests = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    if (!q) return catalog.manifests;
-    return catalog.manifests.filter(
-      (m) =>
+    return catalog.manifests.filter((m) => {
+      if (m.approved === false) return false;
+      const effectiveCategory: ProviderCategory =
+        m.category ??
+        (m.packageType === 'experimental-adapter' ? 'experimental-adapter' : 'official-api');
+      if (categoryFilter !== 'all' && effectiveCategory !== categoryFilter) {
+        return false;
+      }
+      if (!q) return true;
+      return (
         m.name.toLowerCase().includes(q) ||
         m.id.toLowerCase().includes(q) ||
-        (m.category ?? '').toLowerCase().includes(q)
-    );
-  }, [catalog.manifests, searchQuery]);
+        effectiveCategory.toLowerCase().includes(q)
+      );
+    });
+  }, [catalog.manifests, categoryFilter, searchQuery]);
 
   async function handleInstallFromCatalog(manifest: ProviderManifest) {
     setGlobalError(null);
@@ -472,31 +491,68 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
           ) : null}
 
           <div className="card" style={{ padding: '20px 24px' }}>
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: 14,
-                flexWrap: 'wrap',
-              }}
-            >
-              <input
-                type="search"
-                className="input"
-                style={{ maxWidth: 420 }}
-                placeholder="Buscar proveedor por nombre, id o categoría…"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-              />
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => void loadCatalog()}
-                disabled={catalogLoading}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 14,
+                  flexWrap: 'wrap',
+                }}
               >
-                {catalogLoading ? 'Actualizando…' : 'Actualizar catálogo'}
-              </button>
+                <input
+                  type="search"
+                  className="input"
+                  style={{ maxWidth: 400 }}
+                  placeholder="Buscar paquete aprobado por nombre, id o categoría…"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => void loadCatalog()}
+                  disabled={catalogLoading}
+                >
+                  {catalogLoading ? 'Actualizando…' : 'Actualizar catálogo'}
+                </button>
+              </div>
+
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 12,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <div className="subnav-bar" role="group" aria-label="Filtrar por categoría">
+                  {(
+                    [
+                      ['all', 'Todas las categorías'],
+                      ['aggregator', 'Agregadores'],
+                      ['official-api', 'APIs Oficiales'],
+                      ['experimental-adapter', 'Adaptadores Experimentales'],
+                    ] as const
+                  ).map(([catKey, catLabel]) => (
+                    <button
+                      key={catKey}
+                      type="button"
+                      className={`subnav-btn${categoryFilter === catKey ? ' active' : ''}`}
+                      onClick={() => setCategoryFilter(catKey)}
+                    >
+                      {catLabel}
+                    </button>
+                  ))}
+                </div>
+
+                <span className="field-hint" style={{ fontSize: '0.78rem' }}>
+                  Solo paquetes aprobados en <code className="mono">bifrost-providers</code> ·
+                  Instalación manual bajo demanda
+                </span>
+              </div>
             </div>
           </div>
 
@@ -531,6 +587,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
               {filteredManifests.map((manifest) => {
                 const isInstalled = installedIds.has(manifest.id);
                 const isExperimental = manifest.packageType === 'experimental-adapter';
+                const effectiveCategory: ProviderCategory =
+                  manifest.category ??
+                  (isExperimental ? 'experimental-adapter' : 'official-api');
                 const defaultAdapterUrl = manifest.adapter?.defaultPort
                   ? `http://127.0.0.1:${manifest.adapter.defaultPort}`
                   : '';
@@ -547,11 +606,17 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                           flexWrap: 'wrap',
                         }}
                       >
-                        <code className="key-prefix-pill">{manifest.id}</code>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                          <ProviderLogo slug={manifest.id} name={manifest.name} size={36} />
+                          <code className="key-prefix-pill">{manifest.id}</code>
+                        </div>
                         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                           {manifest.verified ? (
                             <span className="meta-tag verified">✓ Verificado</span>
                           ) : null}
+                          <span className="meta-tag">
+                            {formatProviderCategoryLabel(effectiveCategory)}
+                          </span>
                           <span className="meta-tag">
                             {manifest.modelsSource === 'static' ? 'Estático' : 'API /models'}
                           </span>
@@ -570,11 +635,27 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         </p>
                       )}
 
-                      {manifest.modelsSource === 'static' && manifest.reviewedAt ? (
-                        <span className="field-hint">
-                          Ficha revisada el: <strong>{manifest.reviewedAt}</strong>
-                        </span>
-                      ) : null}
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 10,
+                          flexWrap: 'wrap',
+                          fontSize: '0.78rem',
+                          color: 'var(--sub)',
+                        }}
+                      >
+                        {manifest.publishedAt ? (
+                          <span>
+                            Publicado: <strong className="mono">{manifest.publishedAt}</strong>
+                          </span>
+                        ) : null}
+                        {manifest.modelsSource === 'static' && manifest.reviewedAt ? (
+                          <span>
+                            Revisado: <strong className="mono">{manifest.reviewedAt}</strong>
+                          </span>
+                        ) : null}
+                      </div>
 
                       {isExperimental && !isInstalled ? (
                         <div className="field" style={{ marginTop: 4 }}>
@@ -614,9 +695,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         borderTop: '1px solid #e6eef8',
                       }}
                     >
-                      <span className="field-hint" style={{ fontSize: '0.78rem' }}>
+                      <code className="key-prefix-pill" style={{ fontSize: '0.74rem' }}>
                         {isExperimental ? 'experimental-adapter' : 'official-json'}
-                      </span>
+                      </code>
 
                       {isInstalled ? (
                         <button

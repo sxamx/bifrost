@@ -5,6 +5,13 @@ import type { DatabaseSync } from 'node:sqlite';
 import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import {
+  deriveFallbackInitial,
+  getProviderLogo,
+  loadModelsDevSnapshot,
+  readCachedModelsDevSnapshot,
+  resolveAndSyncModelBenchmarks,
+} from './catalog/index.js';
+import {
   encryptSecret,
   generateInternalApiKey,
   generateSessionToken,
@@ -13,7 +20,12 @@ import {
   verifyPassword,
 } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
-import { ModelSyncHttpError, formatModelRow, syncProviderModels } from './models-sync.js';
+import {
+  ModelSyncHttpError,
+  formatModelRow,
+  runModelsAutoSyncTick,
+  syncProviderModels,
+} from './models-sync.js';
 import {
   NodeOperationError,
   PUBLIC_IP_WARNING_MESSAGE,
@@ -33,7 +45,7 @@ import {
   validateProviderManifest,
 } from './schema.js';
 
-export { runNodesHealthTick };
+export { runNodesHealthTick, runModelsAutoSyncTick };
 
 const SESSION_COOKIE_NAME = 'bifrost_session';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
@@ -74,6 +86,7 @@ const MIME_TYPES: Record<string, string> = {
   '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -462,6 +475,42 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     return next();
   });
 
+  const isProviderOrAllKeysDraining = (providerId: string): boolean => {
+    if (registry.isProviderDraining(providerId)) {
+      return true;
+    }
+    const keyRows = db
+      .prepare(`SELECT id FROM provider_keys WHERE provider_id = ?`)
+      .all(providerId) as Array<{ id: string }>;
+    if (keyRows.length > 0 && keyRows.every((k) => registry.isKeyDraining(k.id))) {
+      return true;
+    }
+    return false;
+  };
+
+  const isGuestModelAllowed = (
+    userId: string,
+    modelFullId: string,
+    providerId?: string,
+  ): boolean => {
+    const inferredProv =
+      providerId ??
+      (modelFullId.includes('/') ? modelFullId.slice(0, modelFullId.indexOf('/')) : '');
+    const providerWildcard = inferredProv ? `${inferredProv}/*` : '';
+    const accessRow = db
+      .prepare(
+        `SELECT 1 AS allowed
+         FROM user_model_access
+         WHERE user_id = ?
+           AND (model_full_id = ? OR model_full_id = '*' OR (? != '' AND model_full_id = ?))
+         LIMIT 1`,
+      )
+      .get(userId, modelFullId, providerWildcard, providerWildcard) as
+      | { allowed: number }
+      | undefined;
+    return Boolean(accessRow);
+  };
+
   app.get('/api/auth/me', (c) => {
     const user = c.get('user');
 
@@ -489,13 +538,13 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
                JOIN providers p ON p.id = m.provider_id
                JOIN user_model_access uma
                  ON uma.user_id = ?
-                AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*')
+                AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*' OR uma.model_full_id = m.provider_id || '/*')
                WHERE m.active = 1 AND p.enabled = 1`,
             )
             .all(user.id) as Array<{ full_id: string; provider_id: string }>);
 
     const modelsCount = modelRows.filter(
-      (m) => !registry.isProviderDraining(m.provider_id),
+      (m) => !isProviderOrAllKeysDraining(m.provider_id),
     ).length;
 
     const keysRow = db
@@ -1361,14 +1410,75 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     }
   });
 
+  // --- Monochrome Sanitized Provider Logos & Catalog Explorer (HU-14, HU-14b, HU-14c, HU-15) ---
+
+  app.get('/api/logos/:slug', async (c) => {
+    const rawSlug = c.req.param('slug') ?? '';
+    const cleanedSlug = rawSlug.trim().replace(/\.svg$/i, '');
+    const providerRow = db
+      .prepare(`SELECT name FROM providers WHERE id = ?`)
+      .get(cleanedSlug) as { name: string } | undefined;
+
+    const result = await getProviderLogo(db, cleanedSlug, {
+      displayName: providerRow?.name ?? cleanedSlug,
+      fetchFn: fetchImpl,
+      nowSec: nowSeconds(),
+      forceRefresh: c.req.query('refresh') === '1',
+    });
+
+    const accept = (c.req.header('accept') ?? '').toLowerCase();
+    const wantsRawSvg =
+      c.req.query('format') === 'svg' ||
+      (accept.includes('image/svg+xml') && !accept.includes('application/json'));
+
+    if (wantsRawSvg) {
+      if (result.hasLogo) {
+        return c.body(result.svg, 200, {
+          'Content-Type': 'image/svg+xml; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff',
+          'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+        });
+      }
+      return c.json(
+        {
+          hasLogo: false,
+          slug: result.slug,
+          svg: null,
+          initial: result.initial,
+        },
+        404,
+      );
+    }
+
+    if (result.hasLogo) {
+      return c.json({
+        hasLogo: true,
+        slug: result.slug,
+        svg: result.svg,
+        initial: deriveFallbackInitial(providerRow?.name ?? cleanedSlug),
+      });
+    }
+
+    return c.json({
+      hasLogo: false,
+      slug: result.slug,
+      svg: null,
+      initial: result.initial,
+    });
+  });
+
   app.get('/api/models', (c) => {
     const user = c.get('user');
+    const providerFilter = c.req.query('provider')?.trim().toLowerCase() ?? '';
+    const modalityFilter = c.req.query('modality')?.trim().toLowerCase() ?? '';
+    const capabilityFilter = c.req.query('capability')?.trim().toLowerCase() ?? '';
+    const searchQuery = c.req.query('q')?.trim().toLowerCase() ?? '';
 
     const rows =
       user.role === 'admin'
         ? (db
             .prepare(
-              `SELECT m.*
+              `SELECT m.*, p.name AS provider_name
                FROM models m
                JOIN providers p ON p.id = m.provider_id
                WHERE m.active = 1 AND p.enabled = 1
@@ -1377,22 +1487,178 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
             .all() as Array<Record<string, unknown>>)
         : (db
             .prepare(
-              `SELECT DISTINCT m.*
+              `SELECT DISTINCT m.*, p.name AS provider_name
                FROM models m
                JOIN providers p ON p.id = m.provider_id
                JOIN user_model_access uma
                  ON uma.user_id = ?
-                AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*')
+                AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*' OR uma.model_full_id = m.provider_id || '/*')
                WHERE m.active = 1 AND p.enabled = 1
                ORDER BY m.full_id ASC`,
             )
             .all(user.id) as Array<Record<string, unknown>>);
 
-    const models = rows
-      .filter((r) => !registry.isProviderDraining(String(r.provider_id)))
-      .map(formatModelRow);
+    const snapshot = readCachedModelsDevSnapshot(db);
+    const hasCachedModelsDev =
+      Object.keys(snapshot.api).length > 0 || Object.keys(snapshot.canonical).length > 0;
+
+    let models = rows
+      .filter((r) => !isProviderOrAllKeysDraining(String(r.provider_id)))
+      .map((r) =>
+        hasCachedModelsDev
+          ? formatModelRow(r, {
+              providerName: String(r.provider_name ?? ''),
+              modelsDevSnapshot: snapshot,
+            })
+          : formatModelRow(r),
+      );
+
+    if (providerFilter) {
+      models = models.filter((m) => m.providerId.toLowerCase() === providerFilter);
+    }
+
+    if (modalityFilter) {
+      models = models.filter(
+        (m) =>
+          m.modalities.input.some((mod) => mod.toLowerCase() === modalityFilter) ||
+          m.modalities.output.some((mod) => mod.toLowerCase() === modalityFilter),
+      );
+    }
+
+    if (capabilityFilter) {
+      const reqCaps = capabilityFilter
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      models = models.filter((m) =>
+        reqCaps.every((cap) => {
+          if (cap === 'tools' || cap === 'tool_call') return m.capabilities.tools;
+          if (cap === 'reasoning') return m.capabilities.reasoning;
+          if (
+            cap === 'structuredoutput' ||
+            cap === 'structured_output' ||
+            cap === 'structured'
+          ) {
+            return m.capabilities.structuredOutput;
+          }
+          return false;
+        }),
+      );
+    }
+
+    if (searchQuery) {
+      models = models.filter((m) => {
+        const haystack = [
+          m.fullId,
+          m.name,
+          m.modelId,
+          m.canonicalModelId ?? '',
+          m.providerId,
+          m.providerName ?? '',
+        ]
+          .join(' ')
+          .toLowerCase();
+        return haystack.includes(searchQuery);
+      });
+    }
 
     return c.json({ models });
+  });
+
+  app.get('/api/models/*', async (c) => {
+    const user = c.get('user');
+    let rawPathname: string;
+    try {
+      rawPathname = new URL(c.req.url).pathname;
+    } catch {
+      rawPathname = c.req.path;
+    }
+
+    const prefix = '/api/models/';
+    if (!rawPathname.startsWith(prefix)) {
+      return c.json({ error: 'Not Found' }, 404);
+    }
+
+    let suffix = rawPathname.slice(prefix.length);
+    let isBenchmarks = false;
+    if (suffix.endsWith('/benchmarks')) {
+      isBenchmarks = true;
+      suffix = suffix.slice(0, -'/benchmarks'.length);
+    }
+
+    let decodedFullId: string;
+    try {
+      decodedFullId = decodeURIComponent(suffix).replace(/^\/+|\/+$/g, '');
+    } catch {
+      return c.json({ error: 'Invalid model identifier encoding.' }, 400);
+    }
+
+    if (!decodedFullId) {
+      return c.json({ error: 'Model identifier is required.' }, 400);
+    }
+
+    const modelRow = db
+      .prepare(
+        `SELECT m.*, p.name AS provider_name
+         FROM models m
+         JOIN providers p ON p.id = m.provider_id
+         WHERE m.full_id = ? AND m.active = 1 AND p.enabled = 1`,
+      )
+      .get(decodedFullId) as Record<string, unknown> | undefined;
+
+    if (!modelRow || isProviderOrAllKeysDraining(String(modelRow.provider_id))) {
+      return c.json({ error: `Model "${decodedFullId}" not found.` }, 404);
+    }
+
+    if (
+      user.role === 'guest' &&
+      !isGuestModelAllowed(user.id, String(modelRow.full_id), String(modelRow.provider_id))
+    ) {
+      return c.json(
+        { error: `You do not have access to model "${decodedFullId}".` },
+        403,
+      );
+    }
+
+    let snapshot = readCachedModelsDevSnapshot(db);
+    if (
+      Object.keys(snapshot.api).length === 0 &&
+      Object.keys(snapshot.canonical).length === 0
+    ) {
+      snapshot = await loadModelsDevSnapshot(db, {
+        fetchFn: fetchImpl,
+        nowSec: nowSeconds(),
+      });
+    }
+
+    const formatted = formatModelRow(modelRow, {
+      providerName: String(modelRow.provider_name ?? ''),
+      modelsDevSnapshot: snapshot,
+    });
+
+    if (!isBenchmarks) {
+      return c.json({
+        model: formatted,
+        ...formatted,
+      });
+    }
+
+    const benchmarks = await resolveAndSyncModelBenchmarks(
+      db,
+      {
+        fullId: formatted.fullId,
+        canonicalModelId: formatted.canonicalModelId,
+        modelId: formatted.modelId,
+        name: formatted.name,
+      },
+      {
+        fetchFn: fetchImpl,
+        nowSec: nowSeconds(),
+        forceRefresh: c.req.query('refresh') === '1',
+      },
+    );
+
+    return c.json(benchmarks);
   });
 
   // --- Internal API Keys sk-bf-... (HU-03b) ---
@@ -1934,14 +2200,14 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
                JOIN providers p ON p.id = m.provider_id
                JOIN user_model_access uma
                  ON uma.user_id = ?
-                AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*')
+                AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*' OR uma.model_full_id = m.provider_id || '/*')
                WHERE m.active = 1 AND p.enabled = 1
                ORDER BY m.full_id ASC`,
             )
             .all(user.id) as Array<Record<string, unknown>>);
 
     const data = rows
-      .filter((m) => !registry.isProviderDraining(String(m.provider_id)))
+      .filter((m) => !isProviderOrAllKeysDraining(String(m.provider_id)))
       .map((m) => ({
         id: String(m.full_id),
         object: 'model' as const,
@@ -2000,27 +2266,16 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       );
     }
 
-    if (user.role === 'guest') {
-      const accessRow = db
-        .prepare(
-          `SELECT 1 AS allowed
-           FROM user_model_access
-           WHERE user_id = ? AND (model_full_id = ? OR model_full_id = '*')
-           LIMIT 1`,
-        )
-        .get(user.id, requestedModel) as { allowed: number } | undefined;
-
-      if (!accessRow) {
-        return c.json(
-          openAiError(
-            `You do not have access to model "${requestedModel}".`,
-            'permission_error',
-            'model_not_allowed',
-            'model',
-          ),
-          403,
-        );
-      }
+    if (user.role === 'guest' && !isGuestModelAllowed(user.id, requestedModel)) {
+      return c.json(
+        openAiError(
+          `You do not have access to model "${requestedModel}".`,
+          'permission_error',
+          'model_not_allowed',
+          'model',
+        ),
+        403,
+      );
     }
 
     const modelRow = db
@@ -2034,7 +2289,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       | { full_id: string; model_id: string; provider_id: string }
       | undefined;
 
-    if (!modelRow || registry.isProviderDraining(modelRow.provider_id)) {
+    if (!modelRow || isProviderOrAllKeysDraining(modelRow.provider_id)) {
       return c.json(
         openAiError(
           `No active provider or model is configured for "${requestedModel}" yet.`,
@@ -2124,7 +2379,12 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           const ext = path.extname(candidatePath).toLowerCase();
           const contentType = MIME_TYPES[ext] ?? 'application/octet-stream';
           const body = fs.readFileSync(candidatePath);
-          return c.body(body, 200, { 'Content-Type': contentType });
+          const headers: Record<string, string> = { 'Content-Type': contentType };
+          if (decodedPath === '/sw.js') {
+            headers['Service-Worker-Allowed'] = '/';
+            headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
+          }
+          return c.body(body, 200, headers);
         }
       }
     }
