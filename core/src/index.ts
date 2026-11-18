@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
 import { loadMasterKeyOrExit } from './crypto.js';
 import { openDatabase, writeSystemLog } from './db.js';
+import { AUTO_SYNC_INTERVAL_MS, runModelsAutoSyncTick } from './models-sync.js';
 import { runNodesHealthTick } from './nodes.js';
 
 const resolved = loadMasterKeyOrExit();
@@ -36,6 +37,23 @@ triggerNodesHealthTick();
 const nodesHeartbeatInterval = setInterval(triggerNodesHealthTick, 30_000);
 nodesHeartbeatInterval.unref();
 
+// HU-16: Automatic 6-hour free-model catalog sync for enabled API providers
+let modelsSyncTickRunning = false;
+const triggerModelsAutoSyncTick = () => {
+  if (modelsSyncTickRunning) return;
+  modelsSyncTickRunning = true;
+  void runModelsAutoSyncTick(db, resolved.key)
+    .catch(() => {
+      // Errors per provider are captured and logged inside runModelsAutoSyncTick
+    })
+    .finally(() => {
+      modelsSyncTickRunning = false;
+    });
+};
+
+const modelsAutoSyncInterval = setInterval(triggerModelsAutoSyncTick, AUTO_SYNC_INTERVAL_MS);
+modelsAutoSyncInterval.unref();
+
 const server = serve(
   {
     fetch: app.fetch,
@@ -49,6 +67,7 @@ const server = serve(
 function shutdown(signal: string): void {
   process.stdout.write(`[Bifrost] Received ${signal}, shutting down...\n`);
   clearInterval(nodesHeartbeatInterval);
+  clearInterval(modelsAutoSyncInterval);
   server.close(() => {
     try {
       db.close();

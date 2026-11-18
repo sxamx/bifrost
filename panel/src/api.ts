@@ -1,22 +1,55 @@
 import type {
+  ActivityGroupBy,
+  ActivityMetricsData,
+  ActivityRange,
+  ActivitySeriesItem,
   AddProviderKeyInput,
+  ArtificialWatchAxis,
+  ArtificialWatchBenchmarkBlock,
   AuthSuccessResponse,
+  BackupExportOptions,
+  BackupImportResult,
+  CreateInvitationInput,
+  CreateInvitationResult,
   CreateKeyResponse,
   CreateNodeInput,
   CreateNodeResult,
+  EpochBenchmarkBlock,
+  EpochBenchmarkRun,
   ExitNodeItem,
+  InvitationItem,
   KeysListResponse,
+  LatencyBucketPoint,
+  LatencyMetricsData,
+  LmArenaBenchmarkBlock,
+  LmArenaPeerEntry,
+  ManagedUserItem,
   MarketplaceCatalogState,
   MeResponse,
+  MetricsSummary,
+  ModelBenchmarksData,
+  ModelSpeedEntry,
   ModelSyncDiff,
   NodeAssignedKeyRef,
+  OpenChartsBenchmarkBlock,
+  PercentileTuple,
+  PlaygroundChatRequest,
+  PlaygroundChatResponse,
+  ProviderCacheEntry,
   ProviderKeyItem,
+  ProviderLogoData,
   ProviderManifest,
   ProviderModelItem,
+  ProviderReliabilityEntry,
   ProviderSummary,
   ProvidersResponse,
+  QuotaResetMode,
   RotateNodeTokenResult,
+  SpeedMetricsData,
   StatusResponse,
+  SystemLogEntry,
+  SystemLogsResponse,
+  UptimeDayCell,
 } from './types';
 
 export class ApiError extends Error {
@@ -33,10 +66,13 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
-  if (init?.body && !headers.has('Content-Type')) {
+  const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData;
+  if (init?.body && !isFormData && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-  headers.set('Accept', 'application/json');
+  if (!headers.has('Accept')) {
+    headers.set('Accept', 'application/json');
+  }
 
   const response = await fetch(path, {
     ...init,
@@ -80,6 +116,336 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 function asRecord(val: unknown): Record<string, unknown> {
   return val && typeof val === 'object' ? (val as Record<string, unknown>) : {};
+}
+
+function asNum(val: unknown, fallback = 0): number {
+  return typeof val === 'number' && Number.isFinite(val) ? val : fallback;
+}
+
+function asNullableNum(val: unknown): number | null {
+  return typeof val === 'number' && Number.isFinite(val) ? val : null;
+}
+
+function asStringArray(val: unknown): string[] {
+  if (Array.isArray(val)) return val.map(String);
+  if (typeof val === 'string' && val.trim().startsWith('[')) {
+    try {
+      const parsed = JSON.parse(val);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function normalizePercentiles(raw: unknown): PercentileTuple {
+  const r = asRecord(raw);
+  return {
+    p50: asNum(r.p50 ?? r.P50),
+    p75: asNum(r.p75 ?? r.P75),
+    p90: asNum(r.p90 ?? r.P90),
+    p95: asNum(r.p95 ?? r.P95),
+    p99: asNum(r.p99 ?? r.P99),
+  };
+}
+
+function normalizeRatePct(val: unknown): number {
+  if (typeof val !== 'number' || !Number.isFinite(val)) return 0;
+  return Math.max(0, Math.min(100, val));
+}
+
+function build60DayWindow(rawDays: UptimeDayCell[]): UptimeDayCell[] {
+  const byDate = new Map<string, UptimeDayCell>();
+  for (const d of rawDays) {
+    if (d.date) {
+      byDate.set(d.date.slice(0, 10), d);
+    }
+  }
+
+  const result: UptimeDayCell[] = [];
+  const now = new Date();
+  const todayUtcMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+
+  for (let offset = 59; offset >= 0; offset--) {
+    const dayDate = new Date(todayUtcMs - offset * 86_400_000);
+    const isoDate = dayDate.toISOString().slice(0, 10);
+    const found = byDate.get(isoDate);
+    if (found) {
+      result.push(found);
+    } else {
+      result.push({
+        date: isoDate,
+        uptimePct: null,
+        totalRequests: 0,
+      });
+    }
+  }
+  return result;
+}
+
+/* Monochrome SVG Logo Sanitizer + In-Memory Cache (HU-14b) */
+const logoCache = new Map<string, ProviderLogoData>();
+
+function sanitizeMonochromeSvg(rawSvg: string): string | null {
+  const trimmed = rawSvg.trim();
+  if (!trimmed.includes('<svg')) return null;
+
+  // Strip scripts, foreignObject, and inline event handlers
+  let clean = trimmed
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+    .replace(/<foreignObject[\s\S]*?>[\s\S]*?<\/foreignObject>/gi, '')
+    .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+
+  // Normalize hardcoded black/brand colors to currentColor so CSS `color: var(--sub)` controls it
+  clean = clean
+    .replace(/fill\s*=\s*["'](?!none["']|currentColor["'])[^"']+["']/gi, 'fill="currentColor"')
+    .replace(
+      /stroke\s*=\s*["'](?!none["']|currentColor["'])[^"']+["']/gi,
+      'stroke="currentColor"'
+    );
+
+  // Ensure root <svg> defaults to fill="currentColor" if neither fill nor stroke is set
+  if (!/fill\s*=/i.test(clean)) {
+    clean = clean.replace(/<svg\b/i, '<svg fill="currentColor"');
+  }
+  return clean;
+}
+
+function normalizeModelBenchmarks(fullId: string, raw: unknown): ModelBenchmarksData {
+  const r = asRecord(raw);
+  const sources = asRecord(r.sources ?? r);
+
+  // 1. LMArena (agent/latest, CC BY 4.0)
+  const lmaRaw = asRecord(sources.lmarena ?? sources.lmArena ?? r.lmarena);
+  const lmaPeersRaw = Array.isArray(lmaRaw.rankingPeers)
+    ? lmaRaw.rankingPeers
+    : Array.isArray(lmaRaw.peers)
+      ? lmaRaw.peers
+      : Array.isArray(lmaRaw.ranking)
+        ? lmaRaw.ranking
+        : [];
+  const lmaPeers: LmArenaPeerEntry[] = lmaPeersRaw.map((p, idx) => {
+    const pr = asRecord(p);
+    return {
+      modelId: String(pr.modelId ?? pr.model_id ?? pr.id ?? `peer-${idx}`),
+      fullId: typeof pr.fullId === 'string' ? pr.fullId : (pr.full_id as string | null) ?? null,
+      displayName: String(pr.displayName ?? pr.name ?? pr.modelId ?? pr.id ?? `Modelo #${idx + 1}`),
+      score: asNum(pr.score ?? pr.agentScore),
+      ciLower: asNullableNum(pr.ciLower ?? pr.ci_lower),
+      ciUpper: asNullableNum(pr.ciUpper ?? pr.ci_upper),
+      rank: asNum(pr.rank, idx + 1),
+      isCurrent: Boolean(pr.isCurrent ?? pr.is_current ?? false),
+    };
+  });
+  const lmaScore = asNullableNum(lmaRaw.score ?? lmaRaw.agentScore ?? lmaRaw.nativeScore);
+  const lmarena: LmArenaBenchmarkBlock = {
+    available: Boolean(lmaRaw.available ?? (lmaScore !== null || lmaPeers.length > 0)),
+    score: lmaScore,
+    ciLower: asNullableNum(lmaRaw.ciLower ?? lmaRaw.ci_lower),
+    ciUpper: asNullableNum(lmaRaw.ciUpper ?? lmaRaw.ci_upper),
+    ciPlusMinus: asNullableNum(lmaRaw.ciPlusMinus ?? lmaRaw.ci_margin ?? lmaRaw.ci),
+    sessionsOrVotes: asNullableNum(lmaRaw.sessionsOrVotes ?? lmaRaw.votes ?? lmaRaw.sessions),
+    category: String(lmaRaw.category ?? 'agent/latest'),
+    medianCostPerTaskUsd: asNullableNum(
+      lmaRaw.medianCostPerTaskUsd ?? lmaRaw.medianCost ?? lmaRaw.costPerTask
+    ),
+    rank: asNullableNum(lmaRaw.rank),
+    totalRanked: asNullableNum(lmaRaw.totalRanked ?? lmaRaw.totalModels ?? lmaRaw.total),
+    rankingPeers: lmaPeers,
+    sourceUrl: String(lmaRaw.sourceUrl ?? 'https://lmarena.ai'),
+    license: String(lmaRaw.license ?? 'CC BY 4.0'),
+    capturedAt: typeof lmaRaw.capturedAt === 'string' ? lmaRaw.capturedAt : null,
+  };
+
+  // 2. ArtificialWatch (index & percentile only, CC BY 4.0)
+  const awRaw = asRecord(
+    sources.artificialwatch ?? sources.artificialWatch ?? r.artificialwatch
+  );
+  const awAxesRaw = Array.isArray(awRaw.axes)
+    ? awRaw.axes
+    : Array.isArray(awRaw.dimensions)
+      ? awRaw.dimensions
+      : Array.isArray(awRaw.boards)
+        ? awRaw.boards
+        : [];
+  const awAxes: ArtificialWatchAxis[] = awAxesRaw.map((ax, idx) => {
+    const ar = asRecord(ax);
+    return {
+      axisKey: String(ar.axisKey ?? ar.key ?? ar.id ?? `axis-${idx}`),
+      label: String(ar.label ?? ar.name ?? `Eje ${idx + 1}`),
+      percentile: Math.max(0, Math.min(100, asNum(ar.percentile))),
+      index: asNullableNum(ar.index),
+      sourceBoard: String(ar.sourceBoard ?? ar.board ?? ar.source ?? 'Tablero público'),
+    };
+  });
+  const awIndex = asNullableNum(awRaw.globalIndex ?? awRaw.index);
+  const awMedianPct = asNullableNum(awRaw.medianPercentile ?? awRaw.percentile);
+  const artificialwatch: ArtificialWatchBenchmarkBlock = {
+    available: Boolean(
+      awRaw.available ?? (awIndex !== null || awMedianPct !== null || awAxes.length > 0)
+    ),
+    globalIndex: awIndex,
+    medianPercentile: awMedianPct,
+    axes: awAxes,
+    rankingPeers: Array.isArray(awRaw.rankingPeers)
+      ? awRaw.rankingPeers.map((p, idx) => {
+          const pr = asRecord(p);
+          return {
+            modelId: String(pr.modelId ?? pr.id ?? `aw-${idx}`),
+            fullId: typeof pr.fullId === 'string' ? pr.fullId : null,
+            displayName: String(pr.displayName ?? pr.name ?? pr.modelId ?? `Modelo #${idx + 1}`),
+            percentile: asNum(pr.percentile),
+            index: asNullableNum(pr.index),
+            rank: asNum(pr.rank, idx + 1),
+            isCurrent: Boolean(pr.isCurrent),
+          };
+        })
+      : undefined,
+    sourceUrl: String(awRaw.sourceUrl ?? 'https://artificialwatch.com'),
+    license: String(awRaw.license ?? 'CC BY 4.0'),
+    capturedAt: typeof awRaw.capturedAt === 'string' ? awRaw.capturedAt : null,
+  };
+
+  // 3. Epoch AI (own internal runs only, CC BY 4.0)
+  const epRaw = asRecord(sources.epoch ?? sources.epochAi ?? r.epoch);
+  const epRunsRaw = Array.isArray(epRaw.runs)
+    ? epRaw.runs
+    : Array.isArray(epRaw.benchmarks)
+      ? epRaw.benchmarks
+      : [];
+  const epRuns: EpochBenchmarkRun[] = epRunsRaw.map((run, idx) => {
+    const rr = asRecord(run);
+    return {
+      benchmarkId: String(rr.benchmarkId ?? rr.id ?? `epoch-run-${idx}`),
+      benchmarkName: String(rr.benchmarkName ?? rr.name ?? rr.task ?? `Evaluación #${idx + 1}`),
+      score: asNum(rr.score),
+      unit: typeof rr.unit === 'string' ? rr.unit : undefined,
+      stderr: asNullableNum(rr.stderr ?? rr.stdErr ?? rr.standardError),
+      evaluatedAt:
+        typeof rr.evaluatedAt === 'string'
+          ? rr.evaluatedAt
+          : typeof rr.date === 'string'
+            ? rr.date
+            : null,
+      harness: String(rr.harness ?? 'Inspect (Epoch AI internal run)'),
+      trainingFlop: typeof rr.trainingFlop === 'string' ? rr.trainingFlop : null,
+      tokensUsed: asNullableNum(rr.tokensUsed ?? rr.tokens),
+    };
+  });
+  const epoch: EpochBenchmarkBlock = {
+    available: Boolean(epRaw.available ?? epRuns.length > 0),
+    runs: epRuns,
+    sourceUrl: String(epRaw.sourceUrl ?? 'https://epoch.ai/data/ai-benchmarking-dashboard'),
+    license: String(epRaw.license ?? 'CC BY 4.0'),
+    capturedAt: typeof epRaw.capturedAt === 'string' ? epRaw.capturedAt : null,
+  };
+
+  // 4. OpenCharts (composite index, grade, rankRange + link)
+  const ocRaw = asRecord(sources.opencharts ?? sources.openCharts ?? r.opencharts);
+  const ocIndex = asNullableNum(ocRaw.compositeIndex ?? ocRaw.index ?? ocRaw.score);
+  const ocGrade = typeof ocRaw.grade === 'string' ? ocRaw.grade : null;
+  const ocRankRange =
+    typeof ocRaw.rankRange === 'string'
+      ? ocRaw.rankRange
+      : typeof ocRaw.rank_range === 'string'
+        ? ocRaw.rank_range
+        : null;
+  const opencharts: OpenChartsBenchmarkBlock = {
+    available: Boolean(
+      ocRaw.available ?? (ocIndex !== null || ocGrade !== null || ocRankRange !== null)
+    ),
+    compositeIndex: ocIndex,
+    grade: ocGrade,
+    rankRange: ocRankRange,
+    rankingPeers: Array.isArray(ocRaw.rankingPeers)
+      ? ocRaw.rankingPeers.map((p, idx) => {
+          const pr = asRecord(p);
+          return {
+            modelId: String(pr.modelId ?? pr.id ?? `oc-${idx}`),
+            fullId: typeof pr.fullId === 'string' ? pr.fullId : null,
+            displayName: String(pr.displayName ?? pr.name ?? pr.modelId ?? `Modelo #${idx + 1}`),
+            compositeIndex: asNum(pr.compositeIndex ?? pr.index ?? pr.score),
+            grade: typeof pr.grade === 'string' ? pr.grade : null,
+            rankRange: typeof pr.rankRange === 'string' ? pr.rankRange : null,
+            isCurrent: Boolean(pr.isCurrent),
+          };
+        })
+      : undefined,
+    methodologyUrl: String(
+      ocRaw.methodologyUrl ?? 'https://www.opencharts.com/benchmarks/methodology'
+    ),
+    sourceUrl: String(ocRaw.sourceUrl ?? 'https://www.opencharts.com'),
+    capturedAt: typeof ocRaw.capturedAt === 'string' ? ocRaw.capturedAt : null,
+  };
+
+  return {
+    fullId,
+    canonicalModelId:
+      typeof r.canonicalModelId === 'string' ? r.canonicalModelId : null,
+    lmarena,
+    artificialwatch,
+    epoch,
+    opencharts,
+  };
+}
+
+function normalizeManagedUser(raw: unknown): ManagedUserItem {
+  const r = asRecord(raw);
+  const rawLimit = r.dailyTokenLimit ?? r.daily_token_limit;
+  const resetRaw = r.quotaResetMode ?? r.quota_reset_mode;
+  const quotaResetMode: QuotaResetMode =
+    resetRaw === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight';
+
+  return {
+    id: String(r.id ?? ''),
+    username: String(r.username ?? ''),
+    role: String(r.role ?? 'guest'),
+    dailyTokenLimit:
+      typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? rawLimit : null,
+    quotaResetMode,
+    allowedModels: asStringArray(
+      r.allowedModels ?? r.allowed_models ?? r.allowed_models_json ?? ['*']
+    ),
+    usedTokensToday:
+      typeof r.usedTokensToday === 'number'
+        ? r.usedTokensToday
+        : typeof r.used_tokens_today === 'number'
+          ? r.used_tokens_today
+          : undefined,
+    createdAt:
+      typeof r.createdAt === 'number'
+        ? r.createdAt
+        : typeof r.created_at === 'number'
+          ? r.created_at
+          : undefined,
+  };
+}
+
+function normalizeInvitation(raw: unknown): InvitationItem {
+  const r = asRecord(raw);
+  const resetRaw = r.quotaResetMode ?? r.quota_reset_mode;
+  return {
+    id: String(r.id ?? ''),
+    dailyTokenLimit: asNum(r.dailyTokenLimit ?? r.daily_token_limit),
+    quotaResetMode: resetRaw === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight',
+    allowedModels: asStringArray(
+      r.allowedModels ?? r.allowed_models ?? r.allowed_models_json ?? ['*']
+    ),
+    expiresAt: asNum(r.expiresAt ?? r.expires_at),
+    usedAt:
+      typeof r.usedAt === 'number'
+        ? r.usedAt
+        : typeof r.used_at === 'number'
+          ? r.used_at
+          : null,
+    createdAt:
+      typeof r.createdAt === 'number'
+        ? r.createdAt
+        : typeof r.created_at === 'number'
+          ? r.created_at
+          : undefined,
+  };
 }
 
 function normalizeExitNode(raw: unknown): ExitNodeItem {
@@ -207,11 +573,44 @@ function normalizeProviderModel(raw: unknown): ProviderModelItem {
   const fullId = String(
     r.fullId ?? r.full_id ?? (providerId ? `${providerId}/${modelId}` : modelId)
   );
-  const caps = asRecord(r.capabilities);
+
+  let capsObj = asRecord(r.capabilities);
+  if (typeof r.capabilities_json === 'string') {
+    try {
+      capsObj = asRecord(JSON.parse(r.capabilities_json));
+    } catch {
+      capsObj = {};
+    }
+  }
+
+  let modObj = asRecord(r.modalities);
+  if (typeof r.modalities_json === 'string') {
+    try {
+      modObj = asRecord(JSON.parse(r.modalities_json));
+    } catch {
+      modObj = {};
+    }
+  }
+
+  const inputMods = asStringArray(modObj.input);
+  const outputMods = asStringArray(modObj.output);
+  const pricingObj = r.pricing && typeof r.pricing === 'object' ? asRecord(r.pricing) : null;
 
   return {
     fullId,
     providerId,
+    providerName:
+      typeof r.providerName === 'string'
+        ? r.providerName
+        : typeof r.provider_name === 'string'
+          ? r.provider_name
+          : undefined,
+    logoSlug:
+      typeof r.logoSlug === 'string'
+        ? r.logoSlug
+        : typeof r.logo_slug === 'string'
+          ? r.logo_slug
+          : providerId || undefined,
     modelId,
     canonicalModelId:
       typeof r.canonicalModelId === 'string'
@@ -220,6 +619,7 @@ function normalizeProviderModel(raw: unknown): ProviderModelItem {
           ? r.canonical_model_id
           : null,
     name: String(r.name ?? modelId),
+    family: typeof r.family === 'string' ? r.family : null,
     contextLength:
       typeof r.contextLength === 'number'
         ? r.contextLength
@@ -232,11 +632,38 @@ function normalizeProviderModel(raw: unknown): ProviderModelItem {
         : typeof r.max_output === 'number'
           ? r.max_output
           : null,
-    capabilities: {
-      tools: Boolean(caps.tools),
-      reasoning: Boolean(caps.reasoning),
-      structuredOutput: Boolean(caps.structuredOutput ?? caps.structured_output),
+    modalities: {
+      input: inputMods.length > 0 ? inputMods : ['text'],
+      output: outputMods.length > 0 ? outputMods : ['text'],
     },
+    capabilities: {
+      tools: Boolean(capsObj.tools),
+      reasoning: Boolean(capsObj.reasoning),
+      structuredOutput: Boolean(capsObj.structuredOutput ?? capsObj.structured_output),
+    },
+    pricing: pricingObj
+      ? {
+          prompt: asNullableNum(pricingObj.prompt) ?? undefined,
+          completion: asNullableNum(pricingObj.completion) ?? undefined,
+          referencePromptPer1M: asNullableNum(
+            pricingObj.referencePromptPer1M ??
+              pricingObj.reference_prompt ??
+              pricingObj.modelsDevPrompt
+          ),
+          referenceCompletionPer1M: asNullableNum(
+            pricingObj.referenceCompletionPer1M ??
+              pricingObj.reference_completion ??
+              pricingObj.modelsDevCompletion
+          ),
+        }
+      : null,
+    releaseDate:
+      typeof r.releaseDate === 'string'
+        ? r.releaseDate
+        : typeof r.release_date === 'string'
+          ? r.release_date
+          : null,
+    upstreamCreatedAt: asNullableNum(r.upstreamCreatedAt ?? r.upstream_created_at),
     isFree: r.isFree !== undefined ? Boolean(r.isFree) : Boolean(r.is_free ?? true),
     firstSeenAt:
       typeof r.firstSeenAt === 'number'
@@ -285,6 +712,13 @@ function normalizeProviderSummary(raw: unknown): ProviderSummary {
         ? r.reviewed_at
         : manifest?.reviewedAt ?? null;
 
+  const publishedAt =
+    typeof r.publishedAt === 'string'
+      ? r.publishedAt
+      : typeof r.published_at === 'string'
+        ? r.published_at
+        : manifest?.publishedAt ?? null;
+
   return {
     id: String(r.id ?? manifest?.id ?? ''),
     name: String(r.name ?? manifest?.name ?? ''),
@@ -292,6 +726,7 @@ function normalizeProviderSummary(raw: unknown): ProviderSummary {
     modelsSource,
     category: (r.category as ProviderSummary['category']) ?? manifest?.category,
     verified: Boolean(r.verified ?? manifest?.verified ?? false),
+    publishedAt,
     baseUrl: typeof r.baseUrl === 'string' ? r.baseUrl : manifest?.baseUrl,
     adapterUrl:
       typeof r.adapterUrl === 'string'
@@ -379,6 +814,16 @@ function parseModelSyncDiff(raw: unknown, previousCount?: number): ModelSyncDiff
   };
 }
 
+async function fileToBase64(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
 export const api = {
   getStatus(): Promise<StatusResponse> {
     return request<StatusResponse>('/api/status', { method: 'GET' });
@@ -408,7 +853,785 @@ export const api = {
     return request<MeResponse>('/api/auth/me', { method: 'GET' });
   },
 
-  /* Exit Nodes (Phase 3: HU-11, HU-11b, HU-11c, HU-11d, HU-08, HU-12, HU-13) */
+  /* Phase 4 — Provider Monochrome SVG Logos & 4-Source Model Benchmarks (HU-14, HU-14b, HU-14c) */
+
+  async getProviderLogo(slug: string): Promise<ProviderLogoData> {
+    const cleanSlug = slug.trim().toLowerCase();
+    if (!cleanSlug) return { hasLogo: false, svg: null };
+
+    const cached = logoCache.get(cleanSlug);
+    if (cached) return cached;
+
+    try {
+      const res = await fetch(`/api/logos/${encodeURIComponent(cleanSlug)}`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          Accept: 'image/svg+xml, application/json',
+        },
+      });
+
+      if (!res.ok) {
+        const fallback: ProviderLogoData = { hasLogo: false, svg: null };
+        logoCache.set(cleanSlug, fallback);
+        return fallback;
+      }
+
+      const ct = res.headers.get('content-type') ?? '';
+      if (ct.includes('image/svg+xml')) {
+        const svgText = await res.text();
+        const cleanSvg = sanitizeMonochromeSvg(svgText);
+        const out: ProviderLogoData = { hasLogo: Boolean(cleanSvg), svg: cleanSvg };
+        logoCache.set(cleanSlug, out);
+        return out;
+      }
+
+      const json = (await res.json()) as Record<string, unknown>;
+      const rawSvg = typeof json.svg === 'string' ? json.svg : null;
+      const cleanSvg = rawSvg ? sanitizeMonochromeSvg(rawSvg) : null;
+      const out: ProviderLogoData = {
+        hasLogo: Boolean(json.hasLogo !== false && cleanSvg),
+        svg: cleanSvg,
+      };
+      logoCache.set(cleanSlug, out);
+      return out;
+    } catch {
+      const fallback: ProviderLogoData = { hasLogo: false, svg: null };
+      logoCache.set(cleanSlug, fallback);
+      return fallback;
+    }
+  },
+
+  async getModelDetail(fullId: string): Promise<ProviderModelItem> {
+    const raw = await request<unknown>(`/api/models/${encodeURIComponent(fullId)}`, {
+      method: 'GET',
+    });
+    const r = asRecord(raw);
+    return normalizeProviderModel(r.model ?? raw);
+  },
+
+  async getModelBenchmarks(fullId: string): Promise<ModelBenchmarksData> {
+    const raw = await request<unknown>(
+      `/api/models/${encodeURIComponent(fullId)}/benchmarks`,
+      { method: 'GET' }
+    );
+    return normalizeModelBenchmarks(fullId, raw);
+  },
+
+  /* Phase 6 — Playground Chat (HU-22) */
+
+  async sendPlaygroundChat(
+    input: PlaygroundChatRequest,
+    onDelta?: (partialText: string) => void
+  ): Promise<PlaygroundChatResponse> {
+    const startedMs = performance.now();
+    let firstTokenMs: number | null = null;
+
+    const payload: Record<string, unknown> = {
+      model: input.model,
+      messages: input.messages,
+      temperature: input.temperature,
+      max_tokens: input.maxTokens,
+      maxTokens: input.maxTokens,
+    };
+    if (input.reasoningEffort && input.reasoningEffort !== 'none') {
+      payload.reasoning_effort = input.reasoningEffort;
+      payload.reasoningEffort = input.reasoningEffort;
+    }
+
+    const response = await fetch('/api/playground/chat', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      let errMsg = `Error HTTP ${response.status}`;
+      try {
+        const errJson = (await response.json()) as Record<string, unknown>;
+        errMsg = String(errJson.error ?? errJson.message ?? errMsg);
+      } catch {
+        // Keep HTTP status fallback
+      }
+      throw new ApiError(errMsg, response.status);
+    }
+
+    const contentType = response.headers.get('content-type') ?? '';
+
+    if (contentType.includes('text/event-stream') && response.body) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let contentAcc = '';
+      let reasoningAcc = '';
+      let serverTtft: number | null = null;
+      let serverTps: number | null = null;
+      let promptTokens = 0;
+      let completionTokens = 0;
+      let reasoningTokens = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line.startsWith('data:')) continue;
+          const dataStr = line.slice(5).trim();
+          if (!dataStr || dataStr === '[DONE]') continue;
+
+          try {
+            const evt = JSON.parse(dataStr) as Record<string, unknown>;
+            if (typeof evt.ttftMs === 'number' || typeof evt.ttft_ms === 'number') {
+              serverTtft = asNum(evt.ttftMs ?? evt.ttft_ms);
+            }
+            if (
+              typeof evt.tokensPerSec === 'number' ||
+              typeof evt.tokens_per_sec === 'number'
+            ) {
+              serverTps = asNum(evt.tokensPerSec ?? evt.tokens_per_sec);
+            }
+            if (evt.usage && typeof evt.usage === 'object') {
+              const u = asRecord(evt.usage);
+              promptTokens = asNum(u.prompt_tokens ?? u.promptTokens, promptTokens);
+              completionTokens = asNum(
+                u.completion_tokens ?? u.completionTokens,
+                completionTokens
+              );
+              const details = asRecord(u.completion_tokens_details);
+              reasoningTokens = asNum(
+                u.reasoning_tokens ?? u.reasoningTokens ?? details.reasoning_tokens,
+                reasoningTokens
+              );
+            }
+
+            const choices = Array.isArray(evt.choices) ? evt.choices : [];
+            if (choices.length > 0) {
+              const delta = asRecord(asRecord(choices[0]).delta);
+              const deltaText = typeof delta.content === 'string' ? delta.content : '';
+              const deltaReasoning =
+                typeof delta.reasoning_content === 'string'
+                  ? delta.reasoning_content
+                  : typeof delta.reasoning === 'string'
+                    ? delta.reasoning
+                    : '';
+              if (deltaText || deltaReasoning) {
+                if (firstTokenMs === null) {
+                  firstTokenMs = Math.round(performance.now() - startedMs);
+                }
+                contentAcc += deltaText;
+                reasoningAcc += deltaReasoning;
+                onDelta?.(contentAcc);
+              }
+            } else if (typeof evt.delta === 'string') {
+              if (firstTokenMs === null) {
+                firstTokenMs = Math.round(performance.now() - startedMs);
+              }
+              contentAcc += evt.delta;
+              onDelta?.(contentAcc);
+            }
+          } catch {
+            // Ignore malformed SSE comment/chunk
+          }
+        }
+      }
+
+      const elapsedSec = Math.max(0.05, (performance.now() - startedMs) / 1000);
+      const estimatedTokens =
+        completionTokens > 0 ? completionTokens : Math.max(1, Math.round(contentAcc.length / 4));
+
+      return {
+        content: contentAcc,
+        reasoningContent: reasoningAcc || undefined,
+        model: input.model,
+        ttftMs: serverTtft ?? firstTokenMs,
+        tokensPerSec: serverTps ?? Number((estimatedTokens / elapsedSec).toFixed(1)),
+        usage: {
+          promptTokens,
+          completionTokens: completionTokens || estimatedTokens,
+          reasoningTokens,
+          totalTokens: promptTokens + (completionTokens || estimatedTokens) + reasoningTokens,
+        },
+      };
+    }
+
+    const raw = (await response.json()) as unknown;
+    const elapsedMs = Math.round(performance.now() - startedMs);
+    const r = asRecord(raw);
+    const choices = Array.isArray(r.choices) ? r.choices : [];
+    const firstMsg =
+      choices.length > 0 ? asRecord(asRecord(choices[0]).message) : asRecord(r.message);
+
+    const content = String(r.content ?? firstMsg.content ?? r.reply ?? r.text ?? '');
+    const reasoningContent =
+      typeof r.reasoningContent === 'string'
+        ? r.reasoningContent
+        : typeof r.reasoning_content === 'string'
+          ? r.reasoning_content
+          : typeof firstMsg.reasoning_content === 'string'
+            ? firstMsg.reasoning_content
+            : undefined;
+
+    const u = asRecord(r.usage);
+    const details = asRecord(u.completion_tokens_details);
+    const promptTokens = asNum(u.promptTokens ?? u.prompt_tokens ?? r.promptTokens);
+    const completionTokens = asNum(
+      u.completionTokens ?? u.completion_tokens ?? r.completionTokens
+    );
+    const reasoningTokens = asNum(
+      u.reasoningTokens ??
+        u.reasoning_tokens ??
+        details.reasoning_tokens ??
+        r.reasoningTokens
+    );
+
+    const rawTtft = r.ttftMs ?? r.ttft_ms;
+    const rawTps = r.tokensPerSec ?? r.tokens_per_sec;
+
+    return {
+      content,
+      reasoningContent,
+      model: typeof r.model === 'string' ? r.model : input.model,
+      ttftMs:
+        typeof rawTtft === 'number' && Number.isFinite(rawTtft) ? rawTtft : elapsedMs,
+      tokensPerSec:
+        typeof rawTps === 'number' && Number.isFinite(rawTps)
+          ? rawTps
+          : completionTokens > 0 && elapsedMs > 0
+            ? Number(((completionTokens / elapsedMs) * 1000).toFixed(1))
+            : null,
+      usage: {
+        promptTokens,
+        completionTokens,
+        reasoningTokens,
+        totalTokens: asNum(
+          u.totalTokens ?? u.total_tokens,
+          promptTokens + completionTokens + reasoningTokens
+        ),
+      },
+    };
+  },
+
+  /* Phase 8 — Users & Single-Use Invitations (HU-04, HU-05) */
+
+  async getUsers(): Promise<ManagedUserItem[]> {
+    const raw = await request<unknown>('/api/users', { method: 'GET' });
+    const r = asRecord(raw);
+    const list = Array.isArray(r.users) ? r.users : Array.isArray(raw) ? raw : [];
+    return list.map(normalizeManagedUser);
+  },
+
+  async updateUserQuotaAndModels(
+    userId: string,
+    input: {
+      dailyTokenLimit: number | null;
+      quotaResetMode: QuotaResetMode;
+      allowedModels: string[];
+    }
+  ): Promise<ManagedUserItem> {
+    const raw = await request<unknown>(`/api/users/${encodeURIComponent(userId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    });
+    const r = asRecord(raw);
+    return normalizeManagedUser(r.user ?? raw);
+  },
+
+  deleteUser(userId: string): Promise<{ ok: boolean }> {
+    return request<{ ok: boolean }>(`/api/users/${encodeURIComponent(userId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async getInvitations(): Promise<InvitationItem[]> {
+    try {
+      const raw = await request<unknown>('/api/invitations', { method: 'GET' });
+      const r = asRecord(raw);
+      const list = Array.isArray(r.invitations) ? r.invitations : Array.isArray(raw) ? raw : [];
+      return list.map(normalizeInvitation);
+    } catch {
+      return [];
+    }
+  },
+
+  async createInvitation(input: CreateInvitationInput): Promise<CreateInvitationResult> {
+    const raw = await request<unknown>('/api/invitations', {
+      method: 'POST',
+      body: JSON.stringify({
+        dailyTokenLimit: input.dailyTokenLimit,
+        quotaResetMode: input.quotaResetMode,
+        allowedModels: input.allowedModels,
+        expiresInHours: input.expiresInHours ?? 48,
+      }),
+    });
+    const r = asRecord(raw);
+    const token = String(r.token ?? r.rawToken ?? r.inviteToken ?? '');
+    const inviteUrl =
+      typeof r.inviteUrl === 'string' && r.inviteUrl.startsWith('http')
+        ? r.inviteUrl
+        : `${window.location.origin}/?invite=${encodeURIComponent(token)}`;
+
+    return {
+      invitation: r.invitation ? normalizeInvitation(r.invitation) : undefined,
+      token,
+      inviteUrl,
+      expiresAt: typeof r.expiresAt === 'number' ? r.expiresAt : undefined,
+    };
+  },
+
+  acceptInvitation(
+    token: string,
+    username: string,
+    password: string
+  ): Promise<AuthSuccessResponse> {
+    return request<AuthSuccessResponse>(
+      `/api/invitations/${encodeURIComponent(token)}/accept`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      }
+    );
+  },
+
+  /* Phase 8 — Encrypted Backups .bifrost.enc (HU-25, HU-25b) */
+
+  async exportBackup(options: BackupExportOptions): Promise<Blob> {
+    const response = await fetch('/api/backup/export', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(options),
+    });
+
+    if (!response.ok) {
+      let msg = `Error HTTP ${response.status} al exportar respaldo.`;
+      try {
+        const errJson = (await response.json()) as Record<string, unknown>;
+        msg = String(errJson.error ?? errJson.message ?? msg);
+      } catch {
+        // Ignore JSON parse error
+      }
+      throw new ApiError(msg, response.status);
+    }
+
+    return response.blob();
+  },
+
+  async importBackup(file: File, password: string): Promise<BackupImportResult> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('password', password);
+
+    try {
+      const raw = await request<unknown>('/api/backup/import', {
+        method: 'POST',
+        body: formData,
+      });
+      const r = asRecord(raw);
+      return {
+        ok: r.ok !== undefined ? Boolean(r.ok) : true,
+        message: typeof r.message === 'string' ? r.message : undefined,
+        restored: r.restored as BackupImportResult['restored'],
+      };
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 415 || err.status === 400)) {
+        const errLower = err.message.toLowerCase();
+        const isAuthOrDecryptFailure =
+          errLower.includes('contraseña') ||
+          errLower.includes('password') ||
+          errLower.includes('corrupt') ||
+          errLower.includes('cifrad') ||
+          errLower.includes('decrypt') ||
+          errLower.includes('bifrost1') ||
+          errLower.includes('tag') ||
+          errLower.includes('inválid');
+        if (isAuthOrDecryptFailure) {
+          throw err;
+        }
+
+        const dataBase64 = await fileToBase64(file);
+        const rawJson = await request<unknown>('/api/backup/import', {
+          method: 'POST',
+          body: JSON.stringify({
+            password,
+            fileBase64: dataBase64,
+            data: dataBase64,
+          }),
+        });
+        const rJson = asRecord(rawJson);
+        return {
+          ok: rJson.ok !== undefined ? Boolean(rJson.ok) : true,
+          message: typeof rJson.message === 'string' ? rJson.message : undefined,
+          restored: rJson.restored as BackupImportResult['restored'],
+        };
+      }
+      throw err;
+    }
+  },
+
+  /* Phase 5 — Telemetry, Quota Summary, Percentiles, Uptime & Logs */
+
+  async getMetricsSummary(): Promise<MetricsSummary> {
+    const raw = await request<unknown>('/api/metrics/summary', { method: 'GET' });
+    const r = asRecord(raw);
+    const totalLimitRaw = r.totalDailyLimit ?? r.total_daily_limit ?? r.dailyLimit ?? null;
+    const totalDailyLimit =
+      typeof totalLimitRaw === 'number' && totalLimitRaw > 0 ? totalLimitRaw : null;
+    const usedTokensToday = asNum(r.usedTokensToday ?? r.used_tokens_today ?? r.usedToday);
+
+    let quotaPct: number | null = null;
+    const rawPct = r.quotaPercentageRemaining ?? r.quota_percentage_remaining;
+    if (typeof rawPct === 'number' && Number.isFinite(rawPct)) {
+      quotaPct = Math.max(0, Math.min(100, rawPct));
+    } else if (totalDailyLimit !== null && totalDailyLimit > 0) {
+      quotaPct = Math.max(
+        0,
+        Math.min(100, Math.round(((totalDailyLimit - usedTokensToday) / totalDailyLimit) * 100))
+      );
+    }
+
+    return {
+      quotaPercentageRemaining: quotaPct,
+      usedTokensToday,
+      totalDailyLimit,
+      nextResetAt:
+        (r.nextResetAt as string | number | null) ??
+        (r.next_reset_at as string | number | null) ??
+        null,
+      resetMode: String(r.resetMode ?? r.reset_mode ?? 'utc_midnight'),
+      providersCount: asNum(r.providersCount ?? r.providers_count),
+      activeModelsCount: asNum(r.activeModelsCount ?? r.active_models_count ?? r.modelsCount),
+      onlineNodesCount: asNum(r.onlineNodesCount ?? r.online_nodes_count),
+    };
+  },
+
+  async getMetricsLatency(range = '24h'): Promise<LatencyMetricsData> {
+    const raw = await request<unknown>(
+      `/api/metrics/latency?range=${encodeURIComponent(range)}`,
+      { method: 'GET' }
+    );
+    const r = asRecord(raw);
+    const rawList = Array.isArray(r.buckets)
+      ? r.buckets
+      : Array.isArray(r.series)
+        ? r.series
+        : Array.isArray(r.points)
+          ? r.points
+          : Array.isArray(raw)
+            ? raw
+            : [];
+
+    const buckets: LatencyBucketPoint[] = rawList.map((item) => {
+      const b = asRecord(item);
+      const pct = normalizePercentiles(b.percentiles ?? b);
+      return {
+        timestamp: (b.timestamp ?? b.bucket ?? b.time ?? b.date ?? '') as string | number,
+        label: typeof b.label === 'string' ? b.label : undefined,
+        count:
+          typeof b.count === 'number'
+            ? b.count
+            : typeof b.samples === 'number'
+              ? b.samples
+              : undefined,
+        ...pct,
+      };
+    });
+
+    const overall = r.overall ? normalizePercentiles(r.overall) : null;
+    return { buckets, overall };
+  },
+
+  async getMetricsSpeed(): Promise<SpeedMetricsData> {
+    const raw = await request<unknown>('/api/metrics/speed', { method: 'GET' });
+    const r = asRecord(raw);
+    const rawModels = Array.isArray(r.models)
+      ? r.models
+      : Array.isArray(r.items)
+        ? r.items
+        : [];
+    const rawCache = Array.isArray(r.cacheByProvider)
+      ? r.cacheByProvider
+      : Array.isArray(r.cache)
+        ? r.cache
+        : Array.isArray(r.providers)
+          ? r.providers
+          : [];
+
+    const models: ModelSpeedEntry[] = rawModels.map((item, idx) => {
+      const m = asRecord(item);
+      const modelFullId = String(
+        m.modelFullId ?? m.model_full_id ?? m.fullId ?? m.model ?? `model-${idx}`
+      );
+      const providerId = String(
+        m.providerId ??
+          m.provider_id ??
+          (modelFullId.includes('/') ? modelFullId.split('/')[0] : '')
+      );
+      return {
+        id: `${modelFullId}-${idx}`,
+        modelFullId,
+        providerId,
+        sampleCount: asNum(m.sampleCount ?? m.samples ?? m.count),
+        ttftMs: normalizePercentiles(m.ttftMs ?? m.ttft_ms ?? m.ttft),
+        tokensPerSec: normalizePercentiles(
+          m.tokensPerSec ?? m.tokens_per_sec ?? m.tps ?? m.speed
+        ),
+      };
+    });
+
+    const cacheByProvider: ProviderCacheEntry[] = rawCache.map((item) => {
+      const c = asRecord(item);
+      const cachedTokens = asNum(c.cachedTokens ?? c.cached_tokens);
+      const promptTokens = asNum(c.promptTokens ?? c.prompt_tokens);
+      const rawHitRate = c.cacheHitRate ?? c.cache_hit_rate ?? c.hitRate;
+      const hitRate =
+        typeof rawHitRate === 'number'
+          ? normalizeRatePct(rawHitRate)
+          : promptTokens > 0
+            ? Math.min(100, (cachedTokens / promptTokens) * 100)
+            : 0;
+      const pid = String(c.providerId ?? c.provider_id ?? c.id ?? '');
+      return {
+        providerId: pid,
+        providerName: String(c.providerName ?? c.provider_name ?? c.name ?? pid),
+        cacheHitRate: hitRate,
+        cachedTokens,
+        promptTokens,
+      };
+    });
+
+    return { models, cacheByProvider };
+  },
+
+  async getMetricsUptime(): Promise<ProviderReliabilityEntry[]> {
+    const raw = await request<unknown>('/api/metrics/uptime', { method: 'GET' });
+    const r = asRecord(raw);
+    const rawProviders = Array.isArray(r.providers)
+      ? r.providers
+      : Array.isArray(r.items)
+        ? r.items
+        : Array.isArray(raw)
+          ? raw
+          : [];
+
+    return rawProviders.map((item) => {
+      const p = asRecord(item);
+      const pid = String(p.providerId ?? p.provider_id ?? p.id ?? '');
+      const rawDaysList = Array.isArray(p.days)
+        ? p.days
+        : Array.isArray(p.history)
+          ? p.history
+          : [];
+
+      const parsedDays: UptimeDayCell[] = rawDaysList.map((cell) => {
+        const d = asRecord(cell);
+        const totalReq = asNum(d.totalRequests ?? d.total_requests ?? d.requests ?? d.count);
+        const rawUptime = d.uptimePct ?? d.uptime_pct ?? d.uptime;
+        const uptimePct =
+          totalReq === 0 || rawUptime === null || rawUptime === undefined
+            ? null
+            : typeof rawUptime === 'number' && Number.isFinite(rawUptime)
+              ? Math.max(0, Math.min(100, rawUptime))
+              : null;
+
+        return {
+          date: String(d.date ?? d.day ?? ''),
+          uptimePct,
+          totalRequests: totalReq,
+          errorRequests:
+            typeof d.errorRequests === 'number'
+              ? d.errorRequests
+              : typeof d.errors === 'number'
+                ? d.errors
+                : undefined,
+        };
+      });
+
+      const days60 = build60DayWindow(parsedDays);
+      const daysWithTraffic = days60.filter((d) => d.uptimePct !== null);
+      const overallRaw = p.overallUptimePct ?? p.overall_uptime_pct ?? p.uptimePct;
+      const overallUptimePct =
+        typeof overallRaw === 'number' && Number.isFinite(overallRaw)
+          ? overallRaw
+          : daysWithTraffic.length > 0
+            ? daysWithTraffic.reduce((acc, d) => acc + (d.uptimePct ?? 0), 0) /
+              daysWithTraffic.length
+            : null;
+
+      return {
+        providerId: pid,
+        providerName: String(p.providerName ?? p.provider_name ?? p.name ?? pid),
+        overallUptimePct,
+        days: days60,
+        toolErrorRate7d: normalizeRatePct(
+          p.toolErrorRate ?? p.toolErrorRate7d ?? p.tool_error_rate ?? 0
+        ),
+        structuredErrorRate7d: normalizeRatePct(
+          p.structuredErrorRate ??
+            p.structuredErrorRate7d ??
+            p.structured_error_rate ??
+            0
+        ),
+        totalRequests7d:
+          typeof p.totalRequests7d === 'number' ? p.totalRequests7d : undefined,
+      };
+    });
+  },
+
+  async getMetricsActivity(
+    range: ActivityRange,
+    groupBy: ActivityGroupBy
+  ): Promise<ActivityMetricsData> {
+    const params = new URLSearchParams({ range, groupBy });
+    const raw = await request<unknown>(`/api/metrics/activity?${params.toString()}`, {
+      method: 'GET',
+    });
+    const r = asRecord(raw);
+    const rawItems = Array.isArray(r.items)
+      ? r.items
+      : Array.isArray(r.groups)
+        ? r.groups
+        : Array.isArray(r.series)
+          ? r.series
+          : Array.isArray(r.buckets)
+            ? r.buckets
+            : [];
+
+    const items: ActivitySeriesItem[] = rawItems.map((entry, idx) => {
+      const it = asRecord(entry);
+      const promptTokens = asNum(it.promptTokens ?? it.prompt_tokens ?? it.prompt);
+      const completionTokens = asNum(
+        it.completionTokens ?? it.completion_tokens ?? it.completion
+      );
+      const reasoningTokens = asNum(
+        it.reasoningTokens ?? it.reasoning_tokens ?? it.reasoning
+      );
+      const totalTokens = asNum(
+        it.totalTokens ?? it.total_tokens ?? it.total,
+        promptTokens + completionTokens + reasoningTokens
+      );
+      const key = String(
+        it.key ?? it.id ?? it.model ?? it.provider ?? it.user ?? it.bucket ?? `item-${idx}`
+      );
+      return {
+        key,
+        label: String(it.label ?? it.name ?? key),
+        promptTokens,
+        completionTokens,
+        reasoningTokens,
+        totalTokens,
+        requestsCount:
+          typeof it.requestsCount === 'number'
+            ? it.requestsCount
+            : typeof it.requests === 'number'
+              ? it.requests
+              : undefined,
+      };
+    });
+
+    const t = asRecord(r.totals);
+    const sumPrompt = items.reduce((s, i) => s + i.promptTokens, 0);
+    const sumCompletion = items.reduce((s, i) => s + i.completionTokens, 0);
+    const sumReasoning = items.reduce((s, i) => s + i.reasoningTokens, 0);
+
+    const promptTokens = asNum(t.promptTokens ?? t.prompt_tokens ?? t.prompt, sumPrompt);
+    const completionTokens = asNum(
+      t.completionTokens ?? t.completion_tokens ?? t.completion,
+      sumCompletion
+    );
+    const reasoningTokens = asNum(
+      t.reasoningTokens ?? t.reasoning_tokens ?? t.reasoning,
+      sumReasoning
+    );
+
+    return {
+      range,
+      groupBy,
+      totals: {
+        promptTokens,
+        completionTokens,
+        reasoningTokens,
+        totalTokens: asNum(
+          t.totalTokens ?? t.total_tokens ?? t.total,
+          promptTokens + completionTokens + reasoningTokens
+        ),
+      },
+      items,
+    };
+  },
+
+  async getSystemLogs(filters: {
+    level?: string;
+    category?: string;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<SystemLogsResponse> {
+    const params = new URLSearchParams();
+    if (filters.level) params.set('level', filters.level);
+    if (filters.category) params.set('category', filters.category);
+    if (filters.q && filters.q.trim().length > 0) params.set('q', filters.q.trim());
+    if (filters.limit) params.set('limit', String(filters.limit));
+    if (filters.offset) params.set('offset', String(filters.offset));
+
+    const qs = params.toString();
+    const raw = await request<unknown>(`/api/logs${qs ? `?${qs}` : ''}`, {
+      method: 'GET',
+    });
+    const r = asRecord(raw);
+    const rawLogs = Array.isArray(r.logs)
+      ? r.logs
+      : Array.isArray(r.items)
+        ? r.items
+        : Array.isArray(raw)
+          ? raw
+          : [];
+
+    const logs: SystemLogEntry[] = rawLogs.map((entry, idx) => {
+      const l = asRecord(entry);
+      let meta: Record<string, unknown> | null = null;
+      if (l.meta && typeof l.meta === 'object') {
+        meta = l.meta as Record<string, unknown>;
+      } else if (typeof l.metaJson === 'string' || typeof l.meta_json === 'string') {
+        try {
+          meta = JSON.parse(String(l.metaJson ?? l.meta_json)) as Record<string, unknown>;
+        } catch {
+          meta = null;
+        }
+      }
+
+      const rawLevel = l.level;
+      const level: SystemLogEntry['level'] =
+        rawLevel === 'warn' || rawLevel === 'error' ? rawLevel : 'info';
+
+      return {
+        id: (l.id as number | string) ?? idx,
+        level,
+        category: String(l.category ?? 'system'),
+        message: String(l.message ?? ''),
+        meta,
+        createdAt: (l.createdAt ?? l.created_at ?? Math.floor(Date.now() / 1000)) as
+          | number
+          | string,
+      };
+    });
+
+    return {
+      logs,
+      total: asNum(r.total, logs.length),
+    };
+  },
+
+  /* Exit Nodes (Phase 3) */
 
   async getNodes(): Promise<ExitNodeItem[]> {
     const raw = await request<unknown>('/api/nodes', { method: 'GET' });
@@ -501,7 +1724,7 @@ export const api = {
     return normalizeProviderKey(r.key ?? raw);
   },
 
-  /* Providers & Marketplace (Phase 2: HU-06, HU-06b, HU-06c, HU-07, HU-09, HU-10) */
+  /* Providers & Marketplace (Phase 2 & Phase 7 HU-23) */
 
   async getMarketplace(): Promise<MarketplaceCatalogState> {
     try {
@@ -528,8 +1751,13 @@ export const api = {
               ? r.error
               : undefined;
 
+      // HU-23: Only expose approved packages from marketplace catalog
+      const approvedManifests = (list as ProviderManifest[]).filter(
+        (m) => m.approved !== false
+      );
+
       return {
-        manifests: list as ProviderManifest[],
+        manifests: approvedManifests,
         offline,
         notice,
       };

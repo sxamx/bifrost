@@ -12,7 +12,7 @@ import {
   type BifrostNodeInstance,
   createBifrostNodeServer,
   loadOrGenerateTlsMaterial,
-} from '../nodes/src/index.js';
+} from '../nodes/dist/index.js';
 
 function createTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `bifrost-p3-${prefix}-`));

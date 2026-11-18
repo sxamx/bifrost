@@ -1,4 +1,11 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { normalizeLogoSlug } from './catalog/logos.js';
+import {
+  type ModelsDevSnapshot,
+  loadModelsDevSnapshot,
+  parseReleaseDateToUtcSeconds,
+  resolveCanonicalAndEnrichModel,
+} from './catalog/models-dev.js';
 import { decryptSecret } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
 import {
@@ -12,12 +19,18 @@ import {
   buildProviderAuthHeaders,
 } from './schema.js';
 
+export const AUTO_SYNC_INTERVAL_SEC = 6 * 3600; // 6 hours (HU-16)
+export const AUTO_SYNC_INTERVAL_MS = AUTO_SYNC_INTERVAL_SEC * 1000;
+
 export interface FormattedModelItem {
   fullId: string;
   providerId: string;
+  providerName?: string;
+  logoSlug?: string;
   modelId: string;
   canonicalModelId: string | null;
   name: string;
+  family?: string | null;
   contextLength: number | null;
   maxOutput: number | null;
   modalities: {
@@ -29,6 +42,11 @@ export interface FormattedModelItem {
     reasoning: boolean;
     structuredOutput: boolean;
   };
+  pricing?: {
+    referencePromptPer1M: number | null;
+    referenceCompletionPer1M: number | null;
+  } | null;
+  releaseDate?: string | null;
   isFree: boolean;
   firstSeenAt: number;
   upstreamCreatedAt: number | null;
@@ -57,6 +75,7 @@ interface NormalizedCandidateModel {
 
 export interface ModelSyncResult {
   addedCount: number;
+  updatedCount: number;
   removedCount: number;
   retiredCount: number;
   totalActive: number;
@@ -65,6 +84,22 @@ export interface ModelSyncResult {
   reviewedAt: string | null;
   syncedAt: number;
   models: FormattedModelItem[];
+}
+
+export interface AutoSyncProviderSummary {
+  providerId: string;
+  status: 'synced' | 'error';
+  added: number;
+  updated: number;
+  removedOrDeactivated: number;
+  errorMessage?: string;
+}
+
+export interface AutoSyncTickResult {
+  syncedAt: number;
+  providersChecked: number;
+  skippedStaticOrDisabled: number;
+  summaries: AutoSyncProviderSummary[];
 }
 
 function getByDottedPath(obj: unknown, pathStr: string): unknown {
@@ -168,24 +203,55 @@ function matchesFreeRule(rawModel: Record<string, unknown>, freeRule?: ProviderF
   return true;
 }
 
+function mergeUniqueStrings(primary: string[], secondary?: string[] | null): string[] {
+  const set = new Set<string>();
+  for (const item of primary) {
+    const cleaned = item.trim().toLowerCase();
+    if (cleaned) set.add(cleaned);
+  }
+  if (secondary) {
+    for (const item of secondary) {
+      const cleaned = item.trim().toLowerCase();
+      if (cleaned) set.add(cleaned);
+    }
+  }
+  return set.size > 0 ? Array.from(set) : ['text'];
+}
+
 function normalizeUpstreamApiModel(
   providerId: string,
   rawModel: Record<string, unknown>,
+  snapshot: ModelsDevSnapshot,
 ): NormalizedCandidateModel {
   const modelId = String(rawModel.id).trim();
   const fullId = `${providerId}/${modelId}`;
-  const name =
+
+  const rawCanonicalSlug =
+    typeof rawModel.canonical_slug === 'string' && rawModel.canonical_slug.trim()
+      ? rawModel.canonical_slug.trim()
+      : typeof rawModel.canonicalModelId === 'string' && rawModel.canonicalModelId.trim()
+        ? rawModel.canonicalModelId.trim()
+        : null;
+
+  const enriched = resolveCanonicalAndEnrichModel(providerId, modelId, snapshot, {
+    canonicalSlug: rawCanonicalSlug,
+  });
+
+  const explicitUpstreamName =
     typeof rawModel.name === 'string' && rawModel.name.trim().length > 0
       ? rawModel.name.trim()
-      : modelId;
+      : null;
+  const name = explicitUpstreamName ?? enriched.name ?? modelId;
 
-  let canonicalModelId: string | null = null;
-  if (typeof rawModel.canonical_slug === 'string' && rawModel.canonical_slug.trim()) {
-    canonicalModelId = rawModel.canonical_slug.trim();
-  } else if (typeof rawModel.canonicalModelId === 'string' && rawModel.canonicalModelId.trim()) {
-    canonicalModelId = rawModel.canonicalModelId.trim();
-  } else if (modelId.endsWith(':free')) {
-    canonicalModelId = modelId.slice(0, -5);
+  let canonicalModelId: string | null = enriched.canonicalModelId;
+  if (!canonicalModelId) {
+    if (rawCanonicalSlug) {
+      canonicalModelId = rawCanonicalSlug.replace(/:free$/i, '').replace(/-\d{8}$/, '');
+    } else if (modelId.endsWith(':free')) {
+      canonicalModelId = modelId.slice(0, -5);
+    } else if (modelId.endsWith('-free')) {
+      canonicalModelId = modelId.slice(0, -5);
+    }
   }
 
   const topProvider =
@@ -194,10 +260,11 @@ function normalizeUpstreamApiModel(
       : null;
 
   const rawContext = rawModel.context_length ?? rawModel.contextLength ?? null;
-  const contextLength =
+  const upstreamContextLength =
     typeof rawContext === 'number' && Number.isFinite(rawContext) && rawContext > 0
       ? Math.floor(rawContext)
       : null;
+  const contextLength = upstreamContextLength ?? enriched.contextLength;
 
   const rawMaxOut =
     rawModel.max_output ??
@@ -205,10 +272,11 @@ function normalizeUpstreamApiModel(
     rawModel.max_completion_tokens ??
     topProvider?.max_completion_tokens ??
     null;
-  const maxOutput =
+  const upstreamMaxOutput =
     typeof rawMaxOut === 'number' && Number.isFinite(rawMaxOut) && rawMaxOut > 0
       ? Math.floor(rawMaxOut)
       : null;
+  const maxOutput = upstreamMaxOutput ?? enriched.maxOutput;
 
   const arch =
     rawModel.architecture && typeof rawModel.architecture === 'object'
@@ -219,17 +287,27 @@ function normalizeUpstreamApiModel(
       ? (rawModel.modalities as Record<string, unknown>)
       : null;
 
-  const inputModalities = Array.isArray(arch?.input_modalities)
+  const explicitInputMods = Array.isArray(arch?.input_modalities)
     ? arch!.input_modalities.map(String)
     : Array.isArray(modObj?.input)
       ? (modObj!.input as unknown[]).map(String)
-      : ['text'];
+      : [];
 
-  const outputModalities = Array.isArray(arch?.output_modalities)
+  const explicitOutputMods = Array.isArray(arch?.output_modalities)
     ? arch!.output_modalities.map(String)
     : Array.isArray(modObj?.output)
       ? (modObj!.output as unknown[]).map(String)
-      : ['text'];
+      : [];
+
+  const inputModalities =
+    explicitInputMods.length > 0
+      ? mergeUniqueStrings(explicitInputMods, enriched.modalities?.input)
+      : (enriched.modalities?.input ?? ['text']);
+
+  const outputModalities =
+    explicitOutputMods.length > 0
+      ? mergeUniqueStrings(explicitOutputMods, enriched.modalities?.output)
+      : (enriched.modalities?.output ?? ['text']);
 
   const supportedParams = Array.isArray(rawModel.supported_parameters)
     ? rawModel.supported_parameters.map((p) => String(p).toLowerCase())
@@ -243,25 +321,31 @@ function normalizeUpstreamApiModel(
     tools: Boolean(
       capsObj?.tools ||
         supportedParams.includes('tools') ||
-        supportedParams.includes('tool_choice'),
+        supportedParams.includes('tool_choice') ||
+        enriched.capabilities?.tools,
     ),
     reasoning: Boolean(
       capsObj?.reasoning ||
         supportedParams.includes('reasoning') ||
-        supportedParams.includes('include_reasoning'),
+        supportedParams.includes('include_reasoning') ||
+        enriched.capabilities?.reasoning,
     ),
     structuredOutput: Boolean(
       capsObj?.structuredOutput ||
         capsObj?.structured_output ||
         supportedParams.includes('structured_outputs') ||
-        supportedParams.includes('response_format'),
+        supportedParams.includes('response_format') ||
+        enriched.capabilities?.structuredOutput,
     ),
   };
 
-  const upstreamCreatedAt =
-    typeof rawModel.created === 'number' && Number.isFinite(rawModel.created) && rawModel.created > 0
+  const rawCreated =
+    typeof rawModel.created === 'number' &&
+    Number.isFinite(rawModel.created) &&
+    rawModel.created > 0
       ? Math.floor(rawModel.created)
       : null;
+  const upstreamCreatedAt = rawCreated ?? parseReleaseDateToUtcSeconds(enriched.releaseDate);
 
   return {
     fullId,
@@ -280,7 +364,13 @@ function normalizeUpstreamApiModel(
   };
 }
 
-export function formatModelRow(row: Record<string, unknown>): FormattedModelItem {
+export function formatModelRow(
+  row: Record<string, unknown>,
+  enrichmentContext?: {
+    providerName?: string;
+    modelsDevSnapshot?: ModelsDevSnapshot;
+  },
+): FormattedModelItem {
   let modalities = { input: ['text'], output: ['text'] };
   try {
     const parsed = JSON.parse(String(row.modalities_json ?? '{}')) as {
@@ -309,14 +399,18 @@ export function formatModelRow(row: Record<string, unknown>): FormattedModelItem
     // Keep default capabilities
   }
 
-  return {
+  const providerId = String(row.provider_id);
+  const modelId = String(row.model_id);
+  const canonicalModelId =
+    row.canonical_model_id === null || row.canonical_model_id === undefined
+      ? null
+      : String(row.canonical_model_id);
+
+  const base: FormattedModelItem = {
     fullId: String(row.full_id),
-    providerId: String(row.provider_id),
-    modelId: String(row.model_id),
-    canonicalModelId:
-      row.canonical_model_id === null || row.canonical_model_id === undefined
-        ? null
-        : String(row.canonical_model_id),
+    providerId,
+    modelId,
+    canonicalModelId,
     name: String(row.name),
     contextLength:
       row.context_length === null || row.context_length === undefined
@@ -333,6 +427,47 @@ export function formatModelRow(row: Record<string, unknown>): FormattedModelItem
         ? null
         : Number(row.upstream_created_at),
     active: Number(row.active ?? 1) === 1,
+  };
+
+  if (!enrichmentContext) {
+    return base;
+  }
+
+  const providerName =
+    enrichmentContext.providerName ??
+    (typeof row.provider_name === 'string' ? row.provider_name : undefined);
+  const logoSlug = normalizeLogoSlug(providerId) ?? providerId;
+
+  if (enrichmentContext.modelsDevSnapshot) {
+    const md = resolveCanonicalAndEnrichModel(
+      providerId,
+      modelId,
+      enrichmentContext.modelsDevSnapshot,
+      { canonicalSlug: canonicalModelId },
+    );
+    return {
+      ...base,
+      providerName,
+      logoSlug,
+      canonicalModelId: base.canonicalModelId ?? md.canonicalModelId,
+      contextLength: base.contextLength ?? md.contextLength,
+      maxOutput: base.maxOutput ?? md.maxOutput,
+      family: md.family,
+      releaseDate: md.releaseDate,
+      pricing:
+        md.priceUsdPerMillion.input !== null || md.priceUsdPerMillion.output !== null
+          ? {
+              referencePromptPer1M: md.priceUsdPerMillion.input,
+              referenceCompletionPer1M: md.priceUsdPerMillion.output,
+            }
+          : null,
+    };
+  }
+
+  return {
+    ...base,
+    providerName,
+    logoSlug,
   };
 }
 
@@ -355,6 +490,7 @@ export async function syncProviderModels(options: {
   fetchImpl: typeof fetch;
   upstreamTls?: UpstreamTlsOptions;
   nowSec: number;
+  modelsDevSnapshot?: ModelsDevSnapshot;
 }): Promise<ModelSyncResult> {
   const {
     db,
@@ -416,23 +552,36 @@ export async function syncProviderModels(options: {
     );
   }
 
+  const snapshot =
+    options.modelsDevSnapshot ??
+    (await loadModelsDevSnapshot(db, { fetchFn: fetchImpl, nowSec }));
+
   let candidates: NormalizedCandidateModel[] = [];
 
   if (manifest.modelsSource === 'static') {
     decryptSecret(keyRows[0]!.encrypted_secret as Uint8Array, masterKey);
 
-    candidates = (manifest.staticModels ?? []).map((sm) => ({
-      fullId: `${providerId}/${sm.id}`,
-      providerId,
-      modelId: sm.id,
-      canonicalModelId: sm.canonicalModelId ?? null,
-      name: sm.name,
-      contextLength: sm.contextLength ?? null,
-      maxOutput: sm.maxOutput ?? null,
-      modalities: { input: ['text'], output: ['text'] },
-      capabilities: { tools: false, reasoning: false, structuredOutput: false },
-      upstreamCreatedAt: null,
-    }));
+    candidates = (manifest.staticModels ?? []).map((sm) => {
+      const enriched = resolveCanonicalAndEnrichModel(providerId, sm.id, snapshot, {
+        canonicalSlug: sm.canonicalModelId ?? null,
+      });
+      return {
+        fullId: `${providerId}/${sm.id}`,
+        providerId,
+        modelId: sm.id,
+        canonicalModelId: sm.canonicalModelId ?? enriched.canonicalModelId ?? null,
+        name: sm.name || enriched.name || sm.id,
+        contextLength: sm.contextLength ?? enriched.contextLength ?? null,
+        maxOutput: sm.maxOutput ?? enriched.maxOutput ?? null,
+        modalities: enriched.modalities ?? { input: ['text'], output: ['text'] },
+        capabilities: enriched.capabilities ?? {
+          tools: false,
+          reasoning: false,
+          structuredOutput: false,
+        },
+        upstreamCreatedAt: parseReleaseDateToUtcSeconds(enriched.releaseDate),
+      };
+    });
   } else {
     const effectiveBaseUrl =
       providerRow.package_type === 'experimental-adapter' &&
@@ -529,7 +678,7 @@ export async function syncProviderModels(options: {
       const rec = item as Record<string, unknown>;
       if (!matchesFreeRule(rec, manifest.freeRule)) continue;
 
-      const normalized = normalizeUpstreamApiModel(providerId, rec);
+      const normalized = normalizeUpstreamApiModel(providerId, rec, snapshot);
       if (!seenFullIds.has(normalized.fullId)) {
         seenFullIds.add(normalized.fullId);
         candidates.push(normalized);
@@ -538,6 +687,7 @@ export async function syncProviderModels(options: {
   }
 
   let addedCount = 0;
+  let updatedCount = 0;
   let removedCount = 0;
 
   db.exec('BEGIN IMMEDIATE');
@@ -578,6 +728,7 @@ export async function syncProviderModels(options: {
         tools: m.capabilities.tools,
         reasoning: m.capabilities.reasoning,
         structured_output: m.capabilities.structuredOutput,
+        structuredOutput: m.capabilities.structuredOutput,
       });
 
       const prev = existingMap.get(m.fullId);
@@ -599,6 +750,8 @@ export async function syncProviderModels(options: {
       } else {
         if (Number(prev.active) === 0) {
           addedCount++;
+        } else {
+          updatedCount++;
         }
         updateStmt.run(
           m.modelId,
@@ -620,7 +773,9 @@ export async function syncProviderModels(options: {
     const hasAccessStmt = db.prepare(
       `SELECT 1 AS assigned FROM user_model_access WHERE model_full_id = ? LIMIT 1`,
     );
-    const deactivateStmt = db.prepare(`UPDATE models SET active = 0 WHERE full_id = ?`);
+    const deactivateStmt = db.prepare(
+      `UPDATE models SET active = 0, is_free = 0 WHERE full_id = ?`,
+    );
     const deleteUnusedStmt = db.prepare(`DELETE FROM models WHERE full_id = ?`);
 
     for (const [fullId, prev] of existingMap.entries()) {
@@ -652,7 +807,13 @@ export async function syncProviderModels(options: {
       'info',
       'sync',
       `Synced models for provider "${providerId}": ${summary}`,
-      { providerId, addedCount, removedCount, totalActive: candidates.length },
+      {
+        providerId,
+        addedCount,
+        updatedCount,
+        removedCount,
+        totalActive: candidates.length,
+      },
       nowSec,
     );
 
@@ -666,10 +827,11 @@ export async function syncProviderModels(options: {
       )
       .all(providerId) as Array<Record<string, unknown>>;
 
-    const formattedModels = activeRows.map(formatModelRow);
+    const formattedModels = activeRows.map((r) => formatModelRow(r));
 
     return {
       addedCount,
+      updatedCount,
       removedCount,
       retiredCount: removedCount,
       totalActive: formattedModels.length,
@@ -684,3 +846,129 @@ export async function syncProviderModels(options: {
     throw err;
   }
 }
+
+export interface RunModelsAutoSyncOptions {
+  drainingKeys?: ReadonlySet<string>;
+  drainingProviders?: ReadonlySet<string>;
+  fetchImpl?: typeof fetch;
+  fetchFn?: typeof fetch;
+  upstreamTls?: UpstreamTlsOptions;
+  nowSec?: number;
+  modelsDevSnapshot?: ModelsDevSnapshot;
+}
+
+/**
+ * HU-16: Automatic 6-hour sync tick updating ONLY enabled providers with `models_source = 'api'`,
+ * skipping `models_source = 'static'` and disabled/draining providers, and logging secret-free
+ * `'sync'` events in `system_logs`.
+ */
+export async function runModelsAutoSyncTick(
+  dbOrParams:
+    | DatabaseSync
+    | ({
+        db: DatabaseSync;
+        masterKey: Buffer;
+      } & RunModelsAutoSyncOptions),
+  maybeMasterKey?: Buffer,
+  maybeOptions?: RunModelsAutoSyncOptions,
+): Promise<AutoSyncTickResult> {
+  const isObjectCall =
+    typeof dbOrParams === 'object' &&
+    dbOrParams !== null &&
+    'db' in dbOrParams &&
+    'masterKey' in dbOrParams;
+
+  const db = isObjectCall ? dbOrParams.db : (dbOrParams as DatabaseSync);
+  const masterKey = isObjectCall ? dbOrParams.masterKey : maybeMasterKey!;
+  const opts: RunModelsAutoSyncOptions = isObjectCall ? dbOrParams : (maybeOptions ?? {});
+
+  const fetchImpl = opts.fetchImpl ?? opts.fetchFn ?? globalThis.fetch;
+  const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
+  const drainingKeys = opts.drainingKeys ?? new Set<string>();
+  const drainingProviders = opts.drainingProviders ?? new Set<string>();
+
+  const totalRow = db.prepare(`SELECT COUNT(*) AS count FROM providers`).get() as
+    | { count: number | bigint }
+    | undefined;
+  const totalProviders = Number(totalRow?.count ?? 0);
+
+  const eligibleRows = (
+    db
+      .prepare(
+        `SELECT id, name
+         FROM providers
+         WHERE enabled = 1 AND models_source = 'api'
+         ORDER BY id ASC`,
+      )
+      .all() as Array<{ id: string; name: string }>
+  ).filter((p) => !drainingProviders.has(p.id));
+
+  const skippedStaticOrDisabled = Math.max(0, totalProviders - eligibleRows.length);
+  if (eligibleRows.length === 0) {
+    return {
+      syncedAt: nowSec,
+      providersChecked: 0,
+      skippedStaticOrDisabled,
+      summaries: [],
+    };
+  }
+
+  const snapshot =
+    opts.modelsDevSnapshot ??
+    (await loadModelsDevSnapshot(db, { fetchFn: fetchImpl, nowSec }));
+
+  const summaries: AutoSyncProviderSummary[] = [];
+
+  for (const prov of eligibleRows) {
+    try {
+      const res = await syncProviderModels({
+        db,
+        masterKey,
+        providerId: prov.id,
+        drainingKeys,
+        drainingProviders,
+        fetchImpl,
+        upstreamTls: opts.upstreamTls,
+        nowSec,
+        modelsDevSnapshot: snapshot,
+      });
+
+      summaries.push({
+        providerId: prov.id,
+        status: 'synced',
+        added: res.addedCount,
+        updated: res.updatedCount,
+        removedOrDeactivated: res.removedCount,
+      });
+    } catch (err) {
+      const safeErr = redactSecretsInText(err instanceof Error ? err.message : String(err));
+      if (!(err instanceof ModelSyncHttpError && err.status === 502)) {
+        writeSystemLog(
+          db,
+          'warn',
+          'sync',
+          `Auto-sync skipped/failed for provider "${prov.id}": ${safeErr}`,
+          { providerId: prov.id },
+          nowSec,
+        );
+      }
+      summaries.push({
+        providerId: prov.id,
+        status: 'error',
+        added: 0,
+        updated: 0,
+        removedOrDeactivated: 0,
+        errorMessage: safeErr,
+      });
+    }
+  }
+
+  return {
+    syncedAt: nowSec,
+    providersChecked: eligibleRows.length,
+    skippedStaticOrDisabled,
+    summaries,
+  };
+}
+
+export const runAutoSyncFreeModels = runModelsAutoSyncTick;
