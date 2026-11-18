@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Bifrost — Native Linux + systemd Installer (HU-01, HU-26)
+# Bifrost — Native Linux + systemd Installer
 # ==============================================================================
 set -euo pipefail
 
@@ -9,6 +9,7 @@ BIFROST_GROUP="${BIFROST_GROUP:-bifrost}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/bifrost}"
 DATA_DIR="${DATA_DIR:-/var/lib/bifrost}"
 PORT="${PORT:-8080}"
+ENV_FILE="/etc/default/bifrost"
 SERVICE_NAME="bifrost.service"
 SERVICE_DEST="/etc/systemd/system/${SERVICE_NAME}"
 
@@ -23,9 +24,24 @@ err() {
   printf '\033[1;31m[bifrost][error]\033[0m %s\n' "$*" >&2
 }
 
-# 1. Verify Linux + systemd + root privileges
+# 1. Verify Linux + systemd + root privileges + parameters
 if [[ "$(uname -s)" != "Linux" ]]; then
   err "Este instalador solo soporta sistemas Linux (detectado: $(uname -s))."
+  exit 1
+fi
+
+if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [[ "${PORT}" -lt 1 || "${PORT}" -gt 65535 ]]; then
+  err "Puerto inválido '${PORT}'. Debe ser un entero entre 1 y 65535."
+  exit 1
+fi
+
+if [[ "${INSTALL_DIR}" != /* || "${DATA_DIR}" != /* ]]; then
+  err "INSTALL_DIR (${INSTALL_DIR}) y DATA_DIR (${DATA_DIR}) deben ser rutas absolutas."
+  exit 1
+fi
+
+if [[ "${INSTALL_DIR%/}" == "${DATA_DIR%/}" ]]; then
+  err "INSTALL_DIR y DATA_DIR no pueden apuntar al mismo directorio (${INSTALL_DIR})."
   exit 1
 fi
 
@@ -43,7 +59,7 @@ if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; the
   exit 1
 fi
 
-# 2. Verify Node.js >= 22 and npm
+# 2. Verify Node.js >= 22, npm, and repository files
 if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   err "Node.js (>= 22 LTS) y npm son obligatorios y no se encontraron en PATH."
   exit 1
@@ -56,6 +72,12 @@ if [[ -z "${NODE_MAJOR}" || "${NODE_MAJOR}" -lt 22 ]]; then
   exit 1
 fi
 NODE_BIN="$(command -v node)"
+
+if [[ ! -f "${REPO_ROOT}/nodes/install-node.sh" ]]; then
+  err "No se encontró ${REPO_ROOT}/nodes/install-node.sh en el árbol de código fuente."
+  exit 1
+fi
+
 log "Entorno verificado: Linux + systemd + Node.js v${NODE_VERSION} (${NODE_BIN})"
 
 # 3. Create system user/group bifrost and directories (/opt/bifrost, /var/lib/bifrost)
@@ -78,44 +100,71 @@ if ! id -u "${BIFROST_USER}" >/dev/null 2>&1; then
     "${BIFROST_USER}"
 fi
 
-log "Preparando directorios '${INSTALL_DIR}' y '${DATA_DIR}' (0700)..."
+log "Preparando directorios '${INSTALL_DIR}' (0755) y '${DATA_DIR}' (0700)..."
 mkdir -p "${INSTALL_DIR}" "${DATA_DIR}"
 chmod 0755 "${INSTALL_DIR}"
 chmod 0700 "${DATA_DIR}"
-chown "${BIFROST_USER}:${BIFROST_GROUP}" "${DATA_DIR}"
+chown -R "${BIFROST_USER}:${BIFROST_GROUP}" "${DATA_DIR}"
 
 # 4. Provision /var/lib/bifrost/master.key (32 random bytes, 0600, never overwrite!)
 MASTER_KEY_PATH="${DATA_DIR}/master.key"
 DB_PATH="${DATA_DIR}/bifrost.db"
 
-if [[ -f "${MASTER_KEY_PATH}" ]]; then
+HAS_PERSISTED_ENV_KEY=0
+if [[ -f "${ENV_FILE}" ]] && grep -Eq '^[[:space:]]*BIFROST_MASTER_KEY=[^[:space:]#]+' "${ENV_FILE}"; then
+  HAS_PERSISTED_ENV_KEY=1
+fi
+
+if [[ -L "${MASTER_KEY_PATH}" ]] || { [[ -e "${MASTER_KEY_PATH}" ]] && [[ ! -f "${MASTER_KEY_PATH}" ]]; }; then
+  err "La ruta ${MASTER_KEY_PATH} existe pero no es un archivo regular. Abortando sin sobrescribir."
+  exit 1
+elif [[ -f "${MASTER_KEY_PATH}" ]]; then
   KEY_BYTES="$(wc -c < "${MASTER_KEY_PATH}" | tr -d '[:space:]')"
   if [[ "${KEY_BYTES}" -ne 32 ]]; then
-    err "La llave existente en ${MASTER_KEY_PATH} es inválida (${KEY_BYTES} bytes; se esperan 32 bytes). Abortando sin sobrescribir."
+    err "La llave existente en ${MASTER_KEY_PATH} es inválida (${KEY_BYTES} bytes; se esperan exactamente 32 bytes). Abortando sin sobrescribir."
     exit 1
   fi
   chmod 0600 "${MASTER_KEY_PATH}"
   chown "${BIFROST_USER}:${BIFROST_GROUP}" "${MASTER_KEY_PATH}"
   log "Llave maestra existente conservada en ${MASTER_KEY_PATH} (32 bytes, 0600)."
-elif [[ -f "${DB_PATH}" ]]; then
-  err "Existe base de datos en ${DB_PATH} pero falta ${MASTER_KEY_PATH}. Por seguridad (HU-26) no se genera una llave nueva automáticamente."
-  exit 1
+elif [[ -e "${DB_PATH}" || -e "${DB_PATH}-wal" || -e "${DB_PATH}-shm" ]]; then
+  if [[ "${HAS_PERSISTED_ENV_KEY}" -eq 1 ]]; then
+    log "Base de datos existente detectada en ${DB_PATH}; se usará BIFROST_MASTER_KEY definida en ${ENV_FILE} sin generar ${MASTER_KEY_PATH}."
+  else
+    err "Existe base de datos en ${DB_PATH} pero falta ${MASTER_KEY_PATH}. Por seguridad nunca se genera una llave nueva sobre datos existentes; restaura tu llave maestra original."
+    exit 1
+  fi
+elif [[ "${HAS_PERSISTED_ENV_KEY}" -eq 1 ]]; then
+  log "Se detectó BIFROST_MASTER_KEY en ${ENV_FILE}; se omite la creación de ${MASTER_KEY_PATH}."
 else
   log "Generando nueva llave maestra de 32 bytes en ${MASTER_KEY_PATH}..."
   (
     umask 0077
     head -c 32 /dev/urandom > "${MASTER_KEY_PATH}"
   )
+  CREATED_BYTES="$(wc -c < "${MASTER_KEY_PATH}" | tr -d '[:space:]')"
+  if [[ "${CREATED_BYTES}" -ne 32 ]]; then
+    rm -f "${MASTER_KEY_PATH}"
+    err "No se pudieron generar exactamente 32 bytes aleatorios en ${MASTER_KEY_PATH}."
+    exit 1
+  fi
   chmod 0600 "${MASTER_KEY_PATH}"
   chown "${BIFROST_USER}:${BIFROST_GROUP}" "${MASTER_KEY_PATH}"
 fi
 
-# 5. Sync application files to /opt/bifrost and compile panel + core
+# Re-verify strict permissions on DATA_DIR and master.key
+chmod 0700 "${DATA_DIR}"
+if [[ -f "${MASTER_KEY_PATH}" ]]; then
+  chmod 0600 "${MASTER_KEY_PATH}"
+fi
+
+# 5. Sync application files (including nodes/install-node.sh) to /opt/bifrost and compile panel + core
 REAL_REPO="$(cd "${REPO_ROOT}" && pwd -P)"
 REAL_INSTALL="$(cd "${INSTALL_DIR}" && pwd -P)"
 
 if [[ "${REAL_REPO}" != "${REAL_INSTALL}" ]]; then
   log "Copiando código fuente de Bifrost en ${INSTALL_DIR}..."
+  rm -rf "${INSTALL_DIR}/panel/dist" "${INSTALL_DIR}/core/dist"
   tar -C "${REPO_ROOT}" \
     --exclude='.git' \
     --exclude='node_modules' \
@@ -125,9 +174,15 @@ if [[ "${REAL_REPO}" != "${REAL_INSTALL}" ]]; then
     --exclude='*.sqlite*' \
     --exclude='*.key' \
     --exclude='*.enc' \
-    -cf - package.json schemas core panel scripts \
+    -cf - package.json schemas core panel scripts nodes/install-node.sh \
     | tar -C "${INSTALL_DIR}" -xf -
 fi
+
+if [[ ! -f "${INSTALL_DIR}/nodes/install-node.sh" ]]; then
+  err "Error al verificar ${INSTALL_DIR}/nodes/install-node.sh tras la copia."
+  exit 1
+fi
+chmod 0755 "${INSTALL_DIR}/nodes/install-node.sh"
 
 log "Instalando dependencias y compilando panel (${INSTALL_DIR}/panel)..."
 if [[ -f "${INSTALL_DIR}/panel/package-lock.json" ]]; then
@@ -149,17 +204,39 @@ npm --prefix "${INSTALL_DIR}/core" prune --omit=dev
 
 chown -R "${BIFROST_USER}:${BIFROST_GROUP}" "${INSTALL_DIR}"
 
-# 6. Install and enable systemd unit
+# 6. Provision /etc/default/bifrost (if absent) and install systemd unit
+if [[ ! -f "${ENV_FILE}" ]]; then
+  (
+    umask 0077
+    cat <<EOF > "${ENV_FILE}"
+# Configuración opcional de entorno para Bifrost (leída por ${SERVICE_NAME})
+PORT=${PORT}
+DATA_DIR=${DATA_DIR}
+PANEL_DIST_DIR=${INSTALL_DIR}/panel/dist
+# BIFROST_MARKETPLACE_URL=https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json
+EOF
+  )
+  chmod 0600 "${ENV_FILE}"
+fi
+
 log "Instalando servicio systemd en ${SERVICE_DEST}..."
 install -m 0644 "${INSTALL_DIR}/scripts/${SERVICE_NAME}" "${SERVICE_DEST}"
 
-# Ensure custom Node binary locations outside standard systemd PATH still work cleanly
-if [[ "${NODE_BIN}" != "/usr/bin/node" && "${NODE_BIN}" != "/usr/local/bin/node" ]]; then
-  sed -i "s|^ExecStart=.*|ExecStart=${NODE_BIN} ${INSTALL_DIR}/core/dist/index.js|" "${SERVICE_DEST}"
-fi
+sed -i \
+  -e "s|^User=.*|User=${BIFROST_USER}|" \
+  -e "s|^Group=.*|Group=${BIFROST_GROUP}|" \
+  -e "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}/core|" \
+  -e "s|^Environment=PORT=.*|Environment=PORT=${PORT}|" \
+  -e "s|^Environment=DATA_DIR=.*|Environment=DATA_DIR=${DATA_DIR}|" \
+  -e "s|^Environment=PANEL_DIST_DIR=.*|Environment=PANEL_DIST_DIR=${INSTALL_DIR}/panel/dist|" \
+  -e "s|^ExecStart=.*|ExecStart=${NODE_BIN} ${INSTALL_DIR}/core/dist/index.js|" \
+  -e "s|^ReadWritePaths=.*|ReadWritePaths=${DATA_DIR}|" \
+  -e "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${INSTALL_DIR}|" \
+  "${SERVICE_DEST}"
 
 systemctl daemon-reload
-systemctl enable --now bifrost
+systemctl enable "${SERVICE_NAME}"
+systemctl restart "${SERVICE_NAME}"
 
 log "Bifrost instalado y ejecutándose correctamente."
 log "Panel y API disponibles en: http://localhost:${PORT}"

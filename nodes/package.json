@@ -1,6 +1,6 @@
 {
   "name": "@bifrost/nodes",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Agente ligero de nodo de salida de cero conocimiento (HTTP CONNECT) para Bifrost",
   "license": "MIT",

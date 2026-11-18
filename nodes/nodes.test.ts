@@ -258,7 +258,7 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
     }
   });
 
-  it('enforces SSRF protection against loopback, RFC1918, link-local, CGNAT, IPv6 private, and non-443 ports', async () => {
+  it('enforces SSRF protection against loopback, RFC1918, link-local, CGNAT, IPv6 private/transition, and non-443 ports', async () => {
     for (const blockedIp of [
       '0.0.0.0',
       '127.0.0.1',
@@ -268,21 +268,47 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
       '172.16.0.1',
       '172.31.255.254',
       '192.168.0.1',
+      '192.0.0.192',
+      '192.88.99.1',
       '169.254.169.254',
       '100.64.0.1',
       '100.100.100.100',
+      '100.100.100.200',
       '::1',
       '::',
+      '::127.0.0.1',
       '::ffff:127.0.0.1',
       '::ffff:169.254.169.254',
+      '::ffff:100.100.100.200',
+      '::ffff:0:127.0.0.1',
+      '::ffff:0:169.254.169.254',
+      '::ffff:0:1.1.1.1',
+      '64:ff9b::169.254.169.254',
+      '64:ff9b::1.1.1.1',
+      '64:ff9b:1::1',
+      '2001:0000:4136:e378:8000:63bf:3fff:fdd2',
+      '2001:2::1',
+      '2002:a9fe:a9fe::1',
+      '2002:7f00:0001::1',
+      '2002:0101:0101::1',
+      'fd00:ec2::254',
       'fc00::1',
       'fd12:3456:789a::1',
-      'fe80::1'
+      'fe80::1',
+      'fe80::1%eth0',
     ]) {
       assert.equal(isPrivateOrReservedIp(blockedIp), true, `Expected ${blockedIp} to be blocked`);
     }
 
-    for (const publicIp of ['1.1.1.1', '8.8.8.8', '104.18.2.15', '2606:4700:4700::1111']) {
+    for (const publicIp of [
+      '1.1.1.1',
+      '8.8.8.8',
+      '104.18.2.15',
+      '100.63.255.254',
+      '100.128.0.1',
+      '2606:4700:4700::1111',
+      '2001:4860:4860::8888',
+    ]) {
       assert.equal(isPrivateOrReservedIp(publicIp), false, `Expected ${publicIp} to be allowed`);
     }
 
@@ -314,9 +340,17 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
         '172.20.0.5:443',
         '169.254.169.254:443',
         '100.100.100.100:443',
+        '100.100.100.200:443',
         '[::1]:443',
         '[::ffff:127.0.0.1]:443',
+        '[::ffff:0:169.254.169.254]:443',
+        '[2002:a9fe:a9fe::1]:443',
+        '[2001:0000:4136:e378:8000:63bf:3fff:fdd2]:443',
+        '[64:ff9b::1.1.1.1]:443',
+        '[64:ff9b:1::1]:443',
+        '[fd00:ec2::254]:443',
         'localhost:443',
+        'metadata.google.internal:443',
         '1.1.1.1:22',
         '1.1.1.1:8080'
       ];

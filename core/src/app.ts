@@ -5,6 +5,13 @@ import type { DatabaseSync } from 'node:sqlite';
 import { Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import {
+  BackupValidationError,
+  exportEncryptedBackup,
+  importEncryptedBackup,
+  packBifrostEnvelope,
+  unpackBifrostEnvelopeRaw,
+} from './backup.js';
+import {
   deriveFallbackInitial,
   getProviderLogo,
   loadModelsDevSnapshot,
@@ -68,8 +75,25 @@ import {
   loadSeedManifests,
   validateProviderManifest,
 } from './schema.js';
+import {
+  UserHttpError,
+  acceptInvitation,
+  createInvitation,
+  deleteManagedUser,
+  listInvitations,
+  listUsers,
+  updateManagedUser,
+} from './users-invitations.js';
 
-export { runNodesHealthTick, runModelsAutoSyncTick, computePercentiles };
+export {
+  runNodesHealthTick,
+  runModelsAutoSyncTick,
+  computePercentiles,
+  exportEncryptedBackup,
+  importEncryptedBackup,
+  packBifrostEnvelope,
+  unpackBifrostEnvelopeRaw,
+};
 
 const SESSION_COOKIE_NAME = 'bifrost_session';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
@@ -101,6 +125,7 @@ export interface CreateAppOptions {
   marketplaceUrl?: string;
   fetchImpl?: typeof fetch;
   upstreamTls?: UpstreamTlsOptions;
+  maxBackupUncompressedBytes?: number;
   now?: () => number;
 }
 
@@ -462,7 +487,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       pathname === '/api/status' ||
       pathname === '/api/setup' ||
       pathname === '/api/auth/login' ||
-      pathname === '/api/auth/logout'
+      pathname === '/api/auth/logout' ||
+      (c.req.method === 'POST' && /^\/api\/invitations\/[^/]+\/accept$/.test(pathname))
     ) {
       return next();
     }
@@ -2315,6 +2341,291 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       isGuestModelAllowed: (userId, modelFullId) => isGuestModelAllowed(userId, modelFullId),
       isProviderOrAllKeysDraining,
     });
+  });
+
+  // --- Phase 8: Users, Single-Use Invitations & Encrypted .bifrost.enc Backups (HU-04, HU-05, HU-25, HU-25b) ---
+
+  app.get('/api/users', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    return c.json({ users: listUsers(db, nowSeconds()) });
+  });
+
+  app.patch('/api/users/:id', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    try {
+      const updated = updateManagedUser(
+        db,
+        user.id,
+        c.req.param('id'),
+        body,
+        nowSeconds(),
+      );
+      return c.json({ user: updated });
+    } catch (err) {
+      if (err instanceof UserHttpError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.delete('/api/users/:id', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    try {
+      deleteManagedUser(db, user.id, c.req.param('id'), nowSeconds());
+      return c.json({ ok: true });
+    } catch (err) {
+      if (err instanceof UserHttpError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.get('/api/invitations', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    return c.json({ invitations: listInvitations(db, nowSeconds()) });
+  });
+
+  app.post('/api/invitations', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    let requestOrigin: string | null = c.req.header('origin') ?? null;
+    if (!requestOrigin) {
+      try {
+        requestOrigin = new URL(c.req.url).origin;
+      } catch {
+        requestOrigin = null;
+      }
+    }
+
+    try {
+      const created = createInvitation(
+        db,
+        user.id,
+        body,
+        requestOrigin,
+        nowSeconds(),
+      );
+      return c.json(created, 201);
+    } catch (err) {
+      if (err instanceof UserHttpError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/invitations/:token/accept', async (c) => {
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    let rawToken = c.req.param('token') ?? '';
+    try {
+      rawToken = decodeURIComponent(rawToken);
+    } catch {
+      return c.json({ error: 'Malformed invitation token.' }, 400);
+    }
+
+    try {
+      const accepted = await acceptInvitation(
+        db,
+        rawToken,
+        body,
+        SESSION_TTL_SECONDS,
+        nowSeconds(),
+      );
+
+      setCookie(c, SESSION_COOKIE_NAME, accepted.sessionToken, {
+        httpOnly: true,
+        sameSite: 'Lax',
+        path: '/',
+        maxAge: SESSION_TTL_SECONDS,
+      });
+
+      return c.json({ user: accepted.user }, 201);
+    } catch (err) {
+      if (err instanceof UserHttpError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/backup/export', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    try {
+      const envelope = await exportEncryptedBackup({
+        db,
+        masterKey,
+        password: typeof body.password === 'string' ? body.password : '',
+        actingUserId: user.id,
+        includeProvidersAndConfig:
+          typeof body.includeProvidersAndConfig === 'boolean'
+            ? body.includeProvidersAndConfig
+            : true,
+        includeProviderKeys:
+          typeof body.includeProviderKeys === 'boolean'
+            ? body.includeProviderKeys
+            : true,
+        includeUsersAndQuotas:
+          typeof body.includeUsersAndQuotas === 'boolean'
+            ? body.includeUsersAndQuotas
+            : true,
+        includeNodes:
+          typeof body.includeNodes === 'boolean' ? body.includeNodes : true,
+        includeTelemetry:
+          typeof body.includeTelemetry === 'boolean' ? body.includeTelemetry : false,
+        includeUsageLogs:
+          typeof body.includeUsageLogs === 'boolean' ? body.includeUsageLogs : undefined,
+        includeSystemLogs:
+          typeof body.includeSystemLogs === 'boolean'
+            ? body.includeSystemLogs
+            : undefined,
+        includeCache:
+          typeof body.includeCache === 'boolean' ? body.includeCache : false,
+        nowSec: nowSeconds(),
+      });
+
+      const dateSlug = new Date(now()).toISOString().slice(0, 10);
+      return c.body(new Uint8Array(envelope), 200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="bifrost-backup-${dateSlug}.bifrost.enc"`,
+        'Cache-Control': 'no-store',
+      });
+    } catch (err) {
+      if (err instanceof BackupValidationError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/backup/import', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    const contentType = (c.req.header('content-type') ?? '').toLowerCase();
+    let password = '';
+    let envelope: Buffer;
+
+    try {
+      if (contentType.includes('multipart/form-data')) {
+        const formData = await c.req.formData();
+        const rawPassword = formData.get('password');
+        password = typeof rawPassword === 'string' ? rawPassword : '';
+
+        const fileEntry = formData.get('file');
+        if (!fileEntry || typeof fileEntry === 'string') {
+          return c.json(
+            { error: 'Missing binary backup file ("file") in multipart form data.' },
+            400,
+          );
+        }
+        const blob = fileEntry as Blob;
+        const maxCap = (options.maxBackupUncompressedBytes ?? 50 * 1024 * 1024) + 1024;
+        if (blob.size > maxCap) {
+          return c.json(
+            { error: `Backup file exceeds maximum allowed size (${maxCap} bytes).` },
+            400,
+          );
+        }
+        envelope = Buffer.from(await blob.arrayBuffer());
+      } else {
+        let body: Record<string, unknown>;
+        try {
+          body = (await c.req.json()) as Record<string, unknown>;
+        } catch {
+          return c.json({ error: 'Invalid backup import request body.' }, 400);
+        }
+        password = typeof body.password === 'string' ? body.password : '';
+        const rawB64 =
+          typeof body.fileBase64 === 'string'
+            ? body.fileBase64
+            : typeof body.data === 'string'
+              ? body.data
+              : '';
+        if (!rawB64) {
+          return c.json(
+            { error: 'Missing "fileBase64" or multipart "file" payload.' },
+            400,
+          );
+        }
+        const strippedB64 = rawB64.trim().replace(/^data:[^;]+;base64,/i, '');
+        if (!/^[A-Za-z0-9+/_=-]+$/.test(strippedB64)) {
+          return c.json({ error: 'Corrupted BIFROST1 base64 backup payload.' }, 400);
+        }
+        envelope = Buffer.from(strippedB64, 'base64');
+      }
+
+      const result = await importEncryptedBackup({
+        db,
+        masterKey,
+        envelope,
+        password,
+        schemasDir: resolvedSchemasDir,
+        actingUserId: user.id,
+        maxUncompressedBytes: options.maxBackupUncompressedBytes,
+        nowSec: nowSeconds(),
+      });
+
+      return c.json(result);
+    } catch (err) {
+      if (err instanceof BackupValidationError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
   });
 
   app.all('/api/*', (c) => {
