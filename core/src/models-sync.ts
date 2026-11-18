@@ -603,11 +603,12 @@ export async function syncProviderModels(options: {
       const headers = buildProviderAuthHeaders(manifest.auth, rawSecret);
       try {
         let res: Response;
-        if (
-          typeof kRow.node_id === 'string' &&
-          kRow.node_id.length > 0 &&
-          kRow.node_encrypted_token
-        ) {
+        if (typeof kRow.node_id === 'string' && kRow.node_id.length > 0) {
+          if (!kRow.node_encrypted_token || !kRow.node_endpoint) {
+            throw new Error(
+              `Assigned exit node "${kRow.node_id}" is missing tunnel credentials`,
+            );
+          }
           const nodeToken = decryptSecret(kRow.node_encrypted_token as Uint8Array, masterKey);
           res = await fetchViaExitNode(
             modelsUrl,
@@ -629,6 +630,7 @@ export async function syncProviderModels(options: {
           res = await fetchImpl(modelsUrl, {
             method: 'GET',
             headers,
+            redirect: 'error',
           });
         }
 

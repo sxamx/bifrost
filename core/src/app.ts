@@ -42,6 +42,7 @@ import {
   runModelsAutoSyncTick,
   syncProviderModels,
 } from './models-sync.js';
+import { handlePlaygroundChat } from './playground.js';
 import {
   NodeOperationError,
   PUBLIC_IP_WARNING_MESSAGE,
@@ -1429,6 +1430,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   // --- Monochrome Sanitized Provider Logos & Catalog Explorer (HU-14, HU-14b, HU-14c, HU-15) ---
 
   app.get('/api/logos/:slug', async (c) => {
+    const user = c.get('user');
     const rawSlug = c.req.param('slug') ?? '';
     const cleanedSlug = rawSlug.trim().replace(/\.svg$/i, '');
     const providerRow = db
@@ -1439,7 +1441,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       displayName: providerRow?.name ?? cleanedSlug,
       fetchFn: fetchImpl,
       nowSec: nowSeconds(),
-      forceRefresh: c.req.query('refresh') === '1',
+      forceRefresh: user.role === 'admin' && c.req.query('refresh') === '1',
     });
 
     const accept = (c.req.header('accept') ?? '').toLowerCase();
@@ -1670,7 +1672,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       {
         fetchFn: fetchImpl,
         nowSec: nowSeconds(),
-        forceRefresh: c.req.query('refresh') === '1',
+        forceRefresh: user.role === 'admin' && c.req.query('refresh') === '1',
       },
     );
 
@@ -2276,6 +2278,38 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     });
 
     return c.json(result);
+  });
+
+  // --- Phase 6: Integrated Playground Chat (HU-21, HU-22) ---
+
+  app.post('/api/playground/chat', async (c) => {
+    const user = c.get('user');
+
+    let rawBody: Record<string, unknown>;
+    try {
+      rawBody = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.', code: 'invalid_json' }, 400);
+    }
+
+    return handlePlaygroundChat({
+      db,
+      masterKey,
+      registry,
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+      },
+      rawBody,
+      acceptHeader: c.req.header('accept'),
+      signal: c.req.raw.signal,
+      fetchImpl,
+      upstreamTls: options.upstreamTls,
+      now,
+      isGuestModelAllowed: (userId, modelFullId) => isGuestModelAllowed(userId, modelFullId),
+      isProviderOrAllKeysDraining,
+    });
   });
 
   app.all('/api/*', (c) => {

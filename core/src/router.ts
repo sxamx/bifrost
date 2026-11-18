@@ -606,11 +606,37 @@ export async function executeChatCompletions(options: {
     );
   }
 
+  const extractSafeUpstreamErrorMessage = async (res: Response): Promise<string> => {
+    const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+    const rawBody = await res.text().catch(() => '');
+    if (contentType.includes('application/json') && rawBody.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+        const errField = parsed.error;
+        const candidate =
+          errField && typeof errField === 'object' && !Array.isArray(errField)
+            ? (errField as Record<string, unknown>).message
+            : typeof errField === 'string'
+              ? errField
+              : parsed.message;
+        if (typeof candidate === 'string' && candidate.trim().length > 0) {
+          return redactSecretsInText(candidate.trim().slice(0, 300));
+        }
+      } catch {
+        // Ignore malformed JSON body and return generic HTTP status message
+      }
+    }
+    return `Upstream provider returned HTTP ${res.status}.`;
+  };
+
   const dispatchRequestForKey = async (
     key: ProviderKeyRecord,
     init: RequestInit,
   ): Promise<Response> => {
-    if (key.node_id && key.node_encrypted_token && key.node_endpoint) {
+    if (key.node_id) {
+      if (!key.node_encrypted_token || !key.node_endpoint) {
+        throw new Error(`Assigned exit node "${key.node_id}" is missing tunnel credentials`);
+      }
       const nodeRawToken = decryptSecret(key.node_encrypted_token, masterKey);
       return fetchViaExitNode(
         chatUrl,
@@ -626,7 +652,7 @@ export async function executeChatCompletions(options: {
         upstreamTls,
       );
     }
-    return fetchImpl(chatUrl, init);
+    return fetchImpl(chatUrl, { ...init, redirect: 'error' });
   };
 
   const isStream = requestBody.stream === true;
@@ -704,10 +730,8 @@ export async function executeChatCompletions(options: {
         if (isRetryableKeyFailureStatus(res.status)) {
           lastStatus = res.status;
           lastWasNetwork = false;
-          const errSnippet = await res.text().catch(() => '');
-          lastErrorMsg = redactSecretsInText(
-            `HTTP ${res.status}${errSnippet ? `: ${errSnippet.slice(0, 160)}` : ''}`,
-          );
+          const safeErr = await extractSafeUpstreamErrorMessage(res);
+          lastErrorMsg = redactSecretsInText(`HTTP ${res.status}: ${safeErr.slice(0, 160)}`);
           markKeyFailure(
             db,
             key.id,
@@ -740,7 +764,7 @@ export async function executeChatCompletions(options: {
         }
 
         if (!res.ok) {
-          const errText = await res.text().catch(() => '');
+          const safeErr = await extractSafeUpstreamErrorMessage(res);
           const endMs = now();
           const endSec = Math.floor(endMs / 1000);
           recordUsageLog(db, {
@@ -759,7 +783,7 @@ export async function executeChatCompletions(options: {
             createdAt: endSec,
           });
           return openAiErrorJson(
-            redactSecretsInText(errText || `Upstream returned HTTP ${res.status}`),
+            safeErr,
             'invalid_request_error',
             'upstream_error',
             res.status,
@@ -977,11 +1001,9 @@ export async function executeChatCompletions(options: {
         if (isRetryableKeyFailureStatus(res.status) || !res.body) {
           const status = res.status;
           lastStreamOpenStatus = status;
-          const errSnippet = await res.text().catch(() => '');
+          const safeErr = await extractSafeUpstreamErrorMessage(res);
           releaseLease();
-          const safeMsg = redactSecretsInText(
-            `HTTP ${status}${errSnippet ? `: ${errSnippet.slice(0, 160)}` : ''}`,
-          );
+          const safeMsg = redactSecretsInText(`HTTP ${status}: ${safeErr.slice(0, 160)}`);
           markKeyFailure(db, key.id, status, safeMsg, res.headers, Math.floor(now() / 1000));
 
           const hasMore = candidates.some(
@@ -1001,11 +1023,11 @@ export async function executeChatCompletions(options: {
         }
 
         if (!res.ok) {
-          const errText = await res.text().catch(() => '');
+          const safeErr = await extractSafeUpstreamErrorMessage(res);
           releaseLease();
           nonRetryableStreamFailure = {
             status: res.status,
-            message: redactSecretsInText(errText || `Upstream returned HTTP ${res.status}`),
+            message: safeErr,
             keyId: key.id,
           };
           return null;

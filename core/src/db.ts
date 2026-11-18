@@ -205,13 +205,19 @@ export function openDatabase(dbPath: string): DatabaseSync {
 }
 
 const SENSITIVE_FIELD_RE =
-  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|token|token_hash|tokenHash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|encrypted_token|encryptedToken|masterKey|master_key|authorization|proxy-authorization|cookie)$/i;
+  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|x-api-key|x-goog-api-key|token|token_hash|tokenHash|prev_token_hash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|encrypted_token|encryptedToken|masterKey|master_key|authorization|proxy-authorization|proxy_authorization|cookie)$/i;
 
 export function redactSecretsInText(text: string): string {
   return text
-    .replace(/sk-bf-[A-Za-z0-9_-]{8,}/g, 'sk-bf-[REDACTED]')
-    .replace(/sk-[A-Za-z0-9_-]{12,}/g, 'sk-[REDACTED]')
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, 'Bearer [REDACTED]');
+    .replace(/sk-bf-[A-Za-z0-9_-]{6,}/g, 'sk-bf-[REDACTED]')
+    .replace(/bfnode_[A-Za-z0-9_-]{6,}/g, 'bfnode_[REDACTED]')
+    .replace(/bfn_[A-Za-z0-9_-]{6,}/g, 'bfn_[REDACTED]')
+    .replace(/sk-[A-Za-z0-9_-]{10,}/g, 'sk-[REDACTED]')
+    .replace(/nvapi-[A-Za-z0-9_-]{10,}/g, 'nvapi-[REDACTED]')
+    .replace(/gsk_[A-Za-z0-9_-]{10,}/g, 'gsk_[REDACTED]')
+    .replace(/AIza[A-Za-z0-9_-]{16,}/g, 'AIza[REDACTED]')
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [REDACTED]')
+    .replace(/([?&](?:key|api_key|apikey|token|access_token)=)[^&\s"'#]+/gi, '$1[REDACTED]');
 }
 
 function sanitizeLogValue(value: unknown, depth = 0): unknown {
