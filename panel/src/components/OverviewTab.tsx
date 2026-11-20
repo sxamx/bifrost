@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type { AuthUser, DashboardStats, MetricsSummary, ProviderSummary } from '../types';
 import { InfoTip } from './InfoTip';
 import { OnboardingCard } from './OnboardingCard';
@@ -190,11 +191,11 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   }, []);
 
   async function handleCopyEndpoint() {
-    try {
-      await navigator.clipboard.writeText(baseUrl);
+    const ok = await copyTextToClipboard(baseUrl);
+    if (ok) {
       setCopiedEndpoint(true);
       window.setTimeout(() => setCopiedEndpoint(false), 2200);
-    } catch {
+    } else {
       setCopiedEndpoint(false);
     }
   }

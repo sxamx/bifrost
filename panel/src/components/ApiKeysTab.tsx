@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type { InternalApiKey } from '../types';
 import { InfoTip } from './InfoTip';
 
@@ -127,11 +128,11 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
   }
 
   async function copyText(value: string, setter: (v: boolean) => void) {
-    try {
-      await navigator.clipboard.writeText(value);
+    const ok = await copyTextToClipboard(value);
+    if (ok) {
       setter(true);
       window.setTimeout(() => setter(false), 2400);
-    } catch {
+    } else {
       setter(false);
     }
   }

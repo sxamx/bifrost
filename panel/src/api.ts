@@ -396,6 +396,9 @@ function normalizeManagedUser(raw: unknown): ManagedUserItem {
   const resetRaw = r.quotaResetMode ?? r.quota_reset_mode;
   const quotaResetMode: QuotaResetMode =
     resetRaw === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight';
+  const rawStrict = r.enforceStrictQuota ?? r.enforce_strict_quota;
+  const enforceStrictQuota =
+    rawStrict === undefined || rawStrict === null ? true : Boolean(rawStrict);
 
   return {
     id: String(r.id ?? ''),
@@ -404,6 +407,7 @@ function normalizeManagedUser(raw: unknown): ManagedUserItem {
     dailyTokenLimit:
       typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? rawLimit : null,
     quotaResetMode,
+    enforceStrictQuota,
     allowedModels: asStringArray(
       r.allowedModels ?? r.allowed_models ?? r.allowed_models_json ?? ['*']
     ),
@@ -425,10 +429,14 @@ function normalizeManagedUser(raw: unknown): ManagedUserItem {
 function normalizeInvitation(raw: unknown): InvitationItem {
   const r = asRecord(raw);
   const resetRaw = r.quotaResetMode ?? r.quota_reset_mode;
+  const rawStrict = r.enforceStrictQuota ?? r.enforce_strict_quota;
+  const enforceStrictQuota =
+    rawStrict === undefined || rawStrict === null ? true : Boolean(rawStrict);
   return {
     id: String(r.id ?? ''),
     dailyTokenLimit: asNum(r.dailyTokenLimit ?? r.daily_token_limit),
     quotaResetMode: resetRaw === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight',
+    enforceStrictQuota,
     allowedModels: asStringArray(
       r.allowedModels ?? r.allowed_models ?? r.allowed_models_json ?? ['*']
     ),
@@ -1133,6 +1141,7 @@ export const api = {
     input: {
       dailyTokenLimit: number | null;
       quotaResetMode: QuotaResetMode;
+      enforceStrictQuota?: boolean;
       allowedModels: string[];
     }
   ): Promise<ManagedUserItem> {
@@ -1167,6 +1176,9 @@ export const api = {
       body: JSON.stringify({
         dailyTokenLimit: input.dailyTokenLimit,
         quotaResetMode: input.quotaResetMode,
+        ...(input.enforceStrictQuota !== undefined
+          ? { enforceStrictQuota: input.enforceStrictQuota }
+          : {}),
         allowedModels: input.allowedModels,
         expiresInHours: input.expiresInHours ?? 48,
       }),

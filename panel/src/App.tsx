@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from './api';
+import { copyTextToClipboard } from './clipboard';
 import { AcceptInviteScreen } from './components/AcceptInviteScreen';
 import { ApiKeysTab } from './components/ApiKeysTab';
 import { BackupsTab } from './components/BackupsTab';
@@ -302,11 +303,11 @@ export const App: React.FC = () => {
 
   async function handleCopyTopEndpoint() {
     const baseUrl = `${window.location.origin}/v1`;
-    try {
-      await navigator.clipboard.writeText(baseUrl);
+    const ok = await copyTextToClipboard(baseUrl);
+    if (ok) {
       setCopiedTopUrl(true);
       window.setTimeout(() => setCopiedTopUrl(false), 1800);
-    } catch {
+    } else {
       setCopiedTopUrl(false);
     }
   }

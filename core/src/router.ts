@@ -272,6 +272,30 @@ function recordUsageLog(
   );
 }
 
+export function estimateMessagesPromptTokens(messages: Array<Record<string, unknown>>): number {
+  let chars = 0;
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    const content = msg.content;
+    if (typeof content === 'string') {
+      chars += content.length + 12;
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part && typeof part === 'object') {
+          const p = part as Record<string, unknown>;
+          if (typeof p.text === 'string') {
+            chars += p.text.length;
+          }
+        }
+      }
+      chars += 16;
+    } else {
+      chars += 12;
+    }
+  }
+  return chars > 0 ? Math.max(1, Math.ceil(chars / 4)) : 0;
+}
+
 /**
  * HU-17 & HU-05: Enforces daily token quota strictly using the server's UTC clock
  * (`utc_midnight` or `rolling_24h`), 100% immune to any client Date/Timezone headers.
@@ -281,7 +305,14 @@ export function checkUserDailyQuotaUtc(
   userId: string,
   nowMs: number,
 ):
-  | { exceeded: false }
+  | {
+      exceeded: false;
+      usedTokens: number;
+      dailyTokenLimit: number | null;
+      remainingTokens: number | null;
+      enforceStrictQuota: boolean;
+      resetAtIso: string | null;
+    }
   | {
       exceeded: true;
       usedTokens: number;
@@ -291,17 +322,35 @@ export function checkUserDailyQuotaUtc(
       response: Response;
     } {
   const userRow = db
-    .prepare(`SELECT daily_token_limit, quota_reset_mode FROM users WHERE id = ?`)
+    .prepare(
+      `SELECT daily_token_limit, quota_reset_mode, enforce_strict_quota FROM users WHERE id = ?`,
+    )
     .get(userId) as
-    | { daily_token_limit: number | bigint | null; quota_reset_mode: string | null }
+    | {
+        daily_token_limit: number | bigint | null;
+        quota_reset_mode: string | null;
+        enforce_strict_quota?: number | bigint | null;
+      }
     | undefined;
+
+  const enforceStrictQuota =
+    userRow?.enforce_strict_quota === undefined || userRow?.enforce_strict_quota === null
+      ? true
+      : Number(userRow.enforce_strict_quota) !== 0;
 
   if (
     !userRow ||
     userRow.daily_token_limit === null ||
     userRow.daily_token_limit === undefined
   ) {
-    return { exceeded: false };
+    return {
+      exceeded: false,
+      usedTokens: 0,
+      dailyTokenLimit: null,
+      remainingTokens: null,
+      enforceStrictQuota,
+      resetAtIso: null,
+    };
   }
 
   const dailyTokenLimit = Number(userRow.daily_token_limit);
@@ -340,11 +389,18 @@ export function checkUserDailyQuotaUtc(
     .get(userId, windowStartSec) as { used_tokens: number | bigint } | undefined;
 
   const usedTokens = Number(usageRow?.used_tokens ?? 0);
+  const resetAtIso = new Date(resetAtMs).toISOString();
   if (usedTokens < dailyTokenLimit) {
-    return { exceeded: false };
+    return {
+      exceeded: false,
+      usedTokens,
+      dailyTokenLimit,
+      remainingTokens: Math.max(0, dailyTokenLimit - usedTokens),
+      enforceStrictQuota,
+      resetAtIso,
+    };
   }
 
-  const resetAtIso = new Date(resetAtMs).toISOString();
   const retryAfterSec = Math.max(1, Math.ceil((resetAtMs - nowMs) / 1000));
   const message = `Daily token quota exceeded (${usedTokens}/${dailyTokenLimit} tokens used). Quota resets at ${resetAtIso}.`;
 
@@ -660,6 +716,42 @@ export async function executeChatCompletions(options: {
     ? (requestBody.messages as Array<Record<string, unknown>>)
     : [];
 
+  const strictRemainingTokens =
+    quotaCheck.enforceStrictQuota && quotaCheck.remainingTokens !== null
+      ? quotaCheck.remainingTokens
+      : null;
+  const estimatedPromptTokens =
+    strictRemainingTokens !== null ? estimateMessagesPromptTokens(originalMessages) : 0;
+  const strictMaxOutputTokens =
+    strictRemainingTokens !== null
+      ? Math.max(1, strictRemainingTokens - estimatedPromptTokens)
+      : null;
+
+  const applyStrictMaxTokens = (body: Record<string, unknown>): Record<string, unknown> => {
+    if (strictMaxOutputTokens === null) return body;
+    const out: Record<string, unknown> = { ...body };
+    const existingMax =
+      typeof out.max_tokens === 'number' && Number.isFinite(out.max_tokens) && out.max_tokens > 0
+        ? Math.floor(out.max_tokens)
+        : null;
+    const existingMaxComp =
+      typeof out.max_completion_tokens === 'number' &&
+      Number.isFinite(out.max_completion_tokens) &&
+      out.max_completion_tokens > 0
+        ? Math.floor(out.max_completion_tokens)
+        : null;
+
+    if (existingMaxComp !== null) {
+      out.max_completion_tokens = Math.min(existingMaxComp, strictMaxOutputTokens);
+    } else {
+      out.max_tokens =
+        existingMax !== null
+          ? Math.min(existingMax, strictMaxOutputTokens)
+          : strictMaxOutputTokens;
+    }
+    return out;
+  };
+
   // =========================================================================
   // Mode 1: Non-Streaming (stream: false) with HU-09 Failover + Exit Node Tunnel
   // =========================================================================
@@ -685,11 +777,11 @@ export async function executeChatCompletions(options: {
           ...buildProviderAuthHeaders(manifest.auth, rawSecret),
           'Content-Type': 'application/json',
         };
-        const upstreamBody = {
+        const upstreamBody = applyStrictMaxTokens({
           ...requestBody,
           model: modelId,
           stream: false,
-        };
+        });
 
         let res: Response;
         try {
@@ -961,12 +1053,12 @@ export async function executeChatCompletions(options: {
           'Content-Type': 'application/json',
           Accept: 'text/event-stream',
         };
-        const upstreamBody = {
+        const upstreamBody = applyStrictMaxTokens({
           ...requestBody,
           model: modelId,
           messages: messagesToSend,
           stream: true,
-        };
+        });
 
         let res: Response;
         try {
@@ -1116,6 +1208,7 @@ export async function executeChatCompletions(options: {
 
       let contentAccumulated = '';
       let reasoningAccumulated = '';
+      let toolCallCharsAccumulated = 0;
       const toolCallsAccumulated = new Map<number, { name: string; args: string }>();
       let ttftMs: number | null = null;
       let promptTokens = 0;
@@ -1123,6 +1216,7 @@ export async function executeChatCompletions(options: {
       let reasoningTokens = 0;
       let cachedTokens = 0;
       let wasResumed = false;
+      let quotaCutMidStream = false;
       let lastKeyUsedId = initialConnection.key.id;
 
       try {
@@ -1220,9 +1314,11 @@ export async function executeChatCompletions(options: {
                           : null;
                       if (typeof fn?.name === 'string') {
                         existing.name += fn.name;
+                        toolCallCharsAccumulated += fn.name.length;
                       }
                       if (typeof fn?.arguments === 'string') {
                         existing.args += fn.arguments;
+                        toolCallCharsAccumulated += fn.arguments.length;
                       }
                       toolCallsAccumulated.set(slot, existing);
                     }
@@ -1235,6 +1331,41 @@ export async function executeChatCompletions(options: {
                 choice0.finish_reason !== ''
               ) {
                 sawFinishReason = true;
+              }
+            }
+
+            if (strictRemainingTokens !== null) {
+              const liveOutputTokens = Math.max(
+                completionTokens + reasoningTokens,
+                Math.ceil(
+                  (contentAccumulated.length +
+                    reasoningAccumulated.length +
+                    toolCallCharsAccumulated) /
+                    4,
+                ),
+              );
+              const livePromptTokens = promptTokens > 0 ? promptTokens : estimatedPromptTokens;
+
+              if (livePromptTokens + liveOutputTokens >= strictRemainingTokens) {
+                quotaCutMidStream = true;
+                sawFinishReason = true;
+                const cutChoices =
+                  Array.isArray(parsed.choices) && parsed.choices.length > 0
+                    ? parsed.choices.map((ch, idx) =>
+                        idx === 0 && ch && typeof ch === 'object'
+                          ? { ...(ch as Record<string, unknown>), finish_reason: 'length' }
+                          : ch,
+                      )
+                    : [{ index: 0, delta: {}, finish_reason: 'length' }];
+
+                const cutChunk = {
+                  ...parsed,
+                  model: modelFullId,
+                  choices: cutChoices,
+                  bifrost_quota_cut: true,
+                };
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(cutChunk)}\n\n`));
+                return false;
               }
             }
 
@@ -1265,12 +1396,17 @@ export async function executeChatCompletions(options: {
                 }
               }
 
-              if (sawDone || streamFailureReason !== null) {
+              if (sawDone || quotaCutMidStream || streamFailureReason !== null) {
                 break;
               }
             }
 
-            if (!sawDone && streamFailureReason === null && buffer.trim().length > 0) {
+            if (
+              !sawDone &&
+              !quotaCutMidStream &&
+              streamFailureReason === null &&
+              buffer.trim().length > 0
+            ) {
               for (const remainingLine of buffer.split('\n')) {
                 if (!processLine(remainingLine.replace(/\r$/, ''))) {
                   break;
@@ -1290,7 +1426,7 @@ export async function executeChatCompletions(options: {
           }
 
           const completedCleanly =
-            streamFailureReason === null && (sawDone || sawFinishReason);
+            streamFailureReason === null && (sawDone || sawFinishReason || quotaCutMidStream);
 
           if (completedCleanly) {
             const endMs = now();
@@ -1302,6 +1438,9 @@ export async function executeChatCompletions(options: {
             }
             if (reasoningTokens === 0 && reasoningAccumulated.length > 0) {
               reasoningTokens = Math.max(1, Math.ceil(reasoningAccumulated.length / 4));
+            }
+            if (quotaCutMidStream && promptTokens === 0 && estimatedPromptTokens > 0) {
+              promptTokens = estimatedPromptTokens;
             }
 
             let streamContractError: 'tool_error' | 'structured_error' | null = null;

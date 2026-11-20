@@ -837,4 +837,229 @@ describe('Phase 8 Backend Acceptance & Red-Team Security Tests (HU-04, HU-05, HU
       }
     });
   });
+
+  describe('Strict Mid-Stream Quota Cutoff (enforceStrictQuota)', () => {
+    it('cuts SSE stream mid-generation when enforceStrictQuota is true and allows finishing when false', async () => {
+      const dir = makeTempDir('bifrost-p8-strict-quota-');
+      const db = openDatabase(path.join(dir, 'bifrost.db'));
+      const masterKey = randomBytes(32);
+      const clockMs = Date.UTC(2026, 10, 20, 15, 0, 0);
+      const seenMaxTokens: Array<number | undefined> = [];
+
+      const mockFetch: typeof fetch = async (input, init) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url.endsWith('/models')) {
+          return new Response(
+            JSON.stringify({
+              data: [
+                {
+                  id: 'meta-llama/llama-3.3-70b:free',
+                  name: 'Llama 3.3 70B Free',
+                  pricing: { prompt: '0', completion: '0' },
+                },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        if (url.endsWith('/chat/completions')) {
+          const parsedBody = JSON.parse(String(init?.body ?? '{}')) as { max_tokens?: number };
+          seenMaxTokens.push(parsedBody.max_tokens);
+
+          const enc = new TextEncoder();
+          const chunkText = 'A'.repeat(40); // ~10 tokens per chunk
+          const sseStream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (let i = 0; i < 20; i++) {
+                const payload = {
+                  id: 'chatcmpl-stream-quota',
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(clockMs / 1000),
+                  model: 'meta-llama/llama-3.3-70b:free',
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: chunkText },
+                      finish_reason: i === 19 ? 'stop' : null,
+                    },
+                  ],
+                };
+                controller.enqueue(enc.encode(`data: ${JSON.stringify(payload)}\n\n`));
+              }
+              controller.enqueue(enc.encode('data: [DONE]\n\n'));
+              controller.close();
+            },
+          });
+
+          return new Response(sseStream, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          });
+        }
+        return new Response('Not found', { status: 404 });
+      };
+
+      try {
+        const app = createApp({
+          db,
+          masterKey,
+          fetchImpl: mockFetch,
+          now: () => clockMs,
+        });
+
+        // Setup admin + OpenRouter + key + model
+        const setupRes = await app.request('http://localhost/api/setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'admin', password: 'adminPassword123!' }),
+        });
+        assert.equal(setupRes.status, 201);
+        const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+        await app.request('http://localhost/api/marketplace/install', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ providerId: 'openrouter' }),
+        });
+        await app.request('http://localhost/api/providers/openrouter/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label: 'Primary', secret: 'sk-or-strict-quota-key-123456' }),
+        });
+        await app.request('http://localhost/api/providers/openrouter/detect-models', {
+          method: 'POST',
+          headers: { Cookie: adminCookie },
+        });
+
+        // 1. Guest with strict quota (default true) and 50-token daily limit
+        const invStrictRes = await app.request('http://localhost/api/invitations', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dailyTokenLimit: 50,
+            quotaResetMode: 'utc_midnight',
+            allowedModels: ['*'],
+          }),
+        });
+        assert.equal(invStrictRes.status, 201);
+        const invStrictJson = (await invStrictRes.json()) as {
+          token: string;
+          invitation: { enforceStrictQuota: boolean };
+        };
+        assert.equal(invStrictJson.invitation.enforceStrictQuota, true);
+
+        const acceptStrictRes = await app.request(
+          `http://localhost/api/invitations/${encodeURIComponent(invStrictJson.token)}/accept`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'guest_strict', password: 'guestPassword123!' }),
+          },
+        );
+        assert.equal(acceptStrictRes.status, 201);
+        const strictCookie = extractCookiePair(acceptStrictRes.headers.get('set-cookie'));
+
+        const strictKeyRes = await app.request('http://localhost/api/keys', {
+          method: 'POST',
+          headers: { Cookie: strictCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'strict-key' }),
+        });
+        const strictKeyJson = (await strictKeyRes.json()) as { rawKey: string };
+
+        const strictStreamRes = await app.request('http://localhost/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${strictKeyJson.rawKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'openrouter/meta-llama/llama-3.3-70b:free',
+            stream: true,
+            messages: [{ role: 'user', content: 'Write a long story' }],
+          }),
+        });
+        assert.equal(strictStreamRes.status, 200);
+        const strictSseText = await strictStreamRes.text();
+        assert.ok(strictSseText.includes('"bifrost_quota_cut":true'));
+        assert.ok(strictSseText.includes('"finish_reason":"length"'));
+        assert.ok(strictSseText.includes('data: [DONE]'));
+        // Must have stopped well before all 20 chunks (800 chars)
+        const strictChunkCount = (strictSseText.match(/"chatcmpl-stream-quota"/g) ?? []).length;
+        assert.ok(strictChunkCount < 10, `Expected stream to cut early, got ${strictChunkCount} chunks`);
+        assert.ok(typeof seenMaxTokens[0] === 'number' && seenMaxTokens[0]! <= 50);
+
+        // Next request for strict guest must be rejected with 429 daily_quota_exceeded
+        const blockedRes = await app.request('http://localhost/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${strictKeyJson.rawKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'openrouter/meta-llama/llama-3.3-70b:free',
+            stream: true,
+            messages: [{ role: 'user', content: 'Another prompt' }],
+          }),
+        });
+        assert.equal(blockedRes.status, 429);
+
+        // 2. Guest with enforceStrictQuota: false -> stream finishes all 20 chunks without cutting
+        const invSoftRes = await app.request('http://localhost/api/invitations', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dailyTokenLimit: 50,
+            quotaResetMode: 'utc_midnight',
+            enforceStrictQuota: false,
+            allowedModels: ['*'],
+          }),
+        });
+        assert.equal(invSoftRes.status, 201);
+        const invSoftJson = (await invSoftRes.json()) as {
+          token: string;
+          invitation: { enforceStrictQuota: boolean };
+        };
+        assert.equal(invSoftJson.invitation.enforceStrictQuota, false);
+
+        const acceptSoftRes = await app.request(
+          `http://localhost/api/invitations/${encodeURIComponent(invSoftJson.token)}/accept`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'guest_soft', password: 'guestPassword123!' }),
+          },
+        );
+        assert.equal(acceptSoftRes.status, 201);
+        const softCookie = extractCookiePair(acceptSoftRes.headers.get('set-cookie'));
+
+        const softKeyRes = await app.request('http://localhost/api/keys', {
+          method: 'POST',
+          headers: { Cookie: softCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'soft-key' }),
+        });
+        const softKeyJson = (await softKeyRes.json()) as { rawKey: string };
+
+        const softStreamRes = await app.request('http://localhost/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${softKeyJson.rawKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'openrouter/meta-llama/llama-3.3-70b:free',
+            stream: true,
+            messages: [{ role: 'user', content: 'Write a long story' }],
+          }),
+        });
+        assert.equal(softStreamRes.status, 200);
+        const softSseText = await softStreamRes.text();
+        assert.ok(!softSseText.includes('"bifrost_quota_cut":true'));
+        const softChunkCount = (softSseText.match(/"chatcmpl-stream-quota"/g) ?? []).length;
+        assert.equal(softChunkCount, 20);
+        assert.equal(seenMaxTokens[1], undefined);
+      } finally {
+        db.close();
+      }
+    });
+  });
 });

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type {
   CreateInvitationResult,
   InvitationItem,
@@ -25,7 +26,7 @@ export const UsersTab: React.FC = () => {
   const [loading, setLoading] = useState(true);
 
   // Create Invitation Form State (HU-04)
-  const [inviteDailyLimit, setInviteDailyLimit] = useState(50000);
+  const [inviteDailyLimit, setInviteDailyLimit] = useState('50000');
   const [inviteResetMode, setInviteResetMode] = useState<QuotaResetMode>('utc_midnight');
   const [inviteWildcardAll, setInviteWildcardAll] = useState(true);
   const [inviteSelectedModels, setInviteSelectedModels] = useState<string[]>([]);
@@ -79,7 +80,8 @@ export const UsersTab: React.FC = () => {
     setErrorBanner(null);
     setBanner(null);
 
-    if (!Number.isFinite(inviteDailyLimit) || inviteDailyLimit <= 0) {
+    const parsedInviteLimit = Number(inviteDailyLimit.trim());
+    if (!Number.isFinite(parsedInviteLimit) || parsedInviteLimit <= 0) {
       setErrorBanner('Define una cuota diaria positiva en tokens para el invitado.');
       return;
     }
@@ -95,7 +97,7 @@ export const UsersTab: React.FC = () => {
     setCreatingInvite(true);
     try {
       const res = await api.createInvitation({
-        dailyTokenLimit: Math.floor(inviteDailyLimit),
+        dailyTokenLimit: Math.floor(parsedInviteLimit),
         quotaResetMode: inviteResetMode,
         allowedModels,
       });
@@ -180,11 +182,11 @@ export const UsersTab: React.FC = () => {
   }
 
   async function handleCopyInviteLink(url: string) {
-    try {
-      await navigator.clipboard.writeText(url);
+    const ok = await copyTextToClipboard(url);
+    if (ok) {
       setCopiedInviteUrl(true);
       window.setTimeout(() => setCopiedInviteUrl(false), 2400);
-    } catch {
+    } else {
       setCopiedInviteUrl(false);
     }
   }
@@ -280,11 +282,11 @@ export const UsersTab: React.FC = () => {
               <input
                 id="inv-daily-limit"
                 type="number"
-                min={100}
-                step={1000}
+                min={1}
+                step={1}
                 className="input mono"
                 value={inviteDailyLimit}
-                onChange={(e) => setInviteDailyLimit(Number(e.target.value))}
+                onChange={(e) => setInviteDailyLimit(e.target.value)}
                 disabled={creatingInvite}
               />
             </div>
@@ -524,6 +526,7 @@ export const UsersTab: React.FC = () => {
                   id="edit-user-limit"
                   type="number"
                   min={1}
+                  step={1}
                   className="input mono"
                   value={editLimitInput}
                   onChange={(e) => setEditLimitInput(e.target.value)}

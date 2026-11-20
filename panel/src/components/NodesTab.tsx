@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type {
   CreateNodeResult,
   ExitNodeItem,
@@ -201,11 +202,11 @@ export const NodesTab: React.FC<NodesTabProps> = ({
   }
 
   async function copyToClipboard(text: string, setter: (v: boolean) => void) {
-    try {
-      await navigator.clipboard.writeText(text);
+    const ok = await copyTextToClipboard(text);
+    if (ok) {
       setter(true);
       window.setTimeout(() => setter(false), 2400);
-    } catch {
+    } else {
       setter(false);
     }
   }

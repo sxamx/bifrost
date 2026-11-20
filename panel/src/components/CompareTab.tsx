@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type { ModelSpeedEntry, ProviderModelItem } from '../types';
 import { InfoTip } from './InfoTip';
 
@@ -73,11 +74,11 @@ export const CompareTab: React.FC = () => {
   }
 
   async function handleCopyModelId(fullId: string) {
-    try {
-      await navigator.clipboard.writeText(fullId);
+    const ok = await copyTextToClipboard(fullId);
+    if (ok) {
       setCopiedId(fullId);
       window.setTimeout(() => setCopiedId(null), 2000);
-    } catch {
+    } else {
       setCopiedId(null);
     }
   }

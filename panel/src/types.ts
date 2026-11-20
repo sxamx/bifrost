@@ -193,6 +193,7 @@ export interface ManagedUserItem {
   role: 'admin' | 'guest' | string;
   dailyTokenLimit: number | null;
   quotaResetMode: QuotaResetMode;
+  enforceStrictQuota?: boolean;
   allowedModels: string[];
   usedTokensToday?: number;
   createdAt?: number;
@@ -202,6 +203,7 @@ export interface InvitationItem {
   id: string;
   dailyTokenLimit: number;
   quotaResetMode?: QuotaResetMode;
+  enforceStrictQuota?: boolean;
   allowedModels: string[];
   expiresAt: number;
   usedAt: number | null;
@@ -211,6 +213,7 @@ export interface InvitationItem {
 export interface CreateInvitationInput {
   dailyTokenLimit: number;
   quotaResetMode: QuotaResetMode;
+  enforceStrictQuota?: boolean;
   allowedModels: string[];
   expiresInHours?: number;
 }

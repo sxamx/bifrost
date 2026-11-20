@@ -90,6 +90,7 @@ interface BackupUserRecord {
   role: 'admin' | 'guest';
   daily_token_limit: number | null;
   quota_reset_mode: 'utc_midnight' | 'rolling_24h';
+  enforce_strict_quota?: number;
   created_at: number;
 }
 
@@ -98,6 +99,7 @@ interface BackupInvitationRecord {
   token_hash: string;
   daily_token_limit: number;
   quota_reset_mode: 'utc_midnight' | 'rolling_24h';
+  enforce_strict_quota?: number;
   allowed_models_json: string;
   expires_at: number;
   used_at: number | null;
@@ -260,6 +262,7 @@ const USER_KEYS = new Set([
   'role',
   'daily_token_limit',
   'quota_reset_mode',
+  'enforce_strict_quota',
   'created_at',
 ]);
 
@@ -268,6 +271,7 @@ const INVITATION_KEYS = new Set([
   'token_hash',
   'daily_token_limit',
   'quota_reset_mode',
+  'enforce_strict_quota',
   'allowed_models_json',
   'expires_at',
   'used_at',
@@ -687,6 +691,12 @@ function validateBackupJsonPayload(
         ['utc_midnight', 'rolling_24h'] as const,
         `users[${i}]`,
       ),
+      enforce_strict_quota:
+        r.enforce_strict_quota === undefined
+          ? 1
+          : reqInt(r, 'enforce_strict_quota', `users[${i}]`) === 0
+            ? 0
+            : 1,
       created_at: reqInt(r, 'created_at', `users[${i}]`),
     };
   });
@@ -720,6 +730,12 @@ function validateBackupJsonPayload(
               ['utc_midnight', 'rolling_24h'] as const,
               `invitations[${i}]`,
             ),
+      enforce_strict_quota:
+        r.enforce_strict_quota === undefined
+          ? 1
+          : reqInt(r, 'enforce_strict_quota', `invitations[${i}]`) === 0
+            ? 0
+            : 1,
       allowed_models_json: allowedModelsJson,
       expires_at: reqInt(r, 'expires_at', `invitations[${i}]`),
       used_at: optInt(r, 'used_at', `invitations[${i}]`),
@@ -1015,7 +1031,7 @@ export async function exportEncryptedBackup(
     ? (
         db
           .prepare(
-            `SELECT id, username, password_hash, role, daily_token_limit, quota_reset_mode, created_at
+            `SELECT id, username, password_hash, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at
              FROM users
              ORDER BY created_at ASC`,
           )
@@ -1031,6 +1047,12 @@ export async function exportEncryptedBackup(
             : Number(r.daily_token_limit),
         quota_reset_mode:
           r.quota_reset_mode === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight',
+        enforce_strict_quota:
+          r.enforce_strict_quota === undefined || r.enforce_strict_quota === null
+            ? 1
+            : Number(r.enforce_strict_quota) === 0
+              ? 0
+              : 1,
         created_at: Number(r.created_at),
       }))
     : [];
@@ -1039,7 +1061,7 @@ export async function exportEncryptedBackup(
     ? (
         db
           .prepare(
-            `SELECT id, token_hash, daily_token_limit, quota_reset_mode, allowed_models_json,
+            `SELECT id, token_hash, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
                     expires_at, used_at, created_by, created_at
              FROM invitations
              ORDER BY COALESCE(created_at, expires_at) ASC`,
@@ -1051,6 +1073,12 @@ export async function exportEncryptedBackup(
         daily_token_limit: Number(r.daily_token_limit),
         quota_reset_mode:
           r.quota_reset_mode === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight',
+        enforce_strict_quota:
+          r.enforce_strict_quota === undefined || r.enforce_strict_quota === null
+            ? 1
+            : Number(r.enforce_strict_quota) === 0
+              ? 0
+              : 1,
         allowed_models_json: String(r.allowed_models_json),
         expires_at: Number(r.expires_at),
         used_at: r.used_at === null || r.used_at === undefined ? null : Number(r.used_at),
@@ -1455,14 +1483,15 @@ export async function importEncryptedBackup(
   try {
     // 1. Users (4-step FK-safe swap on username collision so sessions, usage_logs & invitations never break)
     const upsertUserStmt = db.prepare(
-      `INSERT INTO users (id, username, password_hash, role, daily_token_limit, quota_reset_mode, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO users (id, username, password_hash, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          username = excluded.username,
          password_hash = excluded.password_hash,
          role = excluded.role,
          daily_token_limit = excluded.daily_token_limit,
          quota_reset_mode = excluded.quota_reset_mode,
+         enforce_strict_quota = excluded.enforce_strict_quota,
          created_at = excluded.created_at`,
     );
 
@@ -1485,6 +1514,7 @@ export async function importEncryptedBackup(
         u.role,
         u.daily_token_limit,
         u.quota_reset_mode,
+        u.enforce_strict_quota === 0 ? 0 : 1,
         u.created_at,
       );
 
@@ -1750,13 +1780,14 @@ export async function importEncryptedBackup(
     // 8. Invitations
     const upsertInviteStmt = db.prepare(
       `INSERT INTO invitations (
-         id, token_hash, daily_token_limit, quota_reset_mode, allowed_models_json,
+         id, token_hash, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
          expires_at, used_at, created_by, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          token_hash = excluded.token_hash,
          daily_token_limit = excluded.daily_token_limit,
          quota_reset_mode = excluded.quota_reset_mode,
+         enforce_strict_quota = excluded.enforce_strict_quota,
          allowed_models_json = excluded.allowed_models_json,
          expires_at = excluded.expires_at,
          used_at = excluded.used_at,
@@ -1778,6 +1809,7 @@ export async function importEncryptedBackup(
         inv.token_hash,
         inv.daily_token_limit,
         inv.quota_reset_mode,
+        inv.enforce_strict_quota === 0 ? 0 : 1,
         inv.allowed_models_json,
         inv.expires_at,
         inv.used_at,

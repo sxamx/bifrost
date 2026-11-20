@@ -21,6 +21,7 @@ export interface ManagedUserSummary {
   role: 'admin' | 'guest';
   dailyTokenLimit: number | null;
   quotaResetMode: QuotaResetMode;
+  enforceStrictQuota: boolean;
   allowedModels: string[];
   usedTokensToday: number;
   createdAt: number;
@@ -30,6 +31,7 @@ export interface InvitationSummary {
   id: string;
   dailyTokenLimit: number;
   quotaResetMode: QuotaResetMode;
+  enforceStrictQuota: boolean;
   allowedModels: string[];
   expiresAt: number;
   usedAt: number | null;
@@ -139,12 +141,18 @@ function formatManagedUser(
       ? ['*']
       : accessRows.map((r) => String(r.model_full_id));
 
+  const enforceStrictQuota =
+    row.enforce_strict_quota === undefined || row.enforce_strict_quota === null
+      ? true
+      : Number(row.enforce_strict_quota) !== 0;
+
   return {
     id,
     username: String(row.username),
     role,
     dailyTokenLimit,
     quotaResetMode,
+    enforceStrictQuota,
     allowedModels,
     usedTokensToday: computeUsedTokensForUser(db, id, quotaResetMode, nowSec),
     createdAt: Number(row.created_at),
@@ -162,6 +170,10 @@ function formatInvitationRow(
     row.created_at === null || row.created_at === undefined ? null : Number(row.created_at);
   const quotaResetMode: QuotaResetMode =
     row.quota_reset_mode === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight';
+  const enforceStrictQuota =
+    row.enforce_strict_quota === undefined || row.enforce_strict_quota === null
+      ? true
+      : Number(row.enforce_strict_quota) !== 0;
 
   const status: 'pending' | 'used' | 'expired' =
     usedAt !== null ? 'used' : expiresAt <= nowSec ? 'expired' : 'pending';
@@ -170,6 +182,7 @@ function formatInvitationRow(
     id: String(row.id),
     dailyTokenLimit: Number(row.daily_token_limit),
     quotaResetMode,
+    enforceStrictQuota,
     allowedModels: parseAllowedModelsJson(row.allowed_models_json),
     expiresAt,
     usedAt,
@@ -185,7 +198,7 @@ export function listUsers(
 ): ManagedUserSummary[] {
   const rows = db
     .prepare(
-      `SELECT id, username, role, daily_token_limit, quota_reset_mode, created_at
+      `SELECT id, username, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at
        FROM users
        ORDER BY CASE WHEN role = 'admin' THEN 0 ELSE 1 END ASC, created_at ASC`,
     )
@@ -203,7 +216,7 @@ export function updateManagedUser(
 ): ManagedUserSummary {
   const existing = db
     .prepare(
-      `SELECT id, username, role, daily_token_limit, quota_reset_mode, created_at
+      `SELECT id, username, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at
        FROM users
        WHERE id = ?`,
     )
@@ -250,6 +263,18 @@ export function updateManagedUser(
     nextQuotaResetMode = body.quotaResetMode;
   }
 
+  let nextEnforceStrictQuota: boolean =
+    existing.enforce_strict_quota === undefined || existing.enforce_strict_quota === null
+      ? true
+      : Number(existing.enforce_strict_quota) !== 0;
+
+  if ('enforceStrictQuota' in body && body.enforceStrictQuota !== undefined) {
+    if (typeof body.enforceStrictQuota !== 'boolean') {
+      throw new UserHttpError(400, '"enforceStrictQuota" must be a boolean.');
+    }
+    nextEnforceStrictQuota = body.enforceStrictQuota;
+  }
+
   const hasAllowedModelsUpdate = 'allowedModels' in body && body.allowedModels !== undefined;
   const nextAllowedModels = hasAllowedModelsUpdate
     ? validateAndNormalizeAllowedModels(body.allowedModels, false)
@@ -259,9 +284,9 @@ export function updateManagedUser(
   try {
     db.prepare(
       `UPDATE users
-       SET daily_token_limit = ?, quota_reset_mode = ?
+       SET daily_token_limit = ?, quota_reset_mode = ?, enforce_strict_quota = ?
        WHERE id = ?`,
-    ).run(nextDailyTokenLimit, nextQuotaResetMode, targetUserId);
+    ).run(nextDailyTokenLimit, nextQuotaResetMode, nextEnforceStrictQuota ? 1 : 0, targetUserId);
 
     if (nextAllowedModels !== null) {
       db.prepare(`DELETE FROM user_model_access WHERE user_id = ?`).run(targetUserId);
@@ -283,6 +308,7 @@ export function updateManagedUser(
         targetUserId,
         dailyTokenLimit: nextDailyTokenLimit,
         quotaResetMode: nextQuotaResetMode,
+        enforceStrictQuota: nextEnforceStrictQuota,
         ...(nextAllowedModels !== null ? { allowedModels: nextAllowedModels } : {}),
       },
       nowSec,
@@ -296,7 +322,7 @@ export function updateManagedUser(
 
   const updatedRow = db
     .prepare(
-      `SELECT id, username, role, daily_token_limit, quota_reset_mode, created_at
+      `SELECT id, username, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at
        FROM users
        WHERE id = ?`,
     )
@@ -386,7 +412,7 @@ export function listInvitations(
 ): InvitationSummary[] {
   const rows = db
     .prepare(
-      `SELECT id, daily_token_limit, quota_reset_mode, allowed_models_json,
+      `SELECT id, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
               expires_at, used_at, created_by, created_at
        FROM invitations
        ORDER BY COALESCE(created_at, expires_at) DESC, id DESC`,
@@ -433,6 +459,14 @@ export function createInvitation(
     quotaResetMode = body.quotaResetMode;
   }
 
+  let enforceStrictQuota = true;
+  if (body.enforceStrictQuota !== undefined) {
+    if (typeof body.enforceStrictQuota !== 'boolean') {
+      throw new UserHttpError(400, '"enforceStrictQuota" must be a boolean.');
+    }
+    enforceStrictQuota = body.enforceStrictQuota;
+  }
+
   const allowedModels = validateAndNormalizeAllowedModels(body.allowedModels, true);
 
   let expiresInHours = 48;
@@ -459,14 +493,15 @@ export function createInvitation(
 
   db.prepare(
     `INSERT INTO invitations (
-       id, token_hash, daily_token_limit, quota_reset_mode,
+       id, token_hash, daily_token_limit, quota_reset_mode, enforce_strict_quota,
        allowed_models_json, expires_at, used_at, created_by, created_at
-     ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
   ).run(
     invitationId,
     tokenHash,
     rawLimit,
     quotaResetMode,
+    enforceStrictQuota ? 1 : 0,
     allowedModelsJson,
     expiresAt,
     adminUserId,
@@ -483,6 +518,7 @@ export function createInvitation(
       createdBy: adminUserId,
       dailyTokenLimit: rawLimit,
       quotaResetMode,
+      enforceStrictQuota,
       allowedModelsCount: allowedModels.length,
       expiresAt,
     },
@@ -499,7 +535,7 @@ export function createInvitation(
 
   const row = db
     .prepare(
-      `SELECT id, daily_token_limit, quota_reset_mode, allowed_models_json,
+      `SELECT id, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
               expires_at, used_at, created_by, created_at
        FROM invitations
        WHERE id = ?`,
@@ -528,6 +564,7 @@ export async function acceptInvitation(
     role: 'guest';
     dailyTokenLimit: number;
     quotaResetMode: QuotaResetMode;
+    enforceStrictQuota: boolean;
   };
   sessionToken: string;
   sessionExpiresAt: number;
@@ -559,7 +596,7 @@ export async function acceptInvitation(
   // Fast pre-check before running expensive scrypt password hashing
   const preInvite = db
     .prepare(
-      `SELECT id, daily_token_limit, quota_reset_mode, allowed_models_json, expires_at, used_at
+      `SELECT id, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json, expires_at, used_at
        FROM invitations
        WHERE token_hash = ?`,
     )
@@ -593,12 +630,13 @@ export async function acceptInvitation(
 
   let finalDailyLimit = 0;
   let finalResetMode: QuotaResetMode = 'utc_midnight';
+  let finalEnforceStrictQuota = true;
 
   db.exec('BEGIN IMMEDIATE');
   try {
     const invite = db
       .prepare(
-        `SELECT id, daily_token_limit, quota_reset_mode, allowed_models_json, expires_at, used_at
+        `SELECT id, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json, expires_at, used_at
          FROM invitations
          WHERE token_hash = ?`,
       )
@@ -638,12 +676,24 @@ export async function acceptInvitation(
     finalDailyLimit = Number(invite.daily_token_limit);
     finalResetMode =
       invite.quota_reset_mode === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight';
+    finalEnforceStrictQuota =
+      invite.enforce_strict_quota === undefined || invite.enforce_strict_quota === null
+        ? true
+        : Number(invite.enforce_strict_quota) !== 0;
     const allowedModels = parseAllowedModelsJson(invite.allowed_models_json);
 
     db.prepare(
-      `INSERT INTO users (id, username, password_hash, role, daily_token_limit, quota_reset_mode, created_at)
-       VALUES (?, ?, ?, 'guest', ?, ?, ?)`,
-    ).run(userId, username, passwordHash, finalDailyLimit, finalResetMode, nowSec);
+      `INSERT INTO users (id, username, password_hash, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at)
+       VALUES (?, ?, ?, 'guest', ?, ?, ?, ?)`,
+    ).run(
+      userId,
+      username,
+      passwordHash,
+      finalDailyLimit,
+      finalResetMode,
+      finalEnforceStrictQuota ? 1 : 0,
+      nowSec,
+    );
 
     const insertAccess = db.prepare(
       `INSERT OR IGNORE INTO user_model_access (user_id, model_full_id) VALUES (?, ?)`,
@@ -668,6 +718,7 @@ export async function acceptInvitation(
         invitationId: String(invite.id),
         dailyTokenLimit: finalDailyLimit,
         quotaResetMode: finalResetMode,
+        enforceStrictQuota: finalEnforceStrictQuota,
       },
       nowSec,
     );
@@ -685,6 +736,7 @@ export async function acceptInvitation(
       role: 'guest',
       dailyTokenLimit: finalDailyLimit,
       quotaResetMode: finalResetMode,
+      enforceStrictQuota: finalEnforceStrictQuota,
     },
     sessionToken,
     sessionExpiresAt,

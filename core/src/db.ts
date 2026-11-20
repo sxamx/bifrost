@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL CHECK (role IN ('admin', 'guest')),
   daily_token_limit INTEGER,
   quota_reset_mode TEXT NOT NULL DEFAULT 'utc_midnight' CHECK (quota_reset_mode IN ('utc_midnight', 'rolling_24h')),
+  enforce_strict_quota INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL
 );
 
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS invitations (
   token_hash TEXT UNIQUE NOT NULL,
   daily_token_limit INTEGER NOT NULL,
   quota_reset_mode TEXT NOT NULL DEFAULT 'utc_midnight' CHECK (quota_reset_mode IN ('utc_midnight', 'rolling_24h')),
+  enforce_strict_quota INTEGER NOT NULL DEFAULT 1,
   allowed_models_json TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   used_at INTEGER,
@@ -189,6 +191,17 @@ function ensureNodesColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureUsersColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare(`PRAGMA table_info(users)`)
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+
+  if (!colNames.has('enforce_strict_quota')) {
+    db.exec(`ALTER TABLE users ADD COLUMN enforce_strict_quota INTEGER NOT NULL DEFAULT 1;`);
+  }
+}
+
 function ensureInvitationsColumns(db: DatabaseSync): void {
   const cols = db
     .prepare(`PRAGMA table_info(invitations)`)
@@ -199,6 +212,9 @@ function ensureInvitationsColumns(db: DatabaseSync): void {
     db.exec(
       `ALTER TABLE invitations ADD COLUMN quota_reset_mode TEXT NOT NULL DEFAULT 'utc_midnight' CHECK (quota_reset_mode IN ('utc_midnight', 'rolling_24h'));`,
     );
+  }
+  if (!colNames.has('enforce_strict_quota')) {
+    db.exec(`ALTER TABLE invitations ADD COLUMN enforce_strict_quota INTEGER NOT NULL DEFAULT 1;`);
   }
   if (!colNames.has('created_at')) {
     db.exec(`ALTER TABLE invitations ADD COLUMN created_at INTEGER;`);
@@ -211,6 +227,7 @@ export function initDatabase(db: DatabaseSync): DatabaseSync {
   db.exec('PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA_SQL);
   ensureNodesColumns(db);
+  ensureUsersColumns(db);
   ensureInvitationsColumns(db);
   return db;
 }
