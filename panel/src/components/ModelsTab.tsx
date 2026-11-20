@@ -1,11 +1,251 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
-import type { ProviderModelItem } from '../types';
+import type {
+  ActivitySeriesItem,
+  ModelSpeedEntry,
+  ProviderCacheEntry,
+  ProviderModelItem,
+  ProviderReliabilityEntry,
+} from '../types';
 import { InfoTip } from './InfoTip';
 import { ModelBenchmarksPanel } from './ModelBenchmarksPanel';
 import { ProviderLogo } from './ProviderLogo';
 
+const MODEL_PCT_KEYS = [
+  { key: 'p50' as const, label: 'P50', latCol: 'var(--c-lat-50)', tpCol: 'var(--c-tp-50)' },
+  { key: 'p75' as const, label: 'P75', latCol: 'var(--c-lat-75)', tpCol: 'var(--c-tp-75)' },
+  { key: 'p90' as const, label: 'P90', latCol: 'var(--c-lat-90)', tpCol: 'var(--c-tp-90)' },
+  { key: 'p95' as const, label: 'P95', latCol: 'var(--c-lat-95)', tpCol: 'var(--c-tp-95)' },
+  { key: 'p99' as const, label: 'P99', latCol: 'var(--c-lat-99)', tpCol: 'var(--c-tp-99)' },
+];
+
+interface ModelTelemetryBlockProps {
+  model: ProviderModelItem;
+}
+
+const ModelTelemetryBlock: React.FC<ModelTelemetryBlockProps> = ({ model }) => {
+  const [loading, setLoading] = useState(true);
+  const [speedEntry, setSpeedEntry] = useState<ModelSpeedEntry | null>(null);
+  const [cacheEntry, setCacheEntry] = useState<ProviderCacheEntry | null>(null);
+  const [uptimeEntry, setUptimeEntry] = useState<ProviderReliabilityEntry | null>(null);
+  const [activityEntry, setActivityEntry] = useState<ActivitySeriesItem | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+
+    Promise.allSettled([
+      api.getMetricsSpeed(),
+      api.getMetricsUptime(),
+      api.getMetricsActivity('7d', 'model'),
+    ]).then(([spdRes, upRes, actRes]) => {
+      if (cancelled) return;
+      const fullLow = model.fullId.toLowerCase();
+      const shortLow = model.modelId.toLowerCase();
+      const provLow = model.providerId.toLowerCase();
+
+      if (spdRes.status === 'fulfilled') {
+        const mMatch =
+          spdRes.value.models.find(
+            (x) =>
+              x.modelFullId.toLowerCase() === fullLow ||
+              x.modelFullId.toLowerCase().includes(shortLow)
+          ) ?? null;
+        setSpeedEntry(mMatch);
+        const cMatch =
+          spdRes.value.cacheByProvider.find((c) => c.providerId.toLowerCase() === provLow) ?? null;
+        setCacheEntry(cMatch);
+      }
+      if (upRes.status === 'fulfilled') {
+        const uMatch =
+          upRes.value.find((u) => u.providerId.toLowerCase() === provLow) ?? null;
+        setUptimeEntry(uMatch);
+      }
+      if (actRes.status === 'fulfilled') {
+        const aMatch =
+          actRes.value.items.find(
+            (a) =>
+              a.key.toLowerCase() === fullLow ||
+              a.label.toLowerCase().includes(shortLow.split(':')[0])
+          ) ?? null;
+        setActivityEntry(aMatch);
+      }
+      setLoading(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [model.fullId, model.modelId, model.providerId]);
+
+  const hasAny = Boolean(speedEntry || cacheEntry || uptimeEntry || activityEntry);
+
+  return (
+    <section className="card" aria-labelledby="model-metrics-heading">
+      <div className="card-header">
+        <h2 id="model-metrics-heading" className="card-title">
+          Rendimiento y Telemetría del modelo
+          <InfoTip text="Métricas reales del enrutador Bifrost: percentiles P50–P99 de velocidad y TTFT de este modelo, más disponibilidad 60d, caché de su proveedor y volumen de tokens en 7 días." />
+        </h2>
+        {speedEntry ? (
+          <span className="meta-tag">
+            {speedEntry.sampleCount.toLocaleString('es-ES')} muestras reales
+          </span>
+        ) : null}
+      </div>
+
+      {loading ? (
+        <p className="field-hint">Consultando telemetría de este modelo en core/…</p>
+      ) : !hasAny ? (
+        <p className="field-hint">
+          Aún no hay tráfico registrado para <code className="mono">{model.fullId}</code>. Cuando
+          hagas peticiones verás aquí sus percentiles P50–P99, caché y consumo de tokens.
+        </p>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div className="dual-cards-grid">
+            {/* Throughput P50-P99 */}
+            <div className="perf-card" style={{ background: 'var(--bg)' }}>
+              <div className="perf-head">
+                <span className="perf-title">Throughput</span>
+                <span className="perf-sub">tok/s (P50–P99)</span>
+              </div>
+              {speedEntry ? (
+                <div className="p-legend" style={{ borderTop: 'none', paddingTop: 0 }}>
+                  {MODEL_PCT_KEYS.map((s) => (
+                    <div key={`tp-${s.key}`} className="p-row">
+                      <span className="p-left">
+                        <i className="p-dot" style={{ background: s.tpCol }} />
+                        {s.label}
+                      </span>
+                      <span className="p-right">
+                        <strong>{speedEntry.tokensPerSec[s.key].toFixed(1)} tok/s</strong>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="field-hint">Sin muestras de velocidad aún para este modelo.</p>
+              )}
+            </div>
+
+            {/* Latency TTFT P50-P99 */}
+            <div className="perf-card" style={{ background: 'var(--bg)' }}>
+              <div className="perf-head">
+                <span className="perf-title">Latencia (TTFT)</span>
+                <span className="perf-sub">primer token (ms)</span>
+              </div>
+              {speedEntry ? (
+                <div className="p-legend" style={{ borderTop: 'none', paddingTop: 0 }}>
+                  {MODEL_PCT_KEYS.map((s) => (
+                    <div key={`ttft-${s.key}`} className="p-row">
+                      <span className="p-left">
+                        <i className="p-dot" style={{ background: s.latCol }} />
+                        {s.label}
+                      </span>
+                      <span className="p-right">
+                        <strong>{Math.round(speedEntry.ttftMs[s.key])} ms</strong>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="field-hint">Sin muestras de latencia TTFT aún para este modelo.</p>
+              )}
+            </div>
+          </div>
+
+          {/* Provider Uptime 60d + Cache Hit + 7d Token Activity */}
+          <div className="kpi-grid">
+            {uptimeEntry ? (
+              <div className="horiz-err-item">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span className="field-hint">Uptime proveedor (60d)</span>
+                  <strong className="mono" style={{ color: 'var(--ok)' }}>
+                    {uptimeEntry.overallUptimePct !== null
+                      ? `${uptimeEntry.overallUptimePct.toFixed(2)}%`
+                      : '—'}
+                  </strong>
+                </div>
+                <div className="uptime-strip" style={{ height: 18 }}>
+                  {uptimeEntry.days.slice(-30).map((d, idx) => {
+                    const cls =
+                      d.uptimePct === null
+                        ? 'notraffic'
+                        : d.uptimePct >= 99
+                          ? 'ok'
+                          : d.uptimePct >= 95
+                            ? 'partial'
+                            : 'err';
+                    return (
+                      <span
+                        key={`mu-${idx}`}
+                        className={`uptime-bar ${cls}`}
+                        title={`${d.date}: ${d.uptimePct === null ? 'Sin tráfico' : `${d.uptimePct.toFixed(2)}%`}`}
+                      />
+                    );
+                  })}
+                </div>
+                <span className="field-hint" style={{ fontSize: '11px' }}>
+                  Tools err 7d: <strong className="mono">{uptimeEntry.toolErrorRate7d.toFixed(1)}%</strong> · JSON err:{' '}
+                  <strong className="mono">{uptimeEntry.structuredErrorRate7d.toFixed(1)}%</strong>
+                </span>
+              </div>
+            ) : null}
+
+            {cacheEntry ? (
+              <div className="horiz-err-item">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span className="field-hint">Cache hit rate ({cacheEntry.providerName})</span>
+                  <strong className="mono" style={{ color: 'var(--c-cache-hit)' }}>
+                    {cacheEntry.cacheHitRate.toFixed(1)}%
+                  </strong>
+                </div>
+                <div className="horiz-track">
+                  <div
+                    className="horiz-fill"
+                    style={{
+                      width: `${Math.min(100, Math.max(0, cacheEntry.cacheHitRate))}%`,
+                      background: 'var(--c-cache-hit)',
+                    }}
+                  />
+                </div>
+                <span className="field-hint" style={{ fontSize: '11px' }}>
+                  {cacheEntry.cachedTokens.toLocaleString('es-ES')} cached /{' '}
+                  {cacheEntry.promptTokens.toLocaleString('es-ES')} prompt
+                </span>
+              </div>
+            ) : null}
+
+            {activityEntry ? (
+              <div className="horiz-err-item">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span className="field-hint">Consumo del modelo (7d)</span>
+                  <strong className="mono">
+                    {activityEntry.totalTokens.toLocaleString('es-ES')} tok
+                  </strong>
+                </div>
+                <span className="field-hint" style={{ fontSize: '11px' }}>
+                  Prompt: <strong className="mono">{activityEntry.promptTokens.toLocaleString('es-ES')}</strong> · Comp:{' '}
+                  <strong className="mono">{activityEntry.completionTokens.toLocaleString('es-ES')}</strong>
+                  {activityEntry.reasoningTokens > 0 ? (
+                    <>
+                      {' '}· Reas: <strong className="mono">{activityEntry.reasoningTokens.toLocaleString('es-ES')}</strong>
+                    </>
+                  ) : null}
+                </span>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+};
+
 interface ModelsTabProps {
+  initialModelFullId?: string | null;
+  onInitialModelConsumed?: () => void;
   onNavigateCompare?: () => void;
   onNavigatePlayground?: () => void;
 }
@@ -56,6 +296,8 @@ function formatReferencePricing(model: ProviderModelItem): string {
 }
 
 export const ModelsTab: React.FC<ModelsTabProps> = ({
+  initialModelFullId,
+  onInitialModelConsumed,
   onNavigateCompare,
   onNavigatePlayground,
 }) => {
@@ -141,6 +383,24 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
     },
     [models]
   );
+
+  useEffect(() => {
+    if (!initialModelFullId || loading) return;
+    const raw = initialModelFullId.trim();
+    if (!raw) return;
+    const q = raw.toLowerCase();
+    const matched =
+      models.find((m) => m.fullId.toLowerCase() === q) ??
+      models.find((m) => m.modelId.toLowerCase() === q) ??
+      models.find(
+        (m) =>
+          m.fullId.toLowerCase().includes(q) ||
+          m.name.toLowerCase().includes(q) ||
+          q.includes(m.modelId.toLowerCase().split(':')[0])
+      );
+    void openModelDetail(matched ? matched.fullId : raw);
+    onInitialModelConsumed?.();
+  }, [initialModelFullId, loading, models, openModelDetail, onInitialModelConsumed]);
 
   const providerOptions = useMemo(() => {
     const map = new Map<string, string>();
@@ -299,8 +559,8 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
           </div>
 
           <div
-            className="kpi-grid"
-            style={{ marginTop: 22, paddingTop: 18, borderTop: '1px solid var(--line)' }}
+            className="kpi-grid-5"
+            style={{ marginTop: 18, paddingTop: 16, borderTop: '1px solid var(--line)' }}
           >
             <div>
               <span className="kpi-label">Ventana de contexto</span>
@@ -351,6 +611,9 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
             ) : null}
           </div>
         </section>
+
+        {/* Per-Model Real Telemetry (Speed P50-P99, TTFT, Cache, Uptime 60d, 7d Tokens) */}
+        <ModelTelemetryBlock model={detailModel} />
 
         {/* 4-Source Public Benchmarks (HU-14c) */}
         <ModelBenchmarksPanel
@@ -627,7 +890,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                     display: 'flex',
                     justifyContent: 'flex-end',
                     paddingTop: 10,
-                    borderTop: '1px solid #e6eef8',
+                    borderTop: '1px solid var(--line)',
                   }}
                 >
                   <button

@@ -29,6 +29,9 @@ interface ProvidersTabProps {
   loading: boolean;
   initialSubView?: ProvidersSubView;
   onInitialSubViewConsumed?: () => void;
+  initialExpandedProviderId?: string | null;
+  onInitialExpandedProviderConsumed?: () => void;
+  onOpenModel?: (fullId: string) => void;
   onProvidersChanged: () => Promise<void>;
 }
 
@@ -99,10 +102,16 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   loading,
   initialSubView,
   onInitialSubViewConsumed,
+  initialExpandedProviderId,
+  onInitialExpandedProviderConsumed,
+  onOpenModel,
   onProvidersChanged,
 }) => {
   const [subView, setSubView] = useState<ProvidersSubView>(
     initialSubView ?? (providers.length === 0 ? 'marketplace' : 'installed')
+  );
+  const [focusedProviderId, setFocusedProviderId] = useState<string | null>(
+    initialExpandedProviderId ?? null
   );
 
   const [catalog, setCatalog] = useState<MarketplaceCatalogState>({
@@ -138,6 +147,14 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
       onInitialSubViewConsumed?.();
     }
   }, [initialSubView, onInitialSubViewConsumed]);
+
+  useEffect(() => {
+    if (initialExpandedProviderId) {
+      setFocusedProviderId(initialExpandedProviderId);
+      setSubView('installed');
+      onInitialExpandedProviderConsumed?.();
+    }
+  }, [initialExpandedProviderId, onInitialExpandedProviderConsumed]);
 
   const loadCatalog = useCallback(async () => {
     setCatalogLoading(true);
@@ -429,20 +446,84 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
             </div>
           </section>
         ) : (
-          <div className="provider-stack">
-            {providers.map((prov) => {
-              const pKeys = prov.keys ?? keysByProvider[prov.id] ?? [];
+          <div className="providers-master-detail">
+            <aside className="providers-rail" aria-label="Proveedores instalados">
+              <div className="providers-rail-label">Proveedores ({providers.length})</div>
+              {providers.map((prov) => {
+                const activeProvId =
+                  focusedProviderId && providers.some((p) => p.id === focusedProviderId)
+                    ? focusedProviderId
+                    : providers[0]?.id;
+                const isSelected = prov.id === activeProvId;
+                const pKeys = prov.keys ?? keysByProvider[prov.id] ?? [];
+                const pModels =
+                  prov.models ??
+                  allModels.filter((m) => m.providerId === prov.id && m.active !== false);
+                const activeKeysCount = pKeys.filter((k) => k.status === 'active').length;
+                const hasRateLimited = pKeys.some((k) => k.status === 'rate_limited');
+                const healthDot: 'ok' | 'partial' | 'err' =
+                  pKeys.length === 0
+                    ? 'err'
+                    : activeKeysCount > 0
+                      ? hasRateLimited
+                        ? 'partial'
+                        : 'ok'
+                      : 'partial';
+
+                return (
+                  <button
+                    key={prov.id}
+                    type="button"
+                    className={`provider-rail-item${isSelected ? ' active' : ''}`}
+                    aria-current={isSelected ? 'true' : undefined}
+                    onClick={() => setFocusedProviderId(prov.id)}
+                  >
+                    <div className="provider-rail-left">
+                      <svg
+                        className="provider-rail-icon"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <rect x="2" y="3" width="20" height="7" rx="2" />
+                        <rect x="2" y="14" width="20" height="7" rx="2" />
+                        <line x1="6" y1="6.5" x2="6.01" y2="6.5" />
+                        <line x1="6" y1="17.5" x2="6.01" y2="17.5" />
+                      </svg>
+                      <div className="provider-rail-meta">
+                        <span className="provider-rail-name">{prov.name}</span>
+                        <span className="provider-rail-sub">
+                          {pKeys.length} {pKeys.length === 1 ? 'clave' : 'claves'} · {pModels.length}{' '}
+                          {pModels.length === 1 ? 'mod' : 'mods'}
+                        </span>
+                      </div>
+                    </div>
+                    <span className={`status-dot ${healthDot}`} aria-hidden="true" />
+                  </button>
+                );
+              })}
+            </aside>
+
+            {(() => {
+              const selectedProv =
+                providers.find((p) => p.id === focusedProviderId) ?? providers[0];
+              if (!selectedProv) return null;
+              const pKeys = selectedProv.keys ?? keysByProvider[selectedProv.id] ?? [];
               const pModels =
-                prov.models ??
-                allModels.filter((m) => m.providerId === prov.id && m.active !== false);
+                selectedProv.models ??
+                allModels.filter((m) => m.providerId === selectedProv.id && m.active !== false);
 
               return (
                 <ProviderVaultCard
-                  key={prov.id}
-                  provider={prov}
+                  key={selectedProv.id}
+                  provider={selectedProv}
                   keys={pKeys}
                   models={pModels}
                   nodes={nodes}
+                  onOpenModel={onOpenModel}
                   onRefreshAll={refreshEverything}
                   onRequestDeleteProvider={(target) => setProviderToDelete(target)}
                   onRequestDeleteKey={(targetProv, targetKey) =>
@@ -450,7 +531,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                   }
                 />
               );
-            })}
+            })()}
           </div>
         )
       ) : null}
@@ -692,7 +773,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         justifyContent: 'space-between',
                         gap: 10,
                         paddingTop: 8,
-                        borderTop: '1px solid #e6eef8',
+                        borderTop: '1px solid var(--line)',
                       }}
                     >
                       <code className="key-prefix-pill" style={{ fontSize: '0.74rem' }}>

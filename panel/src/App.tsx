@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from './api';
 import { AcceptInviteScreen } from './components/AcceptInviteScreen';
 import { ApiKeysTab } from './components/ApiKeysTab';
@@ -25,6 +25,8 @@ import type {
 } from './types';
 
 type BootStage = 'loading' | 'error' | 'setup' | 'invite' | 'login' | 'authenticated';
+type PaletteKey = 'obsidian' | 'stone' | 'nordic';
+type ThemeMode = 'dark' | 'light';
 
 interface BeforeInstallPromptEvent extends Event {
   readonly platforms?: string[];
@@ -69,6 +71,98 @@ async function enrichProvidersWithKeys(list: ProviderSummary[]): Promise<Provide
   );
 }
 
+function renderTabIcon(tab: ActiveTab): React.ReactNode {
+  switch (tab) {
+    case 'overview':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <rect x="3" y="3" width="7" height="9" rx="1" />
+          <rect x="14" y="3" width="7" height="5" rx="1" />
+          <rect x="14" y="12" width="7" height="9" rx="1" />
+          <rect x="3" y="16" width="7" height="5" rx="1" />
+        </svg>
+      );
+    case 'models':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <path d="M12 2 2 7l10 5 10-5-10-5Z" />
+          <path d="m2 17 10 5 10-5" />
+          <path d="m2 12 10 5 10-5" />
+        </svg>
+      );
+    case 'compare':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <path d="M16 3h5v5" />
+          <path d="M8 3H3v5" />
+          <path d="M12 22v-8.3a4 4 0 0 0-1.172-2.872L3 3" />
+          <path d="m15 9 6-6" />
+        </svg>
+      );
+    case 'playground':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+        </svg>
+      );
+    case 'metrics':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <path d="M3 3v18h18" />
+          <path d="m19 9-5 5-4-4-3 3" />
+        </svg>
+      );
+    case 'keys':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <path d="m15.5 7.5 2.3 2.3a1 1 0 0 0 1.4 0l2.1-2.1a1 1 0 0 0 0-1.4L19 4" />
+          <path d="m21 2-9.6 9.6" />
+          <circle cx="7.5" cy="15.5" r="5.5" />
+        </svg>
+      );
+    case 'providers':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <rect x="2" y="2" width="20" height="8" rx="2" />
+          <rect x="2" y="14" width="20" height="8" rx="2" />
+          <line x1="6" y1="6" x2="6.01" y2="6" />
+          <line x1="6" y1="18" x2="6.01" y2="18" />
+        </svg>
+      );
+    case 'nodes':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M3.6 9h16.8" />
+          <path d="M3.6 15h16.8" />
+        </svg>
+      );
+    case 'users':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+          <circle cx="9" cy="7" r="4" />
+        </svg>
+      );
+    case 'logs':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <path d="M4 6h16" />
+          <path d="M4 12h16" />
+          <path d="M4 18h10" />
+        </svg>
+      );
+    case 'backups':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+          <polyline points="7 10 12 15 17 10" />
+          <line x1="12" y1="15" x2="12" y2="3" />
+        </svg>
+      );
+  }
+}
+
 export const App: React.FC = () => {
   const [stage, setStage] = useState<BootStage>('loading');
   const [bootError, setBootError] = useState<string | null>(null);
@@ -91,15 +185,60 @@ export const App: React.FC = () => {
   const [providersSubView, setProvidersSubView] = useState<
     'installed' | 'marketplace' | 'local-json' | undefined
   >(undefined);
+  const [targetModelFullId, setTargetModelFullId] = useState<string | null>(null);
+  const [targetProviderId, setTargetProviderId] = useState<string | null>(null);
   const [guestInfoModalOpen, setGuestInfoModalOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+
+  // Theme & Palette Studio State
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    try {
+      const s = localStorage.getItem('bf_theme');
+      return s === 'light' ? 'light' : 'dark';
+    } catch {
+      return 'dark';
+    }
+  });
+  const [palette, setPalette] = useState<PaletteKey>(() => {
+    try {
+      const p = localStorage.getItem('bf_palette');
+      return p === 'stone' || p === 'nordic' ? p : 'obsidian';
+    } catch {
+      return 'obsidian';
+    }
+  });
+
+  // Topbar Endpoint Copy & Command Palette (⌘K)
+  const [copiedTopUrl, setCopiedTopUrl] = useState(false);
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [cmdQuery, setCmdQuery] = useState('');
+  const cmdInputRef = useRef<HTMLInputElement | null>(null);
 
   // PWA Install State
   const [installPromptEvt, setInstallPromptEvt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isStandalone, setIsStandalone] = useState<boolean>(() => detectStandaloneMode());
 
   const tabButtonRefs = useRef<Partial<Record<ActiveTab, HTMLButtonElement | null>>>({});
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', themeMode);
+    document.documentElement.setAttribute('data-palette', palette);
+    const metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (metaTheme) {
+      const bgMap: Record<ThemeMode, Record<PaletteKey, string>> = {
+        dark: { obsidian: '#09090b', stone: '#100f0d', nordic: '#0b0d10' },
+        light: { obsidian: '#f6f6f5', stone: '#f5f3ee', nordic: '#f2f4f7' },
+      };
+      metaTheme.setAttribute('content', bgMap[themeMode][palette]);
+    }
+    try {
+      localStorage.setItem('bf_theme', themeMode);
+      localStorage.setItem('bf_palette', palette);
+    } catch {
+      // ignore storage errors
+    }
+  }, [themeMode, palette]);
 
   useEffect(() => {
     const onBeforeInstall = (e: Event) => {
@@ -126,25 +265,27 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // Auto-center active tab in single-line horizontal rail
+  // Keyboard shortcut ⌘K / Ctrl+K & Escape
   useEffect(() => {
-    const btn = tabButtonRefs.current[activeTab];
-    if (btn && typeof btn.scrollIntoView === 'function') {
-      btn.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
-    }
-  }, [activeTab, stage]);
-
-  // Close mobile menu on Escape
-  useEffect(() => {
-    if (!mobileMenuOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCmdOpen((prev) => !prev);
+      } else if (e.key === 'Escape') {
+        setCmdOpen(false);
         setMobileMenuOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [mobileMenuOpen]);
+  }, []);
+
+  useEffect(() => {
+    if (cmdOpen) {
+      setCmdQuery('');
+      window.setTimeout(() => cmdInputRef.current?.focus(), 20);
+    }
+  }, [cmdOpen]);
 
   async function handleTriggerInstallPwa() {
     if (!installPromptEvt) return;
@@ -156,6 +297,17 @@ export const App: React.FC = () => {
       }
     } catch {
       setInstallPromptEvt(null);
+    }
+  }
+
+  async function handleCopyTopEndpoint() {
+    const baseUrl = `${window.location.origin}/v1`;
+    try {
+      await navigator.clipboard.writeText(baseUrl);
+      setCopiedTopUrl(true);
+      window.setTimeout(() => setCopiedTopUrl(false), 1800);
+    } catch {
+      setCopiedTopUrl(false);
     }
   }
 
@@ -324,7 +476,55 @@ export const App: React.FC = () => {
   function selectSection(tab: ActiveTab) {
     setActiveTab(tab);
     setMobileMenuOpen(false);
+    setCmdOpen(false);
+    window.scrollTo({ top: 0, behavior: 'auto' });
   }
+
+  const isAdmin = user?.role === 'admin';
+  const roleLabel = isAdmin ? 'admin' : 'invitado';
+  const effectiveKeysCount = keys.length > 0 || !keysLoading ? keys.length : stats.keysCount;
+  const effectiveProvidersCount = providersLoaded ? providers.length : stats.providersCount;
+  const canInstallPwa = Boolean(installPromptEvt && !isStandalone);
+
+  const usageTabs: Array<{ id: ActiveTab; label: string; pill?: string | number }> = useMemo(
+    () => [
+      { id: 'overview', label: 'Resumen' },
+      {
+        id: 'models',
+        label: 'Modelos',
+        pill: stats.modelsCount > 0 ? stats.modelsCount : undefined,
+      },
+      { id: 'compare', label: 'Comparador' },
+      { id: 'playground', label: 'Playground' },
+      { id: 'metrics', label: 'Métricas' },
+      { id: 'keys', label: 'API Keys', pill: effectiveKeysCount > 0 ? effectiveKeysCount : 'sk-bf' },
+    ],
+    [stats.modelsCount, effectiveKeysCount]
+  );
+
+  const adminTabs: Array<{ id: ActiveTab; label: string; pill?: string | number }> = useMemo(
+    () =>
+      isAdmin
+        ? [
+            { id: 'providers', label: 'Proveedores (BYOK)', pill: effectiveProvidersCount },
+            { id: 'nodes', label: 'Nodos de salida', pill: nodes.length },
+            { id: 'logs', label: 'Logs' },
+            { id: 'users', label: 'Usuarios' },
+            { id: 'backups', label: 'Respaldos' },
+          ]
+        : [],
+    [isAdmin, effectiveProvidersCount, nodes.length]
+  );
+
+  const allVisibleTabs = useMemo(() => [...usageTabs, ...adminTabs], [usageTabs, adminTabs]);
+
+  const filteredCmdTabs = useMemo(() => {
+    const q = cmdQuery.trim().toLowerCase();
+    if (!q) return allVisibleTabs;
+    return allVisibleTabs.filter(
+      (t) => t.label.toLowerCase().includes(q) || t.id.toLowerCase().includes(q)
+    );
+  }, [allVisibleTabs, cmdQuery]);
 
   if (stage === 'loading') {
     return (
@@ -381,106 +581,183 @@ export const App: React.FC = () => {
     return <LoginScreen onLoginSuccess={bootstrap} />;
   }
 
-  const isAdmin = user.role === 'admin';
-  const roleLabel = isAdmin ? 'admin' : 'invitado';
-  const effectiveKeysCount = keys.length > 0 || !keysLoading ? keys.length : stats.keysCount;
-  const effectiveProvidersCount = providersLoaded ? providers.length : stats.providersCount;
-  const canInstallPwa = Boolean(installPromptEvt && !isStandalone);
-
-  const usageTabs: Array<{ id: ActiveTab; label: string; pill?: string | number }> = [
-    { id: 'overview', label: 'Resumen' },
-    {
-      id: 'models',
-      label: 'Modelos',
-      pill: stats.modelsCount > 0 ? stats.modelsCount : undefined,
-    },
-    { id: 'compare', label: 'Comparador' },
-    { id: 'playground', label: 'Playground' },
-    { id: 'metrics', label: 'Métricas' },
-    { id: 'keys', label: 'API Keys', pill: 'sk-bf-…' },
-  ];
-
-  const adminTabs: Array<{ id: ActiveTab; label: string; pill?: string | number }> = isAdmin
-    ? [
-        { id: 'providers', label: 'Proveedores', pill: effectiveProvidersCount },
-        { id: 'nodes', label: 'Nodos', pill: nodes.length },
-        { id: 'users', label: 'Usuarios' },
-        { id: 'logs', label: 'Logs' },
-        { id: 'backups', label: 'Respaldos' },
-      ]
-    : [];
-
-  const allVisibleTabs = [...usageTabs, ...adminTabs];
+  const baseUrl = `${window.location.origin}/v1`;
 
   return (
     <div className="app-shell">
+      {/* FULLSCREEN STICKY TOPBAR */}
       <header className="topbar">
-        <div className="topbar-inner">
-          {/* Compact Top Row: BrandMark + User/PWA/Drawer Cluster */}
-          <div className="topbar-row-main">
-            <BrandMark subtitle="Router OpenAI-compatible" />
+        <div className="topbar-left">
+          <button
+            type="button"
+            className="brand-home-btn"
+            onClick={() => selectSection('overview')}
+            title="Ir a Resumen"
+          >
+            <BrandMark />
+          </button>
+          <span className="crumb-sep">/</span>
+          <button
+            type="button"
+            className="crumb-ws"
+            onClick={() => void handleCopyTopEndpoint()}
+            title="Clic para copiar endpoint OpenAI-compatible"
+          >
+            <span>{baseUrl}</span>
+            <span className="copy-hint">{copiedTopUrl ? '¡Copiado!' : 'Copiar'}</span>
+          </button>
+        </div>
 
-            <div className="user-cluster">
-              {canInstallPwa ? (
-                <button
-                  type="button"
-                  className="btn btn-primary btn-sm"
-                  onClick={() => void handleTriggerInstallPwa()}
-                  title="Instalar Bifrost como aplicación independiente"
-                >
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                    <path
-                      d="M12 4v11m0 0l-4-4m4 4l4-4M5 19h14"
-                      stroke="currentColor"
-                      strokeWidth="2.1"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                  <span>Instalar app</span>
-                </button>
-              ) : null}
-
-              <div className="user-pill" title={`Usuario autenticado: ${user.username}`}>
-                <span className="user-pill-name">{user.username}</span>
-                <span className={`role-badge ${isAdmin ? 'admin' : 'guest'}`}>{roleLabel}</span>
-              </div>
-
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => void handleLogout()}
-                disabled={loggingOut}
-                title="Cerrar sesión"
+        <div className="topbar-right">
+          {/* Command Palette Trigger (⌘K) */}
+          <button
+            type="button"
+            className="cmd-k-trigger"
+            onClick={() => setCmdOpen(true)}
+            aria-label="Abrir buscador rápido y paleta de comandos"
+          >
+            <span className="cmd-k-left">
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                aria-hidden="true"
               >
-                <span>{loggingOut ? 'Saliendo…' : 'Salir'}</span>
-                <span className="logout-label-full">{loggingOut ? '' : 'de sesión'}</span>
-              </button>
+                <circle cx="11" cy="11" r="8" />
+                <path d="m21 21-4.3-4.3" />
+              </svg>
+              <span className="cmd-k-text">Ir a sección, modelos, claves…</span>
+            </span>
+            <span className="kbd">⌘K</span>
+          </button>
 
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm mobile-menu-trigger"
-                aria-expanded={mobileMenuOpen}
-                aria-controls="bifrost-mobile-nav-drawer"
-                onClick={() => setMobileMenuOpen(true)}
-              >
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <path
-                    d="M4 7h16M4 12h16M4 17h16"
-                    stroke="currentColor"
-                    strokeWidth="2.1"
-                    strokeLinecap="round"
-                  />
-                </svg>
-                <span>Menú</span>
-              </button>
-            </div>
+          {/* Curated Palette & Theme Switcher */}
+          <div className="theme-cluster" role="group" aria-label="Paleta y modo de color">
+            <button
+              type="button"
+              className={`palette-dot-btn${palette === 'obsidian' ? ' active' : ''}`}
+              onClick={() => setPalette('obsidian')}
+              title="Paleta: Obsidian & Paper"
+              aria-label="Paleta Obsidian & Paper"
+            >
+              <span className="palette-dot" style={{ background: '#09090b' }} />
+            </button>
+            <button
+              type="button"
+              className={`palette-dot-btn${palette === 'stone' ? ' active' : ''}`}
+              onClick={() => setPalette('stone')}
+              title="Paleta: Warm Stone"
+              aria-label="Paleta Warm Stone"
+            >
+              <span className="palette-dot" style={{ background: '#d6cfc2' }} />
+            </button>
+            <button
+              type="button"
+              className={`palette-dot-btn${palette === 'nordic' ? ' active' : ''}`}
+              onClick={() => setPalette('nordic')}
+              title="Paleta: Nordic Bifrost"
+              aria-label="Paleta Nordic Bifrost"
+            >
+              <span className="palette-dot" style={{ background: '#0057ff' }} />
+            </button>
+            <button
+              type="button"
+              className="theme-toggle-btn"
+              onClick={() => setThemeMode((m) => (m === 'dark' ? 'light' : 'dark'))}
+              title="Alternar entre modo oscuro y claro"
+            >
+              {themeMode === 'dark' ? 'Oscuro' : 'Claro'}
+            </button>
           </div>
 
-          {/* Single-Line Scrollable Navigation Rail (Never stacks into multi-row wall) */}
-          <div className="topbar-nav-rail">
-            <nav className="nav-tabs" aria-label="Navegación principal">
-              {allVisibleTabs.map((item) => {
+          <div className="user-cluster">
+            {canInstallPwa ? (
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={() => void handleTriggerInstallPwa()}
+                title="Instalar Bifrost como aplicación independiente"
+              >
+                <span>Instalar app</span>
+              </button>
+            ) : null}
+
+            <div className="user-pill" title={`Usuario autenticado: ${user.username}`}>
+              <span className="status-dot ok" />
+              <span className="user-pill-name">{user.username}</span>
+              <span className={`role-badge ${isAdmin ? 'admin' : 'guest'}`}>{roleLabel}</span>
+            </div>
+
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm desktop-logout-btn"
+              onClick={() => void handleLogout()}
+              disabled={loggingOut}
+              title="Cerrar sesión"
+            >
+              <span>{loggingOut ? 'Saliendo…' : 'Salir'}</span>
+            </button>
+
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm mobile-menu-trigger"
+              aria-expanded={mobileMenuOpen}
+              aria-controls="bifrost-mobile-nav-drawer"
+              onClick={() => setMobileMenuOpen(true)}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path
+                  d="M4 7h16M4 12h16M4 17h16"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+              </svg>
+              <span>Menú</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* GROUPED LEFT SIDEBAR NAVIGATION */}
+      <aside className="sidebar" aria-label="Navegación principal">
+        <div>
+          <div className="nav-group-label">Gateway</div>
+          <div className="nav-list">
+            {usageTabs.map((item) => {
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  ref={(el) => {
+                    tabButtonRefs.current[item.id] = el;
+                  }}
+                  type="button"
+                  className={`sidebar-nav-item${isActive ? ' active' : ''}`}
+                  aria-current={isActive ? 'page' : undefined}
+                  onClick={() => selectSection(item.id)}
+                >
+                  <span className="sidebar-nav-left">
+                    {renderTabIcon(item.id)}
+                    <span>{item.label}</span>
+                  </span>
+                  {item.pill !== undefined ? (
+                    <span className="nav-tab-pill">{item.pill}</span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {isAdmin && adminTabs.length > 0 ? (
+          <div>
+            <div className="nav-group-label">Infraestructura & Sistema</div>
+            <div className="nav-list">
+              {adminTabs.map((item) => {
                 const isActive = activeTab === item.id;
                 return (
                   <button
@@ -489,22 +766,26 @@ export const App: React.FC = () => {
                       tabButtonRefs.current[item.id] = el;
                     }}
                     type="button"
-                    className={`nav-tab${isActive ? ' active' : ''}`}
+                    className={`sidebar-nav-item${isActive ? ' active' : ''}`}
                     aria-current={isActive ? 'page' : undefined}
                     onClick={() => selectSection(item.id)}
                   >
-                    <span>{item.label}</span>
+                    <span className="sidebar-nav-left">
+                      {renderTabIcon(item.id)}
+                      <span>{item.label}</span>
+                    </span>
                     {item.pill !== undefined ? (
                       <span className="nav-tab-pill">{item.pill}</span>
                     ) : null}
                   </button>
                 );
               })}
-            </nav>
+            </div>
           </div>
-        </div>
-      </header>
+        ) : null}
+      </aside>
 
+      {/* MAIN WORKSPACE */}
       <main className="main-container">
         {activeTab === 'overview' ? (
           <OverviewTab
@@ -528,6 +809,8 @@ export const App: React.FC = () => {
 
         {activeTab === 'models' ? (
           <ModelsTab
+            initialModelFullId={targetModelFullId}
+            onInitialModelConsumed={() => setTargetModelFullId(null)}
             onNavigateCompare={() => setActiveTab('compare')}
             onNavigatePlayground={() => setActiveTab('playground')}
           />
@@ -537,7 +820,26 @@ export const App: React.FC = () => {
 
         {activeTab === 'playground' ? <PlaygroundTab /> : null}
 
-        {activeTab === 'metrics' ? <MetricsTab isAdmin={isAdmin} /> : null}
+        {activeTab === 'metrics' ? (
+          <MetricsTab
+            isAdmin={isAdmin}
+            onOpenModel={(fullId) => {
+              setTargetModelFullId(fullId);
+              setActiveTab('models');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+            onOpenProvider={(providerId) => {
+              if (isAdmin) {
+                setTargetProviderId(providerId);
+                setProvidersSubView('installed');
+                setActiveTab('providers');
+              } else {
+                setActiveTab('models');
+              }
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+          />
+        ) : null}
 
         {activeTab === 'keys' ? (
           <ApiKeysTab
@@ -556,6 +858,13 @@ export const App: React.FC = () => {
             loading={providersLoading}
             initialSubView={providersSubView}
             onInitialSubViewConsumed={() => setProvidersSubView(undefined)}
+            initialExpandedProviderId={targetProviderId}
+            onInitialExpandedProviderConsumed={() => setTargetProviderId(null)}
+            onOpenModel={(fullId) => {
+              setTargetModelFullId(fullId);
+              setActiveTab('models');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
             onProvidersChanged={refreshProvidersNodesAndStats}
           />
         ) : null}
@@ -577,6 +886,102 @@ export const App: React.FC = () => {
           <BackupsTab onBackupRestored={refreshProvidersNodesAndStats} />
         ) : null}
       </main>
+
+      {/* COMMAND PALETTE MODAL (⌘K / Ctrl+K) */}
+      {cmdOpen ? (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Paleta rápida de comandos"
+          onClick={() => setCmdOpen(false)}
+        >
+          <div className="cmd-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="cmd-input-row">
+              <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="var(--fg-3)"
+                strokeWidth="2"
+                aria-hidden="true"
+              >
+                <circle cx="11" cy="11" r="8" />
+                <path d="m21 21-4.3-4.3" />
+              </svg>
+              <input
+                ref={cmdInputRef}
+                type="text"
+                value={cmdQuery}
+                onChange={(e) => setCmdQuery(e.target.value)}
+                placeholder="Ir a sección, crear clave sk-bf-… o cambiar tema…"
+              />
+              <span className="kbd">ESC</span>
+            </div>
+            <div className="cmd-list">
+              {filteredCmdTabs.map((t) => (
+                <button
+                  key={`cmd-${t.id}`}
+                  type="button"
+                  className="cmd-item"
+                  onClick={() => selectSection(t.id)}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                    {renderTabIcon(t.id)}
+                    <span>Ir a {t.label}</span>
+                  </span>
+                  <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                    {t.pill ?? t.id}
+                  </span>
+                </button>
+              ))}
+              <button
+                type="button"
+                className="cmd-item"
+                onClick={() => {
+                  setCmdOpen(false);
+                  setActiveTab('keys');
+                  setAutoFocusKeyInput(true);
+                }}
+              >
+                <span>+ Crear nueva clave interna sk-bf-…</span>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                  API Keys
+                </span>
+              </button>
+              <button
+                type="button"
+                className="cmd-item"
+                onClick={() => {
+                  void handleCopyTopEndpoint();
+                  setCmdOpen(false);
+                }}
+              >
+                <span>Copiar endpoint compatible con OpenAI</span>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                  /v1
+                </span>
+              </button>
+              <button
+                type="button"
+                className="cmd-item"
+                onClick={() => {
+                  setThemeMode((m) => (m === 'dark' ? 'light' : 'dark'));
+                  setCmdOpen(false);
+                }}
+              >
+                <span>
+                  Cambiar a modo {themeMode === 'dark' ? 'Claro' : 'Oscuro'}
+                </span>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                  Tema
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {/* Categorized Navigation Sheet for Mobile & Split-View (<= 900px) */}
       {mobileMenuOpen ? (
@@ -615,7 +1020,7 @@ export const App: React.FC = () => {
             </div>
 
             <div className="mobile-nav-group">
-              <span className="mobile-nav-group-label">Uso y Pruebas</span>
+              <span className="mobile-nav-group-label">Gateway</span>
               {usageTabs.map((item) => {
                 const isActive = activeTab === item.id;
                 return (
@@ -636,7 +1041,7 @@ export const App: React.FC = () => {
 
             {isAdmin && adminTabs.length > 0 ? (
               <div className="mobile-nav-group">
-                <span className="mobile-nav-group-label">Administración</span>
+                <span className="mobile-nav-group-label">Infraestructura & Sistema</span>
                 {adminTabs.map((item) => {
                   const isActive = activeTab === item.id;
                   return (
@@ -666,6 +1071,49 @@ export const App: React.FC = () => {
                 gap: 10,
               }}
             >
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                }}
+              >
+                <span style={{ fontSize: '0.8rem', color: 'var(--sub)' }}>Tema y paleta</span>
+                <div className="theme-cluster">
+                  <button
+                    type="button"
+                    className={`palette-dot-btn${palette === 'obsidian' ? ' active' : ''}`}
+                    onClick={() => setPalette('obsidian')}
+                    aria-label="Paleta Obsidian"
+                  >
+                    <span className="palette-dot" style={{ background: '#09090b' }} />
+                  </button>
+                  <button
+                    type="button"
+                    className={`palette-dot-btn${palette === 'stone' ? ' active' : ''}`}
+                    onClick={() => setPalette('stone')}
+                    aria-label="Paleta Warm Stone"
+                  >
+                    <span className="palette-dot" style={{ background: '#d6cfc2' }} />
+                  </button>
+                  <button
+                    type="button"
+                    className={`palette-dot-btn${palette === 'nordic' ? ' active' : ''}`}
+                    onClick={() => setPalette('nordic')}
+                    aria-label="Paleta Nordic Bifrost"
+                  >
+                    <span className="palette-dot" style={{ background: '#0057ff' }} />
+                  </button>
+                  <button
+                    type="button"
+                    className="theme-toggle-btn"
+                    onClick={() => setThemeMode((m) => (m === 'dark' ? 'light' : 'dark'))}
+                  >
+                    {themeMode === 'dark' ? 'Oscuro' : 'Claro'}
+                  </button>
+                </div>
+              </div>
               <div style={{ fontSize: '0.82rem', color: 'var(--sub)' }}>
                 Sesión activa: <strong style={{ color: 'var(--fg)' }}>{user.username}</strong>
               </div>
@@ -732,6 +1180,37 @@ export const App: React.FC = () => {
           </div>
         </div>
       ) : null}
+      {/* Mobile / PWA Bottom Navigation Bar (<= 640px) */}
+      <nav className="mobile-bottom-bar" aria-label="Navegación rápida móvil">
+        {(
+          [
+            ['overview', 'Resumen'],
+            ['models', 'Modelos'],
+            ['metrics', 'Métricas'],
+            ['playground', 'Chat'],
+          ] as Array<[ActiveTab, string]>
+        ).map(([id, label]) => (
+          <button
+            key={`mb-${id}`}
+            type="button"
+            className={`mobile-bottom-btn${activeTab === id ? ' active' : ''}`}
+            onClick={() => selectSection(id)}
+          >
+            {renderTabIcon(id)}
+            <span>{label}</span>
+          </button>
+        ))}
+        <button
+          type="button"
+          className={`mobile-bottom-btn${mobileMenuOpen ? ' active' : ''}`}
+          onClick={() => setMobileMenuOpen(true)}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16" strokeLinecap="round" />
+          </svg>
+          <span>Más</span>
+        </button>
+      </nav>
     </div>
   );
 };

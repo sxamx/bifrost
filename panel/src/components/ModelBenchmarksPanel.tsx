@@ -53,6 +53,12 @@ function formatCapturedUtc(val: string | null | undefined): string {
   return val;
 }
 
+function tierColor(pct: number): string {
+  if (pct >= 68) return 'var(--ok)';
+  if (pct >= 42) return 'var(--warn)';
+  return 'var(--err)';
+}
+
 function resolvePeerTargetFullId(
   peerFullId: string | null | undefined,
   peerModelId: string,
@@ -85,6 +91,7 @@ interface RadarChartProps {
 
 const PercentileRadarChart: React.FC<RadarChartProps> = ({ axes }) => {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
+  const [radarMode, setRadarMode] = useState<'percentile' | 'index'>('percentile');
 
   if (axes.length === 0) {
     return (
@@ -94,47 +101,70 @@ const PercentileRadarChart: React.FC<RadarChartProps> = ({ axes }) => {
     );
   }
 
+  const hasIndexValues = axes.some((a) => typeof a.index === 'number');
+  const maxIndex = Math.max(
+    100,
+    ...axes.map((a) => (typeof a.index === 'number' ? a.index : a.percentile))
+  );
+
+  const getValueForMode = (ax: ArtificialWatchAxis): number => {
+    if (radarMode === 'index' && typeof ax.index === 'number') {
+      return Math.max(8, Math.min(100, (ax.index / maxIndex) * 100));
+    }
+    return Math.max(8, Math.min(100, ax.percentile));
+  };
+
+  const getSubLabel = (ax: ArtificialWatchAxis): string => {
+    if (radarMode === 'index' && typeof ax.index === 'number') {
+      return `Idx: ${ax.index.toFixed(1)}`;
+    }
+    return `Top ${Math.max(1, 100 - Math.round(ax.percentile))}% · P${Math.round(ax.percentile)}`;
+  };
+
   if (axes.length < 3) {
     return (
-      <div className="horiz-err-grid">
-        {axes.map((ax, idx) => (
-          <div
-            key={ax.axisKey || idx}
-            className="horiz-err-item"
-            onMouseEnter={() => setHoveredIdx(idx)}
-            onMouseLeave={() => setHoveredIdx(null)}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-              <strong style={{ fontSize: '0.88rem' }}>{ax.label}</strong>
-              <span className="mono" style={{ fontWeight: 700, color: 'var(--accent)' }}>
-                Percentil P{Math.round(ax.percentile)}
+      <div className="arena-grid">
+        {axes.map((ax, idx) => {
+          const pct = Math.max(0, Math.min(100, ax.percentile));
+          const col = tierColor(pct);
+          return (
+            <div
+              key={ax.axisKey || idx}
+              className={`arena-card${hoveredIdx === idx ? ' active' : ''}`}
+              onMouseEnter={() => setHoveredIdx(idx)}
+              onMouseLeave={() => setHoveredIdx(null)}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                <strong style={{ fontSize: '0.86rem' }}>{ax.label}</strong>
+                <span className="mono" style={{ fontWeight: 600, color: col }}>
+                  P{Math.round(ax.percentile)}
+                </span>
+              </div>
+              <div className="horiz-track">
+                <div
+                  className="horiz-fill"
+                  style={{
+                    width: `${Math.max(4, pct)}%`,
+                    background: col,
+                  }}
+                />
+              </div>
+              <span className="field-hint" style={{ fontSize: '0.75rem' }}>
+                Tablero: <strong>{ax.sourceBoard}</strong>
+                {typeof ax.index === 'number' ? ` · Índice: ${ax.index.toFixed(1)}` : ''}
               </span>
             </div>
-            <div className="horiz-track">
-              <div
-                className="horiz-fill"
-                style={{
-                  width: `${Math.max(2, Math.min(100, ax.percentile))}%`,
-                  background: 'var(--accent)',
-                }}
-              />
-            </div>
-            <span className="field-hint" style={{ fontSize: '0.78rem' }}>
-              Tablero origen: <strong>{ax.sourceBoard}</strong>
-              {hoveredIdx === idx && typeof ax.index === 'number'
-                ? ` · Índice nativo: ${ax.index.toFixed(1)}`
-                : ''}
-            </span>
-          </div>
-        ))}
+          );
+        })}
       </div>
     );
   }
 
-  const size = 340;
-  const cx = size / 2;
-  const cy = size / 2;
-  const maxR = 112;
+  const svgW = 460;
+  const svgH = 290;
+  const cx = svgW / 2;
+  const cy = svgH / 2;
+  const maxR = 88;
   const rings = [25, 50, 75, 100];
   const count = axes.length;
 
@@ -152,7 +182,7 @@ const PercentileRadarChart: React.FC<RadarChartProps> = ({ axes }) => {
 
   const dataPolygon = axes
     .map((ax, i) => {
-      const pt = pointFor(i, ax.percentile);
+      const pt = pointFor(i, getValueForMode(ax));
       return `${pt.x.toFixed(1)},${pt.y.toFixed(1)}`;
     })
     .join(' ');
@@ -160,163 +190,282 @@ const PercentileRadarChart: React.FC<RadarChartProps> = ({ axes }) => {
   const hoveredAxis = hoveredIdx !== null ? axes[hoveredIdx] : null;
 
   return (
-    <div className="radar-split-grid">
-      <div className="svg-chart-wrap" style={{ position: 'relative' }}>
-        <svg
-          viewBox={`0 0 ${size} ${size}`}
-          className="svg-chart"
-          role="img"
-          aria-label="Gráfico radar de percentiles por eje en ArtificialWatch"
-        >
-          {rings.map((ring) => {
-            const pts = axes
-              .map((_, i) => {
-                const p = pointFor(i, ring);
-                return `${p.x.toFixed(1)},${p.y.toFixed(1)}`;
-              })
-              .join(' ');
-            return (
-              <polygon
-                key={ring}
-                points={pts}
-                fill="none"
-                stroke="#d6e3f3"
-                strokeWidth={ring === 50 ? 1.4 : 1}
-                strokeDasharray={ring === 50 ? '3 3' : undefined}
-              />
-            );
-          })}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {/* Design Arena style Radar Stage with Elo/Rank (Percentil/Índice) toggle */}
+      <div className="radar-stage">
+        <div className="radar-head">
+          <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--fg)' }}>
+            Category performance
+          </span>
+          {hasIndexValues ? (
+            <div className="pill-tabs" role="group" aria-label="Escala del radar">
+              <button
+                type="button"
+                className={`pill-tab${radarMode === 'percentile' ? ' active' : ''}`}
+                onClick={() => setRadarMode('percentile')}
+              >
+                Percentil (P)
+              </button>
+              <button
+                type="button"
+                className={`pill-tab${radarMode === 'index' ? ' active' : ''}`}
+                onClick={() => setRadarMode('index')}
+              >
+                Índice
+              </button>
+            </div>
+          ) : null}
+        </div>
 
-          {axes.map((ax, i) => {
-            const outer = pointFor(i, 100);
-            const labelPt = pointFor(i, 122);
-            const isHovered = hoveredIdx === i;
-            return (
-              <g key={ax.axisKey || i}>
-                <line
-                  x1={cx}
-                  y1={cy}
-                  x2={outer.x}
-                  y2={outer.y}
-                  stroke={isHovered ? 'var(--accent)' : '#c4d4e8'}
-                  strokeWidth={isHovered ? 1.8 : 1}
+        <div
+          className="svg-chart-wrap"
+          style={{ maxWidth: 520, margin: '0 auto', position: 'relative' }}
+        >
+          <svg
+            viewBox={`0 0 ${svgW} ${svgH}`}
+            className="svg-chart"
+            style={{ overflow: 'visible' }}
+            role="img"
+            aria-label="Gráfico radar de capacidades por categoría"
+          >
+            {rings.map((ring) => {
+              const pts = axes
+                .map((_, i) => {
+                  const p = pointFor(i, ring);
+                  return `${p.x.toFixed(1)},${p.y.toFixed(1)}`;
+                })
+                .join(' ');
+              return (
+                <polygon
+                  key={ring}
+                  points={pts}
+                  fill="none"
+                  stroke="var(--line-strong)"
+                  strokeOpacity={0.55}
+                  strokeWidth={1}
                 />
-                <text
-                  x={labelPt.x}
-                  y={labelPt.y}
-                  textAnchor="middle"
-                  dominantBaseline="middle"
-                  fill={isHovered ? 'var(--accent)' : 'var(--sub)'}
-                  fontSize="10.5"
-                  fontWeight={isHovered ? 800 : 600}
+              );
+            })}
+
+            {axes.map((ax, i) => {
+              const outer = pointFor(i, 100);
+              const labelPt = pointFor(i, 134);
+              const isHovered = hoveredIdx === i;
+              const cosA = Math.cos(angleFor(i));
+              const anchor = Math.abs(cosA) < 0.2 ? 'middle' : cosA > 0 ? 'start' : 'end';
+
+              return (
+                <g
+                  key={ax.axisKey || i}
                   style={{ cursor: 'pointer' }}
                   onMouseEnter={() => setHoveredIdx(i)}
                   onMouseLeave={() => setHoveredIdx(null)}
                 >
-                  {ax.label.length > 16 ? `${ax.label.slice(0, 15)}…` : ax.label}
-                </text>
-              </g>
-            );
-          })}
+                  <line
+                    x1={cx}
+                    y1={cy}
+                    x2={outer.x}
+                    y2={outer.y}
+                    stroke="var(--line-strong)"
+                    strokeOpacity={0.42}
+                    strokeWidth={1}
+                  />
+                  <text
+                    x={labelPt.x}
+                    y={labelPt.y - 4}
+                    textAnchor={anchor}
+                    fill={isHovered ? 'var(--accent)' : 'var(--fg)'}
+                    fontSize="11"
+                    fontWeight={600}
+                  >
+                    {ax.label.length > 18 ? `${ax.label.slice(0, 17)}…` : ax.label}
+                  </text>
+                  <text
+                    x={labelPt.x}
+                    y={labelPt.y + 9}
+                    textAnchor={anchor}
+                    fill="var(--fg-3)"
+                    fontSize="10"
+                    fontFamily="var(--font-mono)"
+                  >
+                    {getSubLabel(ax)}
+                  </text>
+                </g>
+              );
+            })}
 
-          <polygon
-            points={dataPolygon}
-            fill="rgba(0, 87, 255, 0.14)"
-            stroke="var(--accent)"
-            strokeWidth="2.2"
-          />
+            <polygon
+              points={dataPolygon}
+              fill="var(--radar-fill)"
+              stroke="var(--radar-stroke)"
+              strokeWidth="2"
+              strokeLinejoin="round"
+              style={{ transition: 'all 0.32s cubic-bezier(0.16, 1, 0.3, 1)' }}
+            />
 
-          {axes.map((ax, i) => {
-            const pt = pointFor(i, ax.percentile);
-            const isHovered = hoveredIdx === i;
-            return (
-              <g
-                key={`vertex-${ax.axisKey || i}`}
-                style={{ cursor: 'pointer' }}
-                onMouseEnter={() => setHoveredIdx(i)}
-                onMouseLeave={() => setHoveredIdx(null)}
-              >
-                <circle cx={pt.x} cy={pt.y} r={12} fill="transparent" />
-                <circle
-                  cx={pt.x}
-                  cy={pt.y}
-                  r={isHovered ? 6 : 4.2}
-                  fill={isHovered ? 'var(--accent)' : '#ffffff'}
-                  stroke="var(--accent)"
-                  strokeWidth="2.2"
-                />
-              </g>
-            );
-          })}
-        </svg>
+            {axes.map((ax, i) => {
+              const pt = pointFor(i, getValueForMode(ax));
+              const isHovered = hoveredIdx === i;
+              return (
+                <g
+                  key={`vertex-${ax.axisKey || i}`}
+                  style={{ cursor: 'pointer' }}
+                  onMouseEnter={() => setHoveredIdx(i)}
+                  onMouseLeave={() => setHoveredIdx(null)}
+                >
+                  <circle cx={pt.x} cy={pt.y} r={14} fill="transparent" />
+                  <circle
+                    cx={pt.x}
+                    cy={pt.y}
+                    r={isHovered ? 10 : 4}
+                    fill="var(--radar-stroke)"
+                    fillOpacity={isHovered ? 0.22 : 0}
+                    style={{ transition: 'all 0.24s cubic-bezier(0.16, 1, 0.3, 1)' }}
+                  />
+                  <circle
+                    cx={pt.x}
+                    cy={pt.y}
+                    r={isHovered ? 5 : 3.6}
+                    fill="var(--panel)"
+                    stroke="var(--radar-stroke)"
+                    strokeWidth={isHovered ? 2.4 : 2}
+                    style={{ transition: 'all 0.24s cubic-bezier(0.16, 1, 0.3, 1)' }}
+                  />
+                </g>
+              );
+            })}
+          </svg>
 
-        {hoveredAxis ? (
-          <div
-            className="floating-white-tooltip"
-            style={{ top: 10, right: 10, maxWidth: 230 }}
-            role="status"
-          >
-            <div style={{ fontWeight: 800, color: 'var(--fg)', marginBottom: 4 }}>
-              {hoveredAxis.label}
-            </div>
-            <div style={{ fontSize: '0.8rem', color: 'var(--accent)', fontWeight: 700 }}>
-              Percentil P{Math.round(hoveredAxis.percentile)} (escala 0–100)
-            </div>
-            {typeof hoveredAxis.index === 'number' ? (
-              <div className="mono" style={{ fontSize: '0.75rem', color: 'var(--sub)' }}>
-                Índice eje: {hoveredAxis.index.toFixed(1)}
-              </div>
-            ) : null}
+          {hoveredAxis ? (
             <div
-              style={{
-                fontSize: '0.75rem',
-                color: 'var(--sub)',
-                marginTop: 4,
-                paddingTop: 4,
-                borderTop: '1px solid var(--line)',
-              }}
+              className="floating-white-tooltip"
+              style={{ position: 'absolute', top: 6, right: 6, maxWidth: 230 }}
+              role="status"
             >
-              Tablero origen: <strong>{hoveredAxis.sourceBoard}</strong>
+              <div
+                style={{
+                  fontWeight: 600,
+                  color: 'var(--tooltip-fg)',
+                  marginBottom: 4,
+                  paddingBottom: 4,
+                  borderBottom: '1px solid var(--tooltip-line)',
+                }}
+              >
+                {hoveredAxis.label}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+                <span style={{ color: 'var(--tooltip-sub)' }}>Percentil</span>
+                <strong className="mono">P{Math.round(hoveredAxis.percentile)}</strong>
+              </div>
+              {typeof hoveredAxis.index === 'number' ? (
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+                  <span style={{ color: 'var(--tooltip-sub)' }}>Índice nativo</span>
+                  <strong className="mono">{hoveredAxis.index.toFixed(1)}</strong>
+                </div>
+              ) : null}
+              <div
+                style={{
+                  fontSize: '0.72rem',
+                  color: 'var(--tooltip-sub)',
+                  marginTop: 5,
+                  paddingTop: 4,
+                  borderTop: '1px solid var(--tooltip-line)',
+                }}
+              >
+                Fuente: <strong>{hoveredAxis.sourceBoard}</strong>
+              </div>
             </div>
-          </div>
-        ) : null}
+          ) : null}
+        </div>
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <span className="field-hint" style={{ fontWeight: 700 }}>
-          Desglose por capacidad (pasa el cursor para ver el tablero fuente):
-        </span>
+      {/* Synchronized Arena Cards Grid (Design Arena layout from screenshots 162852.png / 162855.png) */}
+      <div
+        style={{
+          fontSize: '10.5px',
+          fontWeight: 600,
+          textTransform: 'uppercase',
+          letterSpacing: '0.07em',
+          color: 'var(--fg-3)',
+        }}
+      >
+        CAPABILITY ARENA · PASA EL CURSOR PARA CONECTAR CON EL RADAR
+      </div>
+      <div className="arena-grid">
         {axes.map((ax, i) => {
           const isHovered = hoveredIdx === i;
+          const pct = Math.max(0, Math.min(100, ax.percentile));
+          const topRankPct = Math.max(1, 100 - Math.round(pct));
+          const col = tierColor(pct);
+          const badgeBg =
+            pct >= 68 ? 'var(--ok-soft)' : pct >= 42 ? 'var(--warn-soft)' : 'var(--err-soft)';
+
           return (
             <div
-              key={`legend-${ax.axisKey || i}`}
+              key={`arena-card-${ax.axisKey || i}`}
+              className={`arena-card${isHovered ? ' active' : ''}`}
               onMouseEnter={() => setHoveredIdx(i)}
               onMouseLeave={() => setHoveredIdx(null)}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: 10,
-                padding: '8px 12px',
-                borderRadius: 10,
-                border: `1px solid ${isHovered ? 'var(--accent)' : 'var(--line)'}`,
-                background: isHovered ? 'var(--accent-soft)' : 'var(--surface-muted)',
-                cursor: 'pointer',
-                transition: 'background-color 0.14s ease, border-color 0.14s ease',
-              }}
             >
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <span style={{ fontWeight: 700, fontSize: '0.85rem', color: 'var(--fg)' }}>
-                  {ax.label}
-                </span>
-                <span style={{ fontSize: '0.75rem', color: 'var(--sub)' }}>
-                  Fuente: {ax.sourceBoard}
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                }}
+              >
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="var(--fg-3)"
+                  strokeWidth="1.8"
+                  aria-hidden="true"
+                >
+                  <path d="M5 18c-2-3-2-8 1-12 2 2 3 5 2 9" />
+                  <path d="M19 18c2-3 2-8-1-12-2 2-3 5-2 9" />
+                  <path d="M8 20h8" />
+                </svg>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: '10.5px',
+                    fontWeight: 600,
+                    padding: '2px 7px',
+                    borderRadius: 999,
+                    background: badgeBg,
+                    color: col,
+                  }}
+                >
+                  Top {topRankPct}%
                 </span>
               </div>
-              <span className="mono" style={{ fontWeight: 700, color: 'var(--accent)' }}>
-                P{Math.round(ax.percentile)}
-              </span>
+
+              <div style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--fg)' }}>
+                {ax.label}
+              </div>
+
+              <div
+                className="font-display num"
+                style={{ fontSize: '18px', fontWeight: 700, color: 'var(--fg)' }}
+              >
+                P{Math.round(pct)}{' '}
+                <span style={{ fontSize: '11.5px', fontWeight: 500, color: 'var(--fg-3)' }}>
+                  {typeof ax.index === 'number' ? `· ${ax.index.toFixed(1)} idx` : 'percentil'}
+                </span>
+              </div>
+
+              <div className="horiz-track" style={{ height: 4 }}>
+                <div
+                  className="horiz-fill"
+                  style={{ width: `${Math.max(4, pct)}%`, background: col }}
+                />
+              </div>
+
+              <div className="mono" style={{ fontSize: '11px', color: 'var(--sub)' }}>
+                Tablero: {ax.sourceBoard}
+              </div>
             </div>
           );
         })}
@@ -380,7 +529,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
             Benchmarks públicos verificados (4 fuentes)
             <InfoTip text="Comparativa curada de 4 fuentes públicas independientes con atribución explícita, licencias abiertas y navegación directa entre modelos pares." />
           </h2>
-          <p className="field-hint" style={{ marginTop: 4 }}>
+          <p className="field-hint" style={{ marginTop: 3 }}>
             Evaluaciones de referencia para <strong>{modelName}</strong> (
             <code className="mono">{fullId}</code>). Haz clic en cualquier modelo par del ranking
             para saltar a su ficha.
@@ -399,9 +548,8 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
             aria-selected={activeSource === 'lmarena'}
             className={`subnav-btn${activeSource === 'lmarena' ? ' active' : ''}`}
             onClick={() => setActiveSource('lmarena')}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
           >
-            <BenchmarkSourceIcon source="lmarena" size={15} />
+            <BenchmarkSourceIcon source="lmarena" size={14} />
             <span>LMArena</span>
           </button>
           <button
@@ -410,9 +558,8 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
             aria-selected={activeSource === 'artificialwatch'}
             className={`subnav-btn${activeSource === 'artificialwatch' ? ' active' : ''}`}
             onClick={() => setActiveSource('artificialwatch')}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
           >
-            <BenchmarkSourceIcon source="artificialwatch" size={15} />
+            <BenchmarkSourceIcon source="artificialwatch" size={14} />
             <span>ArtificialWatch</span>
           </button>
           <button
@@ -421,9 +568,8 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
             aria-selected={activeSource === 'epoch'}
             className={`subnav-btn${activeSource === 'epoch' ? ' active' : ''}`}
             onClick={() => setActiveSource('epoch')}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
           >
-            <BenchmarkSourceIcon source="epoch" size={15} />
+            <BenchmarkSourceIcon source="epoch" size={14} />
             <span>Epoch AI</span>
           </button>
           <button
@@ -432,9 +578,8 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
             aria-selected={activeSource === 'opencharts'}
             className={`subnav-btn${activeSource === 'opencharts' ? ' active' : ''}`}
             onClick={() => setActiveSource('opencharts')}
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
           >
-            <BenchmarkSourceIcon source="opencharts" size={15} />
+            <BenchmarkSourceIcon source="opencharts" size={14} />
             <span>OpenCharts</span>
           </button>
         </div>
@@ -457,9 +602,9 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
         </div>
       ) : !data ? null : (
         <>
-          {/* SOURCE 1: LMArena (agent/latest, CC BY 4.0) */}
+          {/* SOURCE 1: LMArena */}
           {activeSource === 'lmarena' ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div
                 style={{
                   display: 'flex',
@@ -485,7 +630,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               </div>
 
               {!data.lmarena.available && data.lmarena.score === null ? (
-                <div className="empty-state" style={{ padding: '26px 18px' }}>
+                <div className="empty-state" style={{ padding: '24px 18px' }}>
                   <p className="field-hint">
                     Este modelo aún no registra partidas suficientes en el tablero{' '}
                     <code className="mono">{data.lmarena.category}</code> de LMArena.
@@ -494,21 +639,21 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               ) : (
                 <>
                   <div className="kpi-grid">
-                    <div className="card" style={{ padding: '18px 20px', boxShadow: 'none' }}>
+                    <div className="card" style={{ padding: '14px 16px' }}>
                       <span className="kpi-label">Puntaje nativo LMArena</span>
                       <div
                         className="kpi-value"
-                        style={{ fontSize: '1.85rem', color: 'var(--accent)', marginTop: 4 }}
+                        style={{ color: 'var(--accent)', marginTop: 4 }}
                       >
                         {data.lmarena.score !== null ? data.lmarena.score.toFixed(1) : '—'}
                       </div>
                       <div style={{ marginTop: 6 }}>
                         <TechTerm
-                          term="intervalo de confianza"
+                          term="IC 95%"
                           tip="Rango estadístico (95%) dentro del cual se ubica el puntaje real tras remuestreo bootstrap de duelos."
                           onOpenMethodology={() => setMethodologyModalOpen(true)}
                         />{' '}
-                        <span className="mono" style={{ fontSize: '0.8rem', color: 'var(--sub)' }}>
+                        <span className="mono" style={{ fontSize: '0.78rem', color: 'var(--sub)' }}>
                           {data.lmarena.ciLower !== null && data.lmarena.ciUpper !== null
                             ? `[${data.lmarena.ciLower.toFixed(1)} – ${data.lmarena.ciUpper.toFixed(1)}]`
                             : data.lmarena.ciPlusMinus !== null &&
@@ -519,12 +664,12 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                       </div>
                     </div>
 
-                    <div className="card" style={{ padding: '18px 20px', boxShadow: 'none' }}>
+                    <div className="card" style={{ padding: '14px 16px' }}>
                       <span className="kpi-label">Posición en ranking</span>
-                      <div className="kpi-value" style={{ fontSize: '1.65rem', marginTop: 4 }}>
+                      <div className="kpi-value" style={{ marginTop: 4 }}>
                         {data.lmarena.rank !== null
-                          ? `Puesto #${data.lmarena.rank}${
-                              data.lmarena.totalRanked ? ` de ${data.lmarena.totalRanked}` : ''
+                          ? `#${data.lmarena.rank}${
+                              data.lmarena.totalRanked ? ` / ${data.lmarena.totalRanked}` : ''
                             }`
                           : 'Sin puesto'}
                       </div>
@@ -538,9 +683,9 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                       </span>
                     </div>
 
-                    <div className="card" style={{ padding: '18px 20px', boxShadow: 'none' }}>
+                    <div className="card" style={{ padding: '14px 16px' }}>
                       <span className="kpi-label">Costo mediano por tarea</span>
-                      <div className="kpi-value" style={{ fontSize: '1.65rem', marginTop: 4 }}>
+                      <div className="kpi-value" style={{ marginTop: 4 }}>
                         {data.lmarena.medianCostPerTaskUsd !== null
                           ? `$${data.lmarena.medianCostPerTaskUsd.toFixed(3)}`
                           : 'N/D'}
@@ -552,10 +697,10 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                   </div>
 
                   {data.lmarena.rankingPeers.length > 0 ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                      <span className="field-hint" style={{ fontWeight: 700 }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      <span className="field-hint" style={{ fontWeight: 600 }}>
                         Comparativa directa en <code className="mono">{data.lmarena.category}</code>{' '}
-                        (haz clic en una fila para inspeccionar ese modelo):
+                        (clic en una fila para inspeccionar ese modelo):
                       </span>
                       <div className="bench-rank-list">
                         {data.lmarena.rankingPeers.map((peer) => {
@@ -585,7 +730,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                               <span
                                 className="mono"
                                 style={{
-                                  fontWeight: 800,
+                                  fontWeight: 600,
                                   color: isCurrent ? 'var(--accent)' : 'var(--sub)',
                                 }}
                               >
@@ -593,7 +738,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                               </span>
                               <span
                                 style={{
-                                  fontWeight: isCurrent ? 800 : 600,
+                                  fontWeight: isCurrent ? 600 : 500,
                                   color: 'var(--fg)',
                                   overflow: 'hidden',
                                   textOverflow: 'ellipsis',
@@ -609,7 +754,9 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                                     className="horiz-fill"
                                     style={{
                                       width: `${widthPct.toFixed(1)}%`,
-                                      background: isCurrent ? 'var(--accent)' : '#7f9bc0',
+                                      background: isCurrent
+                                        ? 'var(--accent)'
+                                        : tierColor(widthPct),
                                     }}
                                   />
                                 </div>
@@ -618,7 +765,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                                 className="mono"
                                 style={{
                                   textAlign: 'right',
-                                  fontWeight: 700,
+                                  fontWeight: 600,
                                   color: isCurrent ? 'var(--accent)' : 'var(--fg)',
                                 }}
                               >
@@ -634,7 +781,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               )}
 
               <footer className="bench-attribution-footer">
-                <BenchmarkSourceIcon source="lmarena" size={16} />
+                <BenchmarkSourceIcon source="lmarena" size={15} />
                 <span>
                   Fuente:{' '}
                   <a href={data.lmarena.sourceUrl} target="_blank" rel="noopener noreferrer">
@@ -647,9 +794,9 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
             </div>
           ) : null}
 
-          {/* SOURCE 2: ArtificialWatch (CC BY 4.0) */}
+          {/* SOURCE 2: ArtificialWatch (Radar + Arena Cards) */}
           {activeSource === 'artificialwatch' ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div
                 style={{
                   display: 'flex',
@@ -666,8 +813,8 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                     onOpenMethodology={() => setMethodologyModalOpen(true)}
                   />
                   <span className="field-hint">
-                    Valores expresados estrictamente como <strong>percentiles (0–100)</strong>,
-                    nunca porcentaje de exactitud (%).
+                    Valores expresados como <strong>percentiles (0–100)</strong> e índices por
+                    categoría.
                   </span>
                 </div>
                 <button
@@ -682,7 +829,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               {!data.artificialwatch.available &&
               data.artificialwatch.axes.length === 0 &&
               data.artificialwatch.medianPercentile === null ? (
-                <div className="empty-state" style={{ padding: '26px 18px' }}>
+                <div className="empty-state" style={{ padding: '24px 18px' }}>
                   <p className="field-hint">
                     ArtificialWatch no dispone aún de perfil multi-eje para este modelo.
                   </p>
@@ -690,11 +837,11 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               ) : (
                 <>
                   <div className="kpi-grid">
-                    <div className="card" style={{ padding: '18px 20px', boxShadow: 'none' }}>
+                    <div className="card" style={{ padding: '14px 16px' }}>
                       <span className="kpi-label">Percentil mediano global</span>
                       <div
                         className="kpi-value"
-                        style={{ fontSize: '1.85rem', color: 'var(--accent)', marginTop: 4 }}
+                        style={{ color: 'var(--accent)', marginTop: 4 }}
                       >
                         {data.artificialwatch.medianPercentile !== null
                           ? `P${Math.round(data.artificialwatch.medianPercentile)}`
@@ -705,9 +852,9 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                       </span>
                     </div>
 
-                    <div className="card" style={{ padding: '18px 20px', boxShadow: 'none' }}>
+                    <div className="card" style={{ padding: '14px 16px' }}>
                       <span className="kpi-label">Índice ArtificialWatch</span>
-                      <div className="kpi-value" style={{ fontSize: '1.85rem', marginTop: 4 }}>
+                      <div className="kpi-value" style={{ marginTop: 4 }}>
                         {data.artificialwatch.globalIndex !== null
                           ? data.artificialwatch.globalIndex.toFixed(1)
                           : '—'}
@@ -722,8 +869,8 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
 
                   {data.artificialwatch.rankingPeers &&
                   data.artificialwatch.rankingPeers.length > 0 ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                      <span className="field-hint" style={{ fontWeight: 700 }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      <span className="field-hint" style={{ fontWeight: 600 }}>
                         Modelos cercanos por percentil mediano (clic para abrir ficha):
                       </span>
                       <div className="bench-rank-list">
@@ -737,6 +884,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                             peer.modelId,
                             allModels
                           );
+                          const pct = Math.max(4, Math.min(100, peer.percentile));
                           return (
                             <button
                               key={`aw-${peer.rank}-${peer.modelId}`}
@@ -744,10 +892,10 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                               className={`bench-rank-row${isCurrent ? ' current' : ''}`}
                               onClick={() => onSelectPeerModel(resolved.targetFullId)}
                             >
-                              <span className="mono" style={{ fontWeight: 800 }}>
+                              <span className="mono" style={{ fontWeight: 600 }}>
                                 #{peer.rank}
                               </span>
-                              <span style={{ fontWeight: isCurrent ? 800 : 600 }}>
+                              <span style={{ fontWeight: isCurrent ? 600 : 500 }}>
                                 {peer.displayName}
                                 {isCurrent ? ' (Actual)' : ''}
                               </span>
@@ -756,15 +904,15 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                                   <div
                                     className="horiz-fill"
                                     style={{
-                                      width: `${Math.max(4, Math.min(100, peer.percentile))}%`,
-                                      background: isCurrent ? 'var(--accent)' : '#7f9bc0',
+                                      width: `${pct}%`,
+                                      background: isCurrent ? 'var(--accent)' : tierColor(pct),
                                     }}
                                   />
                                 </div>
                               </div>
                               <span
                                 className="mono"
-                                style={{ textAlign: 'right', fontWeight: 700 }}
+                                style={{ textAlign: 'right', fontWeight: 600 }}
                               >
                                 P{Math.round(peer.percentile)}
                               </span>
@@ -778,7 +926,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               )}
 
               <footer className="bench-attribution-footer">
-                <BenchmarkSourceIcon source="artificialwatch" size={16} />
+                <BenchmarkSourceIcon source="artificialwatch" size={15} />
                 <span>
                   Fuente:{' '}
                   <a
@@ -795,9 +943,9 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
             </div>
           ) : null}
 
-          {/* SOURCE 3: Epoch AI (CC BY 4.0, own internal runs only) */}
+          {/* SOURCE 3: Epoch AI (Vals AI / Horizontal Progress Bar Cards + Table) */}
           {activeSource === 'epoch' ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div
                 style={{
                   display: 'flex',
@@ -837,60 +985,118 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               </div>
 
               {!data.epoch.available || data.epoch.runs.length === 0 ? (
-                <div className="empty-state" style={{ padding: '26px 18px' }}>
+                <div className="empty-state" style={{ padding: '24px 18px' }}>
                   <p className="field-hint">
                     Epoch AI no registra corridas internas verificadas con Inspect para este modelo.
-                    (Se excluyen autorreportes externos de terceros).
                   </p>
                 </div>
               ) : (
-                <div className="table-wrap">
-                  <table className="bf-table">
-                    <thead>
-                      <tr>
-                        <th>Benchmark</th>
-                        <th>Puntaje</th>
-                        <th>Incertidumbre (±stderr)</th>
-                        <th>Arnés</th>
-                        <th>Fecha corrida</th>
-                        <th>Cómputo / Tokens</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {data.epoch.runs.map((run, idx) => (
-                        <tr key={`${run.benchmarkId}-${idx}`}>
-                          <td style={{ fontWeight: 700 }}>{run.benchmarkName}</td>
-                          <td className="mono" style={{ fontWeight: 700, color: 'var(--accent)' }}>
-                            {run.score.toFixed(1)}
-                            {run.unit ? ` ${run.unit}` : ''}
-                          </td>
-                          <td className="mono">
-                            {run.stderr !== null ? `±${run.stderr.toFixed(2)}` : '—'}
-                          </td>
-                          <td>
+                <>
+                  {/* Vals AI style horizontal benchmark bars (from screenshots 162905.png / 162908.png) */}
+                  <div className="dual-cards-grid">
+                    {data.epoch.runs.map((run, idx) => {
+                      const pct = Math.max(2, Math.min(100, run.score));
+                      const col = tierColor(pct);
+                      return (
+                        <div key={`vals-bar-${run.benchmarkId}-${idx}`} className="horiz-err-item">
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              gap: 10,
+                            }}
+                          >
+                            <strong style={{ fontSize: '12.5px', color: 'var(--fg)' }}>
+                              {run.benchmarkName}
+                            </strong>
                             <code className="key-prefix-pill">{run.harness || 'Inspect'}</code>
-                          </td>
-                          <td className="mono" style={{ fontSize: '0.82rem' }}>
-                            {run.evaluatedAt ?? '—'}
-                          </td>
-                          <td className="mono" style={{ fontSize: '0.8rem', color: 'var(--sub)' }}>
-                            {run.trainingFlop ? `${run.trainingFlop} FLOP` : ''}
-                            {run.trainingFlop && run.tokensUsed ? ' · ' : ''}
-                            {typeof run.tokensUsed === 'number'
-                              ? `${run.tokensUsed.toLocaleString('es-ES')} tok`
-                              : !run.trainingFlop
-                                ? '—'
-                                : ''}
-                          </td>
+                          </div>
+                          <span className="field-hint" style={{ fontSize: '11px' }}>
+                            Updated {run.evaluatedAt ?? 'reciente'}
+                            {run.stderr !== null ? ` · ±${run.stderr.toFixed(2)} stderr` : ''}
+                          </span>
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: '1fr 64px',
+                              alignItems: 'center',
+                              gap: 12,
+                              marginTop: 4,
+                            }}
+                          >
+                            <div className="horiz-track">
+                              <div
+                                className="horiz-fill"
+                                style={{ width: `${pct}%`, background: col }}
+                              />
+                            </div>
+                            <span
+                              className="mono"
+                              style={{
+                                textAlign: 'right',
+                                fontWeight: 600,
+                                fontSize: '12px',
+                                color: 'var(--fg)',
+                              }}
+                            >
+                              {run.score.toFixed(1)}
+                              {run.unit ? run.unit : '%'}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="table-wrap">
+                    <table className="bf-table">
+                      <thead>
+                        <tr>
+                          <th>Benchmark</th>
+                          <th>Puntaje</th>
+                          <th>Incertidumbre (±stderr)</th>
+                          <th>Arnés</th>
+                          <th>Fecha corrida</th>
+                          <th>Cómputo / Tokens</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                      </thead>
+                      <tbody>
+                        {data.epoch.runs.map((run, idx) => (
+                          <tr key={`${run.benchmarkId}-${idx}`}>
+                            <td style={{ fontWeight: 600 }}>{run.benchmarkName}</td>
+                            <td className="mono" style={{ fontWeight: 600, color: 'var(--accent)' }}>
+                              {run.score.toFixed(1)}
+                              {run.unit ? ` ${run.unit}` : ''}
+                            </td>
+                            <td className="mono">
+                              {run.stderr !== null ? `±${run.stderr.toFixed(2)}` : '—'}
+                            </td>
+                            <td>
+                              <code className="key-prefix-pill">{run.harness || 'Inspect'}</code>
+                            </td>
+                            <td className="mono" style={{ fontSize: '0.8rem' }}>
+                              {run.evaluatedAt ?? '—'}
+                            </td>
+                            <td className="mono" style={{ fontSize: '0.78rem', color: 'var(--sub)' }}>
+                              {run.trainingFlop ? `${run.trainingFlop} FLOP` : ''}
+                              {run.trainingFlop && run.tokensUsed ? ' · ' : ''}
+                              {typeof run.tokensUsed === 'number'
+                                ? `${run.tokensUsed.toLocaleString('es-ES')} tok`
+                                : !run.trainingFlop
+                                  ? '—'
+                                  : ''}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
               )}
 
               <footer className="bench-attribution-footer">
-                <BenchmarkSourceIcon source="epoch" size={16} />
+                <BenchmarkSourceIcon source="epoch" size={15} />
                 <span>
                   Fuente:{' '}
                   <a href={data.epoch.sourceUrl} target="_blank" rel="noopener noreferrer">
@@ -905,7 +1111,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
 
           {/* SOURCE 4: OpenCharts */}
           {activeSource === 'opencharts' ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div
                 style={{
                   display: 'flex',
@@ -924,7 +1130,6 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                     target="_blank"
                     rel="noopener noreferrer"
                     className="btn btn-secondary btn-sm"
-                    style={{ textDecoration: 'none' }}
                   >
                     Metodología oficial OpenCharts ↗
                   </a>
@@ -941,7 +1146,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               {!data.opencharts.available &&
               data.opencharts.compositeIndex === null &&
               !data.opencharts.grade ? (
-                <div className="empty-state" style={{ padding: '26px 18px' }}>
+                <div className="empty-state" style={{ padding: '24px 18px' }}>
                   <p className="field-hint">
                     OpenCharts aún no publica calificación compuesta para este modelo.
                   </p>
@@ -949,11 +1154,11 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               ) : (
                 <>
                   <div className="kpi-grid">
-                    <div className="card" style={{ padding: '18px 20px', boxShadow: 'none' }}>
+                    <div className="card" style={{ padding: '14px 16px' }}>
                       <span className="kpi-label">Calificación (Grade)</span>
                       <div
                         className="kpi-value"
-                        style={{ fontSize: '2.1rem', color: 'var(--accent)', marginTop: 4 }}
+                        style={{ color: 'var(--accent)', marginTop: 4 }}
                       >
                         {data.opencharts.grade ?? '—'}
                       </div>
@@ -962,9 +1167,9 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                       </span>
                     </div>
 
-                    <div className="card" style={{ padding: '18px 20px', boxShadow: 'none' }}>
+                    <div className="card" style={{ padding: '14px 16px' }}>
                       <span className="kpi-label">Índice compuesto</span>
-                      <div className="kpi-value" style={{ fontSize: '1.85rem', marginTop: 4 }}>
+                      <div className="kpi-value" style={{ marginTop: 4 }}>
                         {data.opencharts.compositeIndex !== null
                           ? data.opencharts.compositeIndex.toFixed(1)
                           : '—'}
@@ -974,9 +1179,9 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                       </span>
                     </div>
 
-                    <div className="card" style={{ padding: '18px 20px', boxShadow: 'none' }}>
+                    <div className="card" style={{ padding: '14px 16px' }}>
                       <span className="kpi-label">Banda de ranking</span>
-                      <div className="kpi-value" style={{ fontSize: '1.65rem', marginTop: 4 }}>
+                      <div className="kpi-value" style={{ marginTop: 4 }}>
                         {data.opencharts.rankRange ?? '—'}
                       </div>
                       <span className="field-hint" style={{ marginTop: 6, display: 'block' }}>
@@ -986,8 +1191,8 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                   </div>
 
                   {data.opencharts.rankingPeers && data.opencharts.rankingPeers.length > 0 ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                      <span className="field-hint" style={{ fontWeight: 700 }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      <span className="field-hint" style={{ fontWeight: 600 }}>
                         Pares en OpenCharts (clic para navegar al modelo):
                       </span>
                       <div className="bench-rank-list">
@@ -1001,6 +1206,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                             peer.modelId,
                             allModels
                           );
+                          const pct = Math.max(5, Math.min(100, peer.compositeIndex));
                           return (
                             <button
                               key={`oc-${idx}-${peer.modelId}`}
@@ -1008,10 +1214,10 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                               className={`bench-rank-row${isCurrent ? ' current' : ''}`}
                               onClick={() => onSelectPeerModel(resolved.targetFullId)}
                             >
-                              <span className="mono" style={{ fontWeight: 800 }}>
+                              <span className="mono" style={{ fontWeight: 600 }}>
                                 {peer.grade || `#${idx + 1}`}
                               </span>
-                              <span style={{ fontWeight: isCurrent ? 800 : 600 }}>
+                              <span style={{ fontWeight: isCurrent ? 600 : 500 }}>
                                 {peer.displayName}
                                 {isCurrent ? ' (Actual)' : ''}
                               </span>
@@ -1020,15 +1226,15 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                                   <div
                                     className="horiz-fill"
                                     style={{
-                                      width: `${Math.max(5, Math.min(100, peer.compositeIndex))}%`,
-                                      background: isCurrent ? 'var(--accent)' : '#7f9bc0',
+                                      width: `${pct}%`,
+                                      background: isCurrent ? 'var(--accent)' : tierColor(pct),
                                     }}
                                   />
                                 </div>
                               </div>
                               <span
                                 className="mono"
-                                style={{ textAlign: 'right', fontWeight: 700 }}
+                                style={{ textAlign: 'right', fontWeight: 600 }}
                               >
                                 {peer.compositeIndex.toFixed(1)}
                               </span>
@@ -1042,7 +1248,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
               )}
 
               <footer className="bench-attribution-footer">
-                <BenchmarkSourceIcon source="opencharts" size={16} />
+                <BenchmarkSourceIcon source="opencharts" size={15} />
                 <span>
                   Fuente:{' '}
                   <a href={data.opencharts.sourceUrl} target="_blank" rel="noopener noreferrer">
@@ -1066,7 +1272,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
         </>
       )}
 
-      {/* Extended Methodology Modal (strictly deeper than brief hover popups) */}
+      {/* Extended Methodology Modal */}
       {methodologyModalOpen ? (
         <div
           className="modal-backdrop"
@@ -1089,7 +1295,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                 display: 'flex',
                 flexDirection: 'column',
                 gap: 14,
-                fontSize: '0.9rem',
+                fontSize: '0.88rem',
                 color: 'var(--sub)',
                 lineHeight: 1.6,
               }}
@@ -1101,10 +1307,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                 <p>
                   Los puntajes de LMArena provienen de comparaciones pareadas a ciegas en tareas
                   agénticas reales ajustadas mediante regresión logística Bradley-Terry con control
-                  de estilo. No representan porcentaje de aciertos ni Elo secuencial clásico. El
-                  corredor de confianza al 95% se estima por remuestreo bootstrap sobre miles de
-                  sesiones: cuando los intervalos de dos modelos se solapan, su diferencia práctica
-                  es estadísticamente marginal.
+                  de estilo. No representan porcentaje de aciertos ni Elo secuencial clásico.
                 </p>
               </div>
 
@@ -1113,11 +1316,10 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                   2. ArtificialWatch (Normalización por percentiles entre tableros):
                 </strong>
                 <p>
-                  Dado que distintos benchmarks tienen escalas y techos incompatibles,
                   ArtificialWatch transforma la posición de cada modelo en cada tablero origen en un
                   percentil empírico (0–100) respecto al universo de modelos activos y calcula la
-                  mediana robusta entre capacidades (código, matemáticas, razonamiento, agentes).
-                  Un P85 indica superar al 85% de los modelos evaluados en ese eje.
+                  mediana robusta entre capacidades. Un P85 indica superar al 85% de los modelos
+                  evaluados en ese eje.
                 </p>
               </div>
 
@@ -1128,10 +1330,7 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                 <p>
                   Bifrost filtra exclusivamente las corridas ejecutadas internamente por Epoch AI
                   bajo el marco abierto <code className="mono">Inspect</code> con temperatura,
-                  prompts y límite de tokens controlados, descartando cifras autorreportadas en
-                  blogs comerciales. El término <code className="mono">±stderr</code> cuantifica la
-                  dispersión muestral por pregunta; <code className="mono">FLOP</code> estima las
-                  operaciones totales de coma flotante invertidas durante el preentrenamiento.
+                  prompts y límite de tokens controlados.
                 </p>
               </div>
 
@@ -1141,14 +1340,13 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                 </strong>
                 <p>
                   OpenCharts sintetiza evaluaciones abiertas verificables en un índice compuesto
-                  ponderado y asigna bandas de ranking (ej. <code className="mono">#4–#7</code>) en
-                  lugar de un único ordinal rígido para reflejar la variabilidad entre sub-tareas.
+                  ponderado y asigna bandas de ranking (ej. <code className="mono">#4–#7</code>).
                   Consulta siempre los pesos vigentes en{' '}
                   <a
                     href="https://www.opencharts.com/benchmarks/methodology"
                     target="_blank"
                     rel="noopener noreferrer"
-                    style={{ color: 'var(--accent)', fontWeight: 700 }}
+                    style={{ color: 'var(--accent)', fontWeight: 600 }}
                   >
                     opencharts.com/benchmarks/methodology
                   </a>

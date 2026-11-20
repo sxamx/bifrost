@@ -170,7 +170,7 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
               <h2 className="card-title" style={{ marginBottom: 4 }}>
                 Nueva clave creada para «{revealedKey.name}»
               </h2>
-              <p style={{ color: '#7c4f08', fontWeight: 700, fontSize: '0.92rem' }}>
+              <p style={{ color: 'var(--partial)', fontWeight: 600, fontSize: '0.88rem' }}>
                 Guarda esta clave ahora. Por seguridad no se volverá a mostrar completa.
               </p>
             </div>
@@ -347,10 +347,11 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
 
         <div
           style={{
-            background: '#0b1a2e',
-            color: '#e8f0fa',
-            borderRadius: 14,
-            padding: '16px 18px',
+            background: 'var(--bg)',
+            color: 'var(--fg)',
+            border: '1px solid var(--line)',
+            borderRadius: 9,
+            padding: '14px 16px',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
