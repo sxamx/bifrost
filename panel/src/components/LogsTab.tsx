@@ -152,7 +152,7 @@ export const LogsTab: React.FC = () => {
             </select>
           </div>
 
-          <div className="field" style={{ flex: '2 1 220px', minWidth: 0 }}>
+          <div className="field" style={{ flex: '2 1 280px', minWidth: 0 }}>
             <label htmlFor="log-search-input" className="field-label">
               Búsqueda por texto
             </label>
@@ -160,7 +160,7 @@ export const LogsTab: React.FC = () => {
               id="log-search-input"
               type="search"
               className="input"
-              placeholder="Buscar proveedor, nodo, código HTTP o mensaje…"
+              placeholder="Buscar proveedor, nodo, HTTP o mensaje…"
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
             />
@@ -238,7 +238,9 @@ export const LogsTab: React.FC = () => {
                         <td>
                           <code className="key-prefix-pill">{entry.category}</code>
                         </td>
-                        <td style={{ color: 'var(--fg)', fontWeight: 500 }}>{entry.message}</td>
+                        <td className="wrap-cell" style={{ color: 'var(--fg)', fontWeight: 500 }}>
+                          {entry.message}
+                        </td>
                         <td style={{ textAlign: 'right' }}>
                           {hasMeta ? (
                             <button

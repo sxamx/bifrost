@@ -229,7 +229,7 @@ export const UsersTab: React.FC = () => {
               <h2 className="card-title" style={{ marginBottom: 4 }}>
                 Enlace de invitación de un solo uso listo
               </h2>
-              <p style={{ color: '#7c4f08', fontWeight: 700, fontSize: '0.9rem' }}>
+              <p style={{ color: 'var(--partial)', fontWeight: 600, fontSize: '0.88rem' }}>
                 Envía este enlace a tu colaborador ahora. Por seguridad, el token solo se muestra al
                 generarlo y caduca tras su primer uso.
               </p>

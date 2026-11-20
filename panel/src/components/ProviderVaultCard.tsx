@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
 import type {
   ExitNodeItem,
@@ -14,6 +14,7 @@ interface ProviderVaultCardProps {
   keys: ProviderKeyItem[];
   models: ProviderModelItem[];
   nodes: ExitNodeItem[];
+  onOpenModel?: (fullId: string) => void;
   onRefreshAll: () => Promise<void>;
   onRequestDeleteProvider: (provider: ProviderSummary) => void;
   onRequestDeleteKey: (provider: ProviderSummary, key: ProviderKeyItem) => void;
@@ -64,10 +65,15 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
   keys,
   models,
   nodes,
+  onOpenModel,
   onRefreshAll,
   onRequestDeleteProvider,
   onRequestDeleteKey,
 }) => {
+  const [modelsOpen, setModelsOpen] = useState(models.length <= 6);
+  const [modelSearch, setModelSearch] = useState('');
+  const [visibleModelsLimit, setVisibleModelsLimit] = useState(6);
+
   const [showAddKeyForm, setShowAddKeyForm] = useState(keys.length === 0);
   const [label, setLabel] = useState('');
   const [secret, setSecret] = useState('');
@@ -82,7 +88,6 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
   const [reloadDiff, setReloadDiff] = useState<ModelSyncDiff | null>(null);
   const [detectBanner, setDetectBanner] = useState<string | null>(null);
   const [cardError, setCardError] = useState<string | null>(null);
-  const [showAllModels, setShowAllModels] = useState(false);
 
   const modelsSource = provider.modelsSource ?? provider.manifest?.modelsSource ?? 'api';
   const isStaticSource = modelsSource === 'static';
@@ -261,7 +266,18 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
     }
   }
 
-  const visibleModels = showAllModels ? models : models.slice(0, 8);
+  const filteredModels = useMemo(() => {
+    const q = modelSearch.trim().toLowerCase();
+    if (!q) return models;
+    return models.filter(
+      (m) =>
+        m.name.toLowerCase().includes(q) ||
+        m.fullId.toLowerCase().includes(q) ||
+        m.modelId.toLowerCase().includes(q)
+    );
+  }, [models, modelSearch]);
+
+  const visibleModels = filteredModels.slice(0, visibleModelsLimit);
 
   return (
     <article className="provider-card" aria-labelledby={`prov-heading-${provider.id}`}>
@@ -275,12 +291,12 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
           flexWrap: 'wrap',
         }}
       >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <h2
               id={`prov-heading-${provider.id}`}
               className="card-title"
-              style={{ fontSize: '1.22rem' }}
+              style={{ fontSize: '1.14rem' }}
             >
               {provider.name}
             </h2>
@@ -300,9 +316,9 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
             style={{
               display: 'flex',
               alignItems: 'center',
-              gap: 16,
+              gap: 14,
               flexWrap: 'wrap',
-              fontSize: '0.83rem',
+              fontSize: '0.8rem',
               color: 'var(--sub)',
             }}
           >
@@ -313,11 +329,11 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
             ) : null}
             {isStaticSource && reviewedAt ? (
               <span>
-                Última revisión de ficha estática: <strong>{reviewedAt}</strong>
+                Revisada: <strong>{reviewedAt}</strong>
               </span>
             ) : null}
             {!isStaticSource && provider.lastModelsSyncAt ? (
-              <span>Última sincronización: {formatSyncDate(provider.lastModelsSyncAt)}</span>
+              <span>Sincronizado: {formatSyncDate(provider.lastModelsSyncAt)}</span>
             ) : null}
           </div>
         </div>
@@ -368,10 +384,10 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
           <form
             onSubmit={handleAddKey}
             style={{
-              background: '#ffffff',
+              background: 'var(--panel)',
               border: '1px solid var(--line)',
-              borderRadius: 14,
-              padding: '18px 20px',
+              borderRadius: 9,
+              padding: '16px 18px',
               display: 'flex',
               flexDirection: 'column',
               gap: 14,
@@ -460,8 +476,8 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
           <div
             className="table-wrap"
             style={{
-              background: '#ffffff',
-              borderRadius: 12,
+              background: 'var(--panel)',
+              borderRadius: 9,
               border: '1px solid var(--line)',
             }}
           >
@@ -499,21 +515,34 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
                           <select
                             aria-label={`Nodo asignado para ${k.label}`}
                             className="select-compact"
+                            style={{ maxWidth: 230 }}
+                            title={
+                              assignedNode
+                                ? `${assignedNode.name} (${assignedNode.endpoint})`
+                                : 'Directo / Sin nodo'
+                            }
                             value={k.nodeId ?? ''}
                             disabled={updatingKeyNodeId === k.id}
                             onChange={(e) => handleSelectKeyNode(k, e.target.value)}
                           >
                             <option value="">Directo / Sin nodo</option>
-                            {nodes.map((nodeOpt) => (
-                              <option key={nodeOpt.id} value={nodeOpt.id}>
-                                {nodeOpt.name} ({nodeOpt.endpoint}) —{' '}
-                                {nodeOpt.status === 'online'
+                            {nodes.map((nodeOpt) => {
+                              const statusTxt =
+                                nodeOpt.status === 'online'
                                   ? 'En línea'
                                   : nodeOpt.status === 'unresponsive'
                                     ? 'Sin respuesta'
-                                    : 'Desconectado'}
-                              </option>
-                            ))}
+                                    : 'Desconectado';
+                              return (
+                                <option
+                                  key={nodeOpt.id}
+                                  value={nodeOpt.id}
+                                  title={`${nodeOpt.name} (${nodeOpt.endpoint})`}
+                                >
+                                  {nodeOpt.name} · {statusTxt}
+                                </option>
+                              );
+                            })}
                             {k.nodeId && !assignedNode ? (
                               <option value={k.nodeId}>{k.nodeId} (no disponible)</option>
                             ) : null}
@@ -662,58 +691,128 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
           </p>
         ) : (
           <>
-            <div className="models-grid">
-              {visibleModels.map((m) => (
-                <div key={m.fullId} className="model-tile">
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'flex-start',
-                      justifyContent: 'space-between',
-                      gap: 8,
-                    }}
-                  >
-                    <span style={{ fontWeight: 700, fontSize: '0.88rem', color: 'var(--fg)' }}>
-                      {m.name}
-                    </span>
-                    {m.isFree ? <span className="meta-tag verified">Gratis</span> : null}
-                  </div>
-                  <code
-                    className="mono"
-                    style={{ fontSize: '0.76rem', color: 'var(--sub)', wordBreak: 'break-all' }}
-                  >
-                    {m.fullId}
-                  </code>
-                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 2 }}>
-                    {typeof m.contextLength === 'number' && m.contextLength > 0 ? (
-                      <span className="meta-tag">
-                        {Math.round(m.contextLength / 1024)}k ctx
-                      </span>
-                    ) : null}
-                    {m.capabilities?.tools ? <span className="meta-tag">Tools</span> : null}
-                    {m.capabilities?.reasoning ? (
-                      <span className="meta-tag">Reasoning</span>
-                    ) : null}
-                    {m.capabilities?.structuredOutput ? (
-                      <span className="meta-tag">JSON</span>
-                    ) : null}
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            {models.length > 8 ? (
-              <div>
+            {models.length > 6 ? (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 10,
+                  flexWrap: 'wrap',
+                }}
+              >
                 <button
                   type="button"
-                  className="btn btn-ghost btn-sm"
-                  onClick={() => setShowAllModels((prev) => !prev)}
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setModelsOpen((prev) => !prev)}
                 >
-                  {showAllModels
-                    ? 'Mostrar menos modelos'
-                    : `Ver los ${models.length} modelos detectados`}
+                  {modelsOpen
+                    ? `Ocultar catálogo (${models.length})`
+                    : `Explorar catálogo (${models.length} modelos)`}
                 </button>
+                {modelsOpen ? (
+                  <input
+                    type="search"
+                    className="input"
+                    style={{ maxWidth: 300, padding: '6px 10px', fontSize: '0.82rem' }}
+                    placeholder={`Buscar entre ${models.length} modelos…`}
+                    value={modelSearch}
+                    onChange={(e) => {
+                      setModelSearch(e.target.value);
+                      setVisibleModelsLimit(6);
+                    }}
+                  />
+                ) : null}
               </div>
+            ) : null}
+
+            {modelsOpen ? (
+              <>
+                {filteredModels.length === 0 ? (
+                  <p className="field-hint">
+                    Ningún modelo coincide con «{modelSearch.trim()}».
+                  </p>
+                ) : (
+                  <div className="models-grid">
+                    {visibleModels.map((m) => (
+                      <button
+                        key={m.fullId}
+                        type="button"
+                        className="model-tile clickable-tile"
+                        onClick={() => onOpenModel?.(m.fullId)}
+                        title={`Abrir ficha y métricas de ${m.fullId}`}
+                      >
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'flex-start',
+                            justifyContent: 'space-between',
+                            gap: 8,
+                            width: '100%',
+                          }}
+                        >
+                          <span style={{ fontWeight: 700, fontSize: '0.88rem', color: 'var(--fg)' }}>
+                            {m.name}
+                          </span>
+                          {m.isFree ? <span className="meta-tag verified">Gratis</span> : null}
+                        </div>
+                        <code
+                          className="mono"
+                          style={{ fontSize: '0.76rem', color: 'var(--sub)', wordBreak: 'break-all' }}
+                        >
+                          {m.fullId}
+                        </code>
+                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 2 }}>
+                          {typeof m.contextLength === 'number' && m.contextLength > 0 ? (
+                            <span className="meta-tag">
+                              {Math.round(m.contextLength / 1024)}k ctx
+                            </span>
+                          ) : null}
+                          {m.capabilities?.tools ? <span className="meta-tag">Tools</span> : null}
+                          {m.capabilities?.reasoning ? (
+                            <span className="meta-tag">Reasoning</span>
+                          ) : null}
+                          {m.capabilities?.structuredOutput ? (
+                            <span className="meta-tag">JSON</span>
+                          ) : null}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {filteredModels.length > visibleModelsLimit ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => setVisibleModelsLimit((prev) => prev + 12)}
+                    >
+                      Mostrar más (+{Math.min(12, filteredModels.length - visibleModelsLimit)} de{' '}
+                      {filteredModels.length - visibleModelsLimit} restantes)
+                    </button>
+                    {visibleModelsLimit > 6 ? (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setVisibleModelsLimit(6)}
+                      >
+                        Contraer lista
+                      </button>
+                    ) : null}
+                  </div>
+                ) : visibleModelsLimit > 6 && filteredModels.length > 6 ? (
+                  <div>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      onClick={() => setVisibleModelsLimit(6)}
+                    >
+                      Mostrar menos modelos
+                    </button>
+                  </div>
+                ) : null}
+              </>
             ) : null}
           </>
         )}

@@ -322,9 +322,9 @@ export const PlaygroundTab: React.FC = () => {
                     {turn.reasoningContent ? (
                       <details
                         style={{
-                          background: '#ffffff',
+                          background: 'var(--panel)',
                           border: '1px solid var(--line)',
-                          borderRadius: 10,
+                          borderRadius: 8,
                           padding: '8px 12px',
                           fontSize: '0.82rem',
                           color: 'var(--sub)',

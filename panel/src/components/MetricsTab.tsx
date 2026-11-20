@@ -15,14 +15,24 @@ import { InfoTip } from './InfoTip';
 
 interface MetricsTabProps {
   isAdmin: boolean;
+  onOpenModel?: (modelIdOrQuery: string) => void;
+  onOpenProvider?: (providerId: string) => void;
 }
 
 const PERCENTILE_SERIES = [
-  { key: 'p50' as const, label: 'P50', color: '#0b6b5c' },
-  { key: 'p75' as const, label: 'P75', color: '#0057ff' },
-  { key: 'p90' as const, label: 'P90', color: '#6b4eff' },
-  { key: 'p95' as const, label: 'P95', color: '#e0a040' },
-  { key: 'p99' as const, label: 'P99', color: '#c0392b' },
+  { key: 'p50' as const, label: 'P50', color: 'var(--c-lat-50)' },
+  { key: 'p75' as const, label: 'P75', color: 'var(--c-lat-75)' },
+  { key: 'p90' as const, label: 'P90', color: 'var(--c-lat-90)' },
+  { key: 'p95' as const, label: 'P95', color: 'var(--c-lat-95)' },
+  { key: 'p99' as const, label: 'P99', color: 'var(--c-lat-99)' },
+];
+
+const THROUGHPUT_SERIES = [
+  { key: 'p50' as const, label: 'P50', color: 'var(--c-tp-50)' },
+  { key: 'p75' as const, label: 'P75', color: 'var(--c-tp-75)' },
+  { key: 'p90' as const, label: 'P90', color: 'var(--c-tp-90)' },
+  { key: 'p95' as const, label: 'P95', color: 'var(--c-tp-95)' },
+  { key: 'p99' as const, label: 'P99', color: 'var(--c-tp-99)' },
 ];
 
 function formatBucketTimeLabel(ts: string | number, label?: string): string {
@@ -45,13 +55,36 @@ function classifyUptimeBar(uptimePct: number | null): 'notraffic' | 'ok' | 'part
   return 'err';
 }
 
+function formatCompactCount(val: number): string {
+  if (val >= 1_000_000) return `${(val / 1_000_000).toFixed(val >= 10_000_000 ? 0 : 2)}M`;
+  if (val >= 1_000) return `${Math.round(val / 1_000)}K`;
+  return String(val);
+}
+
 function errorBarColor(ratePct: number): string {
   if (ratePct <= 0) return 'var(--ok)';
   if (ratePct < 5) return 'var(--partial)';
   return 'var(--err)';
 }
 
-export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
+function buildSmoothSvgPath(xs: number[], ys: number[]): string {
+  if (xs.length === 0) return '';
+  if (xs.length === 1) return `M ${xs[0].toFixed(1)},${ys[0].toFixed(1)}`;
+  let d = `M ${xs[0].toFixed(1)},${ys[0].toFixed(1)}`;
+  for (let i = 0; i < xs.length - 1; i++) {
+    const cx = ((xs[i] + xs[i + 1]) / 2).toFixed(1);
+    d += ` C ${cx},${ys[i].toFixed(1)} ${cx},${ys[i + 1].toFixed(1)} ${xs[i + 1].toFixed(1)},${ys[
+      i + 1
+    ].toFixed(1)}`;
+  }
+  return d;
+}
+
+export const MetricsTab: React.FC<MetricsTabProps> = ({
+  isAdmin,
+  onOpenModel,
+  onOpenProvider,
+}) => {
   const [latencyData, setLatencyData] = useState<LatencyMetricsData>({ buckets: [] });
   const [speedData, setSpeedData] = useState<SpeedMetricsData>({
     models: [],
@@ -77,8 +110,9 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
   });
   const [activityLoading, setActivityLoading] = useState(true);
 
-  // Interactive hover states (zero cursor:help — pure pointer + floating white tooltips)
+  // Interactive hover & isolation states
   const [hoveredLatencyIndex, setHoveredLatencyIndex] = useState<number | null>(null);
+  const [isolatedPercentile, setIsolatedPercentile] = useState<string | null>(null);
   const [hoveredSpeedModel, setHoveredSpeedModel] = useState<ModelSpeedEntry | null>(null);
   const [hoveredUptimeCell, setHoveredUptimeCell] = useState<{
     providerId: string;
@@ -87,6 +121,9 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
     day: UptimeDayCell;
   } | null>(null);
   const [hoveredActivityIndex, setHoveredActivityIndex] = useState<number | null>(null);
+  const [isolatedTokenSeries, setIsolatedTokenSeries] = useState<
+    'prompt' | 'completion' | 'reasoning' | null
+  >(null);
 
   const loadTelemetry = useCallback(async () => {
     setCoreLoading(true);
@@ -133,7 +170,6 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
     void loadActivity();
   }, [loadActivity]);
 
-  // Filtered activity items when user narrows down to a specific model/provider/user
   const visibleActivityItems = useMemo(() => {
     if (selectedEntityFilter === 'ALL') return activityData.items;
     return activityData.items.filter((it) => it.key === selectedEntityFilter);
@@ -154,11 +190,11 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
 
   // SVG Geometry for HU-18 Latency Percentiles Chart
   const svgW = 860;
-  const svgH = 260;
+  const svgH = 250;
   const padL = 56;
   const padR = 24;
-  const padT = 20;
-  const padB = 36;
+  const padT = 18;
+  const padB = 34;
   const plotW = svgW - padL - padR;
   const plotH = svgH - padT - padB;
 
@@ -181,20 +217,36 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
     return padT + plotH - (clamped / maxLatencyMs) * plotH;
   }
 
-  function buildPolylinePoints(key: keyof Pick<LatencyBucketPoint, 'p50' | 'p75' | 'p90' | 'p95' | 'p99'>): string {
-    return latencyBuckets
-      .map((b, idx) => `${bucketX(idx).toFixed(1)},${latencyY(b[key]).toFixed(1)}`)
-      .join(' ');
+  function buildCurvePath(
+    key: keyof Pick<LatencyBucketPoint, 'p50' | 'p75' | 'p90' | 'p95' | 'p99'>
+  ): string {
+    const xs = latencyBuckets.map((_, idx) => bucketX(idx));
+    const ys = latencyBuckets.map((b) => latencyY(b[key]));
+    return buildSmoothSvgPath(xs, ys);
   }
+
+  const latencyAvgs = useMemo(() => {
+    if (latencyBuckets.length === 0) {
+      return { p50: 0, p75: 0, p90: 0, p95: 0, p99: 0 };
+    }
+    const n = latencyBuckets.length;
+    return {
+      p50: Math.round(latencyBuckets.reduce((s, b) => s + b.p50, 0) / n),
+      p75: Math.round(latencyBuckets.reduce((s, b) => s + b.p75, 0) / n),
+      p90: Math.round(latencyBuckets.reduce((s, b) => s + b.p90, 0) / n),
+      p95: Math.round(latencyBuckets.reduce((s, b) => s + b.p95, 0) / n),
+      p99: Math.round(latencyBuckets.reduce((s, b) => s + b.p99, 0) / n),
+    };
+  }, [latencyBuckets]);
 
   const activeLatencyBucket =
     hoveredLatencyIndex !== null ? latencyBuckets[hoveredLatencyIndex] ?? null : null;
 
   // SVG Geometry for HU-20b Stacked Token Activity Chart
   const actSvgW = 860;
-  const actSvgH = 250;
+  const actSvgH = 240;
   const actPlotW = actSvgW - padL - padR;
-  const actPlotH = actSvgH - padT - 44;
+  const actPlotH = actSvgH - padT - 40;
 
   const maxActivityTokens = useMemo(() => {
     let m = 10;
@@ -211,11 +263,11 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
     <>
       <header className="page-header">
         <div>
-          <h1 className="page-title">Métricas, Uptime y Actividad</h1>
+          <h1 className="page-title">Métricas, Percentiles y Disponibilidad</h1>
           <p className="page-subtitle">
-            Telemetría calculada sobre tráfico real (sin pings artificiales que consuman cuota
-            gratuita): percentiles completos <code className="mono">P50–P99</code>, disponibilidad
-            de 60 días y desglose de tokens.
+            Telemetría calculada sobre tráfico real: curvas multi-percentil{' '}
+            <code className="mono">P50–P99</code>, disponibilidad de 60 días y desglose de tokens
+            con aislamiento interactivo por serie.
           </p>
         </div>
 
@@ -235,8 +287,8 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
       <section className="card" aria-labelledby="uptime-section-title">
         <div className="card-header">
           <h2 id="uptime-section-title" className="card-title">
-            Disponibilidad por proveedor (últimos 60 días) y errores de capacidades (7d)
-            <InfoTip text="Basado únicamente en peticiones reales de tus aplicaciones. Los días sin tráfico se muestran en gris neutro y nunca penalizan el porcentaje como 0%. Verde ≥ 99%, Ámbar 95–99%, Rojo < 95%." />
+            Disponibilidad por proveedor (60 días) y errores de capacidades (7d)
+            <InfoTip text="Basado únicamente en peticiones reales de tus aplicaciones. Los días sin tráfico se muestran en tono neutro y nunca penalizan el porcentaje como 0%. Verde ≥ 99%, Ámbar 95–99%, Rojo < 95%." />
           </h2>
 
           <div className="pct-legend-row">
@@ -252,7 +304,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
             <span className="pct-legend-item">
               <span
                 className="status-dot"
-                style={{ background: '#d3dfef', border: '1px solid var(--line)' }}
+                style={{ background: 'var(--line-strong)', border: '1px solid var(--line)' }}
               />{' '}
               Sin tráfico
             </span>
@@ -262,14 +314,14 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
         {coreLoading && uptimeList.length === 0 ? (
           <p className="field-hint">Calculando serie de 60 días…</p>
         ) : uptimeList.length === 0 ? (
-          <div className="empty-state" style={{ padding: '26px 16px' }}>
+          <div className="empty-state" style={{ padding: '24px 16px' }}>
             <p className="field-hint">
               Aún no hay proveedores con historial registrado. Al instalar proveedores verás aquí su
               tira de 60 días UTC y sus tasas de error en herramientas y salidas JSON.
             </p>
           </div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {uptimeList.map((prov) => {
               const hoveredHere =
                 hoveredUptimeCell && hoveredUptimeCell.providerId === prov.providerId
@@ -288,24 +340,24 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                     }}
                   >
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                      <strong style={{ fontSize: '1.02rem', color: 'var(--fg)' }}>
+                      <strong style={{ fontSize: '0.96rem', color: 'var(--fg)' }}>
                         {prov.providerName}
                       </strong>
                       <code className="key-prefix-pill">{prov.providerId}</code>
                     </div>
 
                     <span
-                      className="font-display"
+                      className="mono"
                       style={{
-                        fontSize: '0.96rem',
-                        fontWeight: 700,
+                        fontSize: '0.88rem',
+                        fontWeight: 600,
                         color:
                           prov.overallUptimePct === null
                             ? 'var(--sub)'
                             : prov.overallUptimePct >= 99
                               ? 'var(--ok)'
                               : prov.overallUptimePct >= 95
-                                ? '#8a5607'
+                                ? 'var(--partial)'
                                 : 'var(--err)',
                       }}
                     >
@@ -359,40 +411,50 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                     style={{
                       display: 'flex',
                       justifyContent: 'space-between',
-                      fontSize: '0.75rem',
-                      color: 'var(--sub)',
+                      fontSize: '0.73rem',
+                      color: 'var(--fg-3)',
                     }}
                   >
                     <span>Hace 60 días ({prov.days[0]?.date ?? ''})</span>
+                    <span>Pasa el cursor por cada día para inspeccionar tráfico</span>
                     <span>Hoy UTC ({prov.days[prov.days.length - 1]?.date ?? ''})</span>
                   </div>
 
-                  {/* Floating white tooltip for hovered day bar */}
+                  {/* Floating tooltip for hovered day bar */}
                   {hoveredHere ? (
                     <div
                       className="floating-white-tooltip"
                       style={{
                         position: 'absolute',
-                        top: 56,
+                        top: 48,
                         left: `${Math.min(
-                          74,
+                          72,
                           Math.max(4, (hoveredHere.dayIndex / 60) * 100)
                         )}%`,
                       }}
                     >
-                      <div className="mono" style={{ fontWeight: 700, marginBottom: 4 }}>
+                      <div
+                        className="mono"
+                        style={{
+                          fontWeight: 600,
+                          marginBottom: 4,
+                          paddingBottom: 4,
+                          borderBottom: '1px solid var(--tooltip-line)',
+                        }}
+                      >
                         {hoveredHere.day.date} (UTC)
                       </div>
-                      <div>
-                        Disponibilidad:{' '}
-                        <strong>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+                        <span style={{ color: 'var(--tooltip-sub)' }}>Disponibilidad</span>
+                        <strong className="mono">
                           {hoveredHere.day.uptimePct === null
-                            ? 'Sin tráfico registrado'
+                            ? 'Sin tráfico'
                             : `${hoveredHere.day.uptimePct.toFixed(2)}%`}
                         </strong>
                       </div>
-                      <div style={{ color: 'var(--sub)' }}>
-                        Peticiones reales: <strong>{hoveredHere.day.totalRequests}</strong>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+                        <span style={{ color: 'var(--tooltip-sub)' }}>Peticiones reales</span>
+                        <strong className="mono">{hoveredHere.day.totalRequests}</strong>
                       </div>
                     </div>
                   ) : null}
@@ -408,11 +470,11 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'space-between',
-                          fontSize: '0.82rem',
+                          fontSize: '0.8rem',
                         }}
                       >
-                        <span style={{ fontWeight: 700, color: 'var(--sub)' }}>
-                          Errores en Tools (7d)
+                        <span style={{ fontWeight: 500, color: 'var(--sub)' }}>
+                          Tool call error rate (7d)
                         </span>
                         <strong className="mono">{prov.toolErrorRate7d.toFixed(1)}%</strong>
                       </div>
@@ -436,11 +498,11 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'space-between',
-                          fontSize: '0.82rem',
+                          fontSize: '0.8rem',
                         }}
                       >
-                        <span style={{ fontWeight: 700, color: 'var(--sub)' }}>
-                          Errores en Structured Output (7d)
+                        <span style={{ fontWeight: 500, color: 'var(--sub)' }}>
+                          Structured output error rate (7d)
                         </span>
                         <strong className="mono">
                           {prov.structuredErrorRate7d.toFixed(1)}%
@@ -464,17 +526,22 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
         )}
       </section>
 
-      {/* 2. HU-18: Latency Percentiles (P50, P75, P90, P95, P99 TOGETHER) */}
+      {/* 2. HU-18: Latency Percentiles (P50, P75, P90, P95, P99 TOGETHER + Interactive Legend Table) */}
       <section className="card" aria-labelledby="latency-section-title">
         <div className="card-header">
           <h2 id="latency-section-title" className="card-title">
-            Latencia de extremo a extremo por percentiles (ms)
-            <InfoTip text="P50 es la mediana (50% de peticiones más rápidas que ese valor), mientras que P90, P95 y P99 revelan las colas lentas o congestión puntual en proveedores gratuitos." />
+            Latencia de extremo a extremo por percentiles (P50 – P99)
+            <InfoTip text="Pasa el cursor sobre la gráfica o sobre cualquier fila P50–P99 debajo para aislar esa curva e inspeccionar valores exactos." />
           </h2>
 
           <div className="pct-legend-row">
             {PERCENTILE_SERIES.map((s) => (
-              <span key={s.key} className="pct-legend-item">
+              <span
+                key={s.key}
+                className="pct-legend-item"
+                onMouseEnter={() => setIsolatedPercentile(s.key)}
+                onMouseLeave={() => setIsolatedPercentile(null)}
+              >
                 <span className="pct-swatch" style={{ background: s.color }} />
                 {s.label}
               </span>
@@ -483,7 +550,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
         </div>
 
         {latencyBuckets.length === 0 ? (
-          <div className="empty-state" style={{ padding: '28px 16px' }}>
+          <div className="empty-state" style={{ padding: '26px 16px' }}>
             <p className="field-hint">
               Aún no hay muestras de latencia registradas. En cuanto fluyan peticiones por{' '}
               <code className="mono">/v1/chat/completions</code>, verás las 5 curvas{' '}
@@ -491,189 +558,249 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
             </p>
           </div>
         ) : (
-          <div
-            className="chart-stage"
-            onMouseLeave={() => setHoveredLatencyIndex(null)}
-          >
-            <svg
-              viewBox={`0 0 ${svgW} ${svgH}`}
-              style={{ width: '100%', height: 'auto', display: 'block', overflow: 'visible' }}
-              role="img"
-              aria-label="Gráfico temporal de percentiles de latencia P50, P75, P90, P95 y P99"
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div
+              className="chart-stage"
+              style={{ cursor: 'crosshair' }}
+              onMouseLeave={() => setHoveredLatencyIndex(null)}
             >
-              {/* Horizontal grid lines */}
-              {[0, 0.25, 0.5, 0.75, 1].map((frac) => {
-                const val = Math.round(maxLatencyMs * frac);
-                const y = latencyY(val);
-                return (
-                  <g key={frac}>
-                    <line
-                      x1={padL}
-                      y1={y}
-                      x2={svgW - padR}
-                      y2={y}
-                      stroke="#dce7f5"
-                      strokeDasharray={frac === 0 ? undefined : '4 4'}
+              <div className="chart-scroll-x">
+                <svg
+                  className="chart-svg-responsive"
+                  viewBox={`0 0 ${svgW} ${svgH}`}
+                  style={{ width: '100%', height: 'auto', display: 'block', overflow: 'visible' }}
+                  role="img"
+                  aria-label="Gráfico temporal de percentiles de latencia P50, P75, P90, P95 y P99"
+                >
+                {/* Horizontal dotted grid lines */}
+                {[0, 0.25, 0.5, 0.75, 1].map((frac) => {
+                  const val = Math.round(maxLatencyMs * frac);
+                  const y = latencyY(val);
+                  return (
+                    <g key={frac}>
+                      <line
+                        x1={padL}
+                        y1={y}
+                        x2={svgW - padR}
+                        y2={y}
+                        stroke="var(--line)"
+                        strokeDasharray={frac === 0 ? undefined : '2 3'}
+                      />
+                      <text
+                        x={padL - 8}
+                        y={y + 4}
+                        textAnchor="end"
+                        fontSize="10.5"
+                        fill="var(--fg-3)"
+                        fontFamily="var(--font-mono)"
+                      >
+                        {val}ms
+                      </text>
+                    </g>
+                  );
+                })}
+
+                {/* 5 Smooth Percentile Curves */}
+                {PERCENTILE_SERIES.map((serie) => {
+                  const isDimmed =
+                    isolatedPercentile !== null && isolatedPercentile !== serie.key;
+                  const isHighlighted = isolatedPercentile === serie.key;
+                  return (
+                    <path
+                      key={serie.key}
+                      className="perf-line"
+                      fill="none"
+                      stroke={serie.color}
+                      strokeWidth={isHighlighted ? 2.6 : 1.75}
+                      opacity={isDimmed ? 0.18 : 1}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d={buildCurvePath(serie.key)}
                     />
+                  );
+                })}
+
+                {/* Active vertical crosshair + dots on all 5 percentiles */}
+                {hoveredLatencyIndex !== null && activeLatencyBucket ? (
+                  <g>
+                    <line
+                      x1={bucketX(hoveredLatencyIndex)}
+                      y1={padT}
+                      x2={bucketX(hoveredLatencyIndex)}
+                      y2={padT + plotH}
+                      stroke="var(--fg-3)"
+                      strokeWidth="1"
+                      strokeDasharray="2 2"
+                    />
+                    {PERCENTILE_SERIES.map((serie) => (
+                      <circle
+                        key={serie.key}
+                        cx={bucketX(hoveredLatencyIndex)}
+                        cy={latencyY(activeLatencyBucket[serie.key])}
+                        r={4}
+                        fill={serie.color}
+                        stroke="var(--panel)"
+                        strokeWidth={1.8}
+                      />
+                    ))}
+                  </g>
+                ) : null}
+
+                {/* X-axis labels */}
+                {latencyBuckets.map((b, idx) => {
+                  const showLabel =
+                    latencyBuckets.length <= 6 ||
+                    idx === 0 ||
+                    idx === Math.floor(latencyBuckets.length / 2) ||
+                    idx === latencyBuckets.length - 1;
+                  if (!showLabel) return null;
+                  return (
                     <text
-                      x={padL - 8}
-                      y={y + 4}
-                      textAnchor="end"
-                      fontSize="11"
-                      fill="#2c4259"
+                      key={`lbl-${idx}`}
+                      x={bucketX(idx)}
+                      y={svgH - 8}
+                      textAnchor={
+                        idx === 0
+                          ? 'start'
+                          : idx === latencyBuckets.length - 1
+                            ? 'end'
+                            : 'middle'
+                      }
+                      fontSize="10.5"
+                      fill="var(--fg-3)"
                       fontFamily="var(--font-mono)"
                     >
-                      {val}ms
+                      {formatBucketTimeLabel(b.timestamp, b.label)}
                     </text>
-                  </g>
-                );
-              })}
+                  );
+                })}
 
-              {/* 5 Percentile Polylines rendered TOGETHER */}
-              {PERCENTILE_SERIES.map((serie) => (
-                <polyline
-                  key={serie.key}
-                  fill="none"
-                  stroke={serie.color}
-                  strokeWidth={serie.key === 'p50' || serie.key === 'p95' ? 2.6 : 2}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  points={buildPolylinePoints(serie.key)}
-                />
-              ))}
-
-              {/* Active vertical guide + dots on all 5 percentiles */}
-              {hoveredLatencyIndex !== null && activeLatencyBucket ? (
-                <g>
-                  <line
-                    x1={bucketX(hoveredLatencyIndex)}
-                    y1={padT}
-                    x2={bucketX(hoveredLatencyIndex)}
-                    y2={padT + plotH}
-                    stroke="var(--accent)"
-                    strokeWidth="1.5"
-                    strokeDasharray="3 3"
-                  />
-                  {PERCENTILE_SERIES.map((serie) => (
-                    <circle
-                      key={serie.key}
-                      cx={bucketX(hoveredLatencyIndex)}
-                      cy={latencyY(activeLatencyBucket[serie.key])}
-                      r={4.5}
-                      fill="#ffffff"
-                      stroke={serie.color}
-                      strokeWidth={2.5}
+                {/* Interactive hit columns */}
+                {latencyBuckets.map((_, idx) => {
+                  const colWidth =
+                    latencyBuckets.length > 1 ? plotW / latencyBuckets.length : plotW;
+                  const xCenter = bucketX(idx);
+                  return (
+                    <rect
+                      key={`hit-${idx}`}
+                      x={Math.max(padL, xCenter - colWidth / 2)}
+                      y={padT}
+                      width={colWidth}
+                      height={plotH}
+                      fill="transparent"
+                      style={{ cursor: 'crosshair' }}
+                      onMouseEnter={() => setHoveredLatencyIndex(idx)}
+                      onClick={() => setHoveredLatencyIndex(idx)}
                     />
-                  ))}
-                </g>
-              ) : null}
-
-              {/* X-axis first / middle / last labels */}
-              {latencyBuckets.map((b, idx) => {
-                const showLabel =
-                  latencyBuckets.length <= 6 ||
-                  idx === 0 ||
-                  idx === Math.floor(latencyBuckets.length / 2) ||
-                  idx === latencyBuckets.length - 1;
-                if (!showLabel) return null;
-                return (
-                  <text
-                    key={`lbl-${idx}`}
-                    x={bucketX(idx)}
-                    y={svgH - 10}
-                    textAnchor={
-                      idx === 0
-                        ? 'start'
-                        : idx === latencyBuckets.length - 1
-                          ? 'end'
-                          : 'middle'
-                    }
-                    fontSize="11"
-                    fill="#2c4259"
-                    fontFamily="var(--font-mono)"
-                  >
-                    {formatBucketTimeLabel(b.timestamp, b.label)}
-                  </text>
-                );
-              })}
-
-              {/* Interactive pointer hit columns across every bucket */}
-              {latencyBuckets.map((_, idx) => {
-                const colWidth =
-                  latencyBuckets.length > 1 ? plotW / latencyBuckets.length : plotW;
-                const xCenter = bucketX(idx);
-                return (
-                  <rect
-                    key={`hit-${idx}`}
-                    x={Math.max(padL, xCenter - colWidth / 2)}
-                    y={padT}
-                    width={colWidth}
-                    height={plotH}
-                    fill="transparent"
-                    style={{ cursor: 'pointer' }}
-                    onMouseEnter={() => setHoveredLatencyIndex(idx)}
-                    onClick={() => setHoveredLatencyIndex(idx)}
-                  />
-                );
-              })}
-            </svg>
-
-            {/* Floating White Tooltip showing ALL 5 percentiles simultaneously */}
-            {hoveredLatencyIndex !== null && activeLatencyBucket ? (
-              <div
-                className="floating-white-tooltip"
-                style={{
-                  position: 'absolute',
-                  top: 12,
-                  left:
-                    hoveredLatencyIndex > latencyBuckets.length / 2 ? '16px' : undefined,
-                  right:
-                    hoveredLatencyIndex <= latencyBuckets.length / 2 ? '16px' : undefined,
-                }}
-              >
-                <div className="mono" style={{ fontWeight: 700, marginBottom: 6 }}>
-                  {formatBucketTimeLabel(
-                    activeLatencyBucket.timestamp,
-                    activeLatencyBucket.label
-                  )}
-                </div>
-                {PERCENTILE_SERIES.map((serie) => (
-                  <div
-                    key={serie.key}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      gap: 16,
-                    }}
-                  >
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                      <span
-                        className="pct-swatch"
-                        style={{ background: serie.color, height: 8, width: 8, borderRadius: '50%' }}
-                      />
-                      <strong>{serie.label}</strong>
-                    </span>
-                    <span className="mono">
-                      {Math.round(activeLatencyBucket[serie.key]).toLocaleString('es-ES')} ms
-                    </span>
-                  </div>
-                ))}
-                {typeof activeLatencyBucket.count === 'number' ? (
-                  <div
-                    style={{
-                      marginTop: 6,
-                      paddingTop: 5,
-                      borderTop: '1px solid #e6eef8',
-                      color: 'var(--sub)',
-                      fontSize: '0.76rem',
-                    }}
-                  >
-                    Muestras: {activeLatencyBucket.count}
-                  </div>
-                ) : null}
+                  );
+                })}
+                </svg>
               </div>
-            ) : null}
+
+              {/* Floating Dark/Glass Tooltip showing ALL 5 percentiles simultaneously */}
+              {hoveredLatencyIndex !== null && activeLatencyBucket ? (
+                <div
+                  className="floating-white-tooltip"
+                  style={{
+                    position: 'absolute',
+                    top: 10,
+                    left:
+                      hoveredLatencyIndex > latencyBuckets.length / 2 ? '16px' : undefined,
+                    right:
+                      hoveredLatencyIndex <= latencyBuckets.length / 2 ? '16px' : undefined,
+                  }}
+                >
+                  <div
+                    className="mono"
+                    style={{
+                      fontWeight: 600,
+                      marginBottom: 6,
+                      paddingBottom: 5,
+                      borderBottom: '1px solid var(--tooltip-line)',
+                    }}
+                  >
+                    {formatBucketTimeLabel(
+                      activeLatencyBucket.timestamp,
+                      activeLatencyBucket.label
+                    )}
+                  </div>
+                  {PERCENTILE_SERIES.map((serie) => (
+                    <div
+                      key={serie.key}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 16,
+                      }}
+                    >
+                      <span
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          color: 'var(--tooltip-sub)',
+                        }}
+                      >
+                        <span
+                          className="pct-swatch"
+                          style={{ background: serie.color }}
+                        />
+                        {serie.label}
+                      </span>
+                      <span className="mono" style={{ fontWeight: 600 }}>
+                        {Math.round(activeLatencyBucket[serie.key]).toLocaleString('es-ES')} ms
+                      </span>
+                    </div>
+                  ))}
+                  {typeof activeLatencyBucket.count === 'number' ? (
+                    <div
+                      style={{
+                        marginTop: 6,
+                        paddingTop: 5,
+                        borderTop: '1px solid var(--tooltip-line)',
+                        color: 'var(--tooltip-sub)',
+                        fontSize: '0.73rem',
+                      }}
+                    >
+                      Muestras en ventana: {activeLatencyBucket.count}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+
+            {/* Interactive 5-Row Percentile Legend Table (OpenRouter Performance layout) */}
+            <div className="p-legend">
+              {PERCENTILE_SERIES.map((serie) => {
+                const liveVal = activeLatencyBucket
+                  ? Math.round(activeLatencyBucket[serie.key])
+                  : latencyAvgs[serie.key];
+                const modeLabel = activeLatencyBucket
+                  ? formatBucketTimeLabel(
+                      activeLatencyBucket.timestamp,
+                      activeLatencyBucket.label
+                    )
+                  : 'Avg';
+                return (
+                  <div
+                    key={`leg-row-${serie.key}`}
+                    className="p-row"
+                    onMouseEnter={() => setIsolatedPercentile(serie.key)}
+                    onMouseLeave={() => setIsolatedPercentile(null)}
+                  >
+                    <span className="p-left">
+                      <i className="p-dot" style={{ background: serie.color }} />
+                      {serie.label}
+                    </span>
+                    <span className="p-right">
+                      <span>{modeLabel}</span>{' '}
+                      <strong>{liveVal.toLocaleString('es-ES')} ms</strong>
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
       </section>
@@ -682,8 +809,8 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
       <section className="card" aria-labelledby="speed-section-title">
         <div className="card-header">
           <h2 id="speed-section-title" className="card-title">
-            Velocidad real (TTFT y Tokens/s) y Aciertos de Caché
-            <InfoTip text="Pasa el cursor sobre cualquier modelo para inspeccionar simultáneamente los 5 percentiles (P50, P75, P90, P95, P99) de Time to First Token y velocidad de generación." />
+            Velocidad por modelo (Throughput tok/s y Latencia TTFT P50–P99) y Caché
+            <InfoTip text="Pasa el cursor sobre cualquier tarjeta de modelo para inspeccionar simultáneamente los 5 percentiles (P50, P75, P90, P95, P99) de Time to First Token y velocidad de generación." />
           </h2>
         </div>
 
@@ -694,10 +821,10 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
             </p>
           </div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
             {speedData.models.length > 0 ? (
               <div
-                style={{ display: 'flex', flexDirection: 'column', gap: 12 }}
+                style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
                 onMouseLeave={() => setHoveredSpeedModel(null)}
               >
                 {speedData.models.map((m) => {
@@ -706,9 +833,18 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                     <div
                       key={m.id}
                       className="speed-row-card"
+                      role={onOpenModel ? 'button' : undefined}
                       tabIndex={0}
+                      style={onOpenModel ? { cursor: 'pointer' } : undefined}
                       onMouseEnter={() => setHoveredSpeedModel(m)}
                       onFocus={() => setHoveredSpeedModel(m)}
+                      onClick={() => onOpenModel?.(m.modelFullId)}
+                      onKeyDown={(e) => {
+                        if (onOpenModel && (e.key === 'Enter' || e.key === ' ')) {
+                          e.preventDefault();
+                          onOpenModel(m.modelFullId);
+                        }
+                      }}
                     >
                       <div
                         style={{
@@ -722,7 +858,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                       >
                         <code
                           className="mono"
-                          style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--fg)' }}
+                          style={{ fontWeight: 600, fontSize: '0.88rem', color: 'var(--fg)' }}
                         >
                           {m.modelFullId}
                         </code>
@@ -735,32 +871,48 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                         style={{
                           display: 'grid',
                           gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))',
-                          gap: 12,
+                          gap: 14,
                         }}
                       >
                         <div>
-                          <div className="field-hint" style={{ fontWeight: 700, marginBottom: 5 }}>
-                            TTFT (ms) · P50 → P99
+                          <div className="field-hint" style={{ fontWeight: 600, marginBottom: 6 }}>
+                            Throughput (tok/s) · P50 → P99
                           </div>
                           <div className="pct-pill-group">
-                            {PERCENTILE_SERIES.map((s) => (
+                            {THROUGHPUT_SERIES.map((s) => (
                               <span key={s.key} className="pct-chip">
+                                <i
+                                  className="p-dot"
+                                  style={{
+                                    background: s.color,
+                                    display: 'inline-block',
+                                    marginRight: 5,
+                                  }}
+                                />
                                 <strong>{s.label}</strong>
-                                {Math.round(m.ttftMs[s.key])}ms
+                                {m.tokensPerSec[s.key].toFixed(1)}
                               </span>
                             ))}
                           </div>
                         </div>
 
                         <div>
-                          <div className="field-hint" style={{ fontWeight: 700, marginBottom: 5 }}>
-                            Velocidad (tok/s) · P50 → P99
+                          <div className="field-hint" style={{ fontWeight: 600, marginBottom: 6 }}>
+                            Latencia TTFT (ms) · P50 → P99
                           </div>
                           <div className="pct-pill-group">
                             {PERCENTILE_SERIES.map((s) => (
                               <span key={s.key} className="pct-chip">
+                                <i
+                                  className="p-dot"
+                                  style={{
+                                    background: s.color,
+                                    display: 'inline-block',
+                                    marginRight: 5,
+                                  }}
+                                />
                                 <strong>{s.label}</strong>
-                                {m.tokensPerSec[s.key].toFixed(1)}
+                                {Math.round(m.ttftMs[s.key])}ms
                               </span>
                             ))}
                           </div>
@@ -777,7 +929,15 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                             width: 'min(290px, calc(100vw - 44px))',
                           }}
                         >
-                          <div className="mono" style={{ fontWeight: 700, marginBottom: 6 }}>
+                          <div
+                            className="mono"
+                            style={{
+                              fontWeight: 600,
+                              marginBottom: 6,
+                              paddingBottom: 5,
+                              borderBottom: '1px solid var(--tooltip-line)',
+                            }}
+                          >
                             {m.modelFullId}
                           </div>
                           {PERCENTILE_SERIES.map((s) => (
@@ -789,13 +949,36 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                                 gap: 16,
                               }}
                             >
-                              <strong>{s.label}</strong>
-                              <span className="mono">
+                              <span
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: 6,
+                                  color: 'var(--tooltip-sub)',
+                                }}
+                              >
+                                <i className="p-dot" style={{ background: s.color }} />
+                                {s.label}
+                              </span>
+                              <span className="mono" style={{ fontWeight: 600 }}>
                                 {Math.round(m.ttftMs[s.key])} ms ·{' '}
                                 {m.tokensPerSec[s.key].toFixed(1)} tok/s
                               </span>
                             </div>
                           ))}
+                          {onOpenModel ? (
+                            <div
+                              style={{
+                                marginTop: 6,
+                                paddingTop: 5,
+                                borderTop: '1px solid var(--tooltip-line)',
+                                fontSize: '0.72rem',
+                                color: 'var(--tooltip-sub)',
+                              }}
+                            >
+                              Clic para abrir ficha del modelo →
+                            </div>
+                          ) : null}
                         </div>
                       ) : null}
                     </div>
@@ -807,12 +990,26 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
             {/* Provider Cache Hit Rate % */}
             {speedData.cacheByProvider.length > 0 ? (
               <div>
-                <h3 style={{ fontSize: '0.96rem', marginBottom: 12 }}>
-                  Tasa de aciertos de caché de prompt por proveedor
+                <h3 style={{ fontSize: '0.9rem', fontWeight: 600, marginBottom: 10 }}>
+                  Caché de prompt y ahorro de cuota por proveedor
                 </h3>
                 <div className="kpi-grid">
                   {speedData.cacheByProvider.map((c) => (
-                    <div key={c.providerId} className="horiz-err-item">
+                    <div
+                      key={c.providerId}
+                      className="horiz-err-item"
+                      role={onOpenProvider ? 'button' : undefined}
+                      tabIndex={onOpenProvider ? 0 : undefined}
+                      title={onOpenProvider ? `Abrir proveedor ${c.providerName}` : undefined}
+                      style={onOpenProvider ? { cursor: 'pointer' } : undefined}
+                      onClick={() => onOpenProvider?.(c.providerId)}
+                      onKeyDown={(e) => {
+                        if (onOpenProvider && (e.key === 'Enter' || e.key === ' ')) {
+                          e.preventDefault();
+                          onOpenProvider(c.providerId);
+                        }
+                      }}
+                    >
                       <div
                         style={{
                           display: 'flex',
@@ -822,8 +1019,8 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                       >
                         <strong>{c.providerName}</strong>
                         <span
-                          className="font-display"
-                          style={{ color: 'var(--ok)', fontWeight: 700 }}
+                          className="mono"
+                          style={{ color: 'var(--ok)', fontWeight: 600 }}
                         >
                           {c.cacheHitRate.toFixed(1)}%
                         </span>
@@ -833,12 +1030,12 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                           className="horiz-fill"
                           style={{
                             width: `${Math.min(100, Math.max(0, c.cacheHitRate))}%`,
-                            background: 'var(--ok)',
+                            background: 'var(--c-cache-hit)',
                           }}
                         />
                       </div>
                       <span className="field-hint">
-                        {c.cachedTokens.toLocaleString('es-ES')} en caché /{' '}
+                        {c.cachedTokens.toLocaleString('es-ES')} cached /{' '}
                         {c.promptTokens.toLocaleString('es-ES')} prompt tokens
                       </span>
                     </div>
@@ -850,15 +1047,15 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
         )}
       </section>
 
-      {/* 4. HU-20b: Token Activity (prompt, completion, reasoning) + Comboboxes */}
+      {/* 4. HU-20b: Token Activity (prompt, completion, reasoning) + Interactive Series Filter */}
       <section className="card" aria-labelledby="activity-section-title">
         <div className="card-header">
           <h2 id="activity-section-title" className="card-title">
-            Actividad de tokens (Prompt, Completion y Reasoning)
-            <InfoTip text="Desglosa el volumen consumido separando tokens de entrada (prompt), generación (completion) y razonamiento interno (reasoning)." />
+            Desglose de tokens (Prompt, Completion y Reasoning)
+            <InfoTip text="Pasa el cursor por las columnas para ver el desglose o por la leyenda inferior para aislar una categoría." />
           </h2>
 
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <select
               aria-label="Rango de tiempo de actividad"
               className="select-compact"
@@ -900,34 +1097,55 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
         </div>
 
         {/* Summary Totals Strip */}
-        <div className="kpi-grid" style={{ marginBottom: 22 }}>
-          <div className="horiz-err-item">
-            <span className="field-hint">Prompt tokens</span>
-            <strong className="font-display" style={{ fontSize: '1.3rem', color: 'var(--accent)' }}>
+        <div className="kpi-grid" style={{ marginBottom: 18 }}>
+          <div
+            className="horiz-err-item"
+            onMouseEnter={() => setIsolatedTokenSeries('prompt')}
+            onMouseLeave={() => setIsolatedTokenSeries(null)}
+          >
+            <span className="field-hint" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <i className="p-dot" style={{ background: 'var(--c-bar-1)' }} />
+              Prompt tokens
+            </span>
+            <strong className="mono" style={{ fontSize: '1.2rem', color: 'var(--fg)' }}>
               {displayedTotals.promptTokens.toLocaleString('es-ES')}
             </strong>
           </div>
-          <div className="horiz-err-item">
-            <span className="field-hint">Completion tokens</span>
-            <strong className="font-display" style={{ fontSize: '1.3rem', color: 'var(--ok)' }}>
+          <div
+            className="horiz-err-item"
+            onMouseEnter={() => setIsolatedTokenSeries('completion')}
+            onMouseLeave={() => setIsolatedTokenSeries(null)}
+          >
+            <span className="field-hint" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <i className="p-dot" style={{ background: 'var(--c-bar-2)' }} />
+              Completion tokens
+            </span>
+            <strong className="mono" style={{ fontSize: '1.2rem', color: 'var(--fg)' }}>
               {displayedTotals.completionTokens.toLocaleString('es-ES')}
             </strong>
           </div>
-          <div className="horiz-err-item">
-            <span className="field-hint">Reasoning tokens</span>
-            <strong className="font-display" style={{ fontSize: '1.3rem', color: '#8a5607' }}>
+          <div
+            className="horiz-err-item"
+            onMouseEnter={() => setIsolatedTokenSeries('reasoning')}
+            onMouseLeave={() => setIsolatedTokenSeries(null)}
+          >
+            <span className="field-hint" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <i className="p-dot" style={{ background: 'var(--c-bar-3)' }} />
+              Reasoning tokens
+            </span>
+            <strong className="mono" style={{ fontSize: '1.2rem', color: 'var(--fg)' }}>
               {displayedTotals.reasoningTokens.toLocaleString('es-ES')}
             </strong>
           </div>
           <div className="horiz-err-item">
             <span className="field-hint">Total acumulado</span>
-            <strong className="font-display" style={{ fontSize: '1.3rem', color: 'var(--fg)' }}>
+            <strong className="mono" style={{ fontSize: '1.2rem', color: 'var(--fg)' }}>
               {displayedTotals.totalTokens.toLocaleString('es-ES')}
             </strong>
           </div>
         </div>
 
-        {activityLoading ? (
+        {activityLoading && visibleActivityItems.length === 0 ? (
           <p className="field-hint">Consultando actividad de tokens…</p>
         ) : visibleActivityItems.length === 0 ? (
           <div className="empty-state" style={{ padding: '24px 16px' }}>
@@ -936,15 +1154,21 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
         ) : (
           <div
             className="chart-stage"
+            style={{
+              opacity: activityLoading ? 0.55 : 1,
+              transition: 'opacity 0.15s ease',
+            }}
             onMouseLeave={() => setHoveredActivityIndex(null)}
           >
-            <svg
-              viewBox={`0 0 ${actSvgW} ${actSvgH}`}
-              style={{ width: '100%', height: 'auto', display: 'block' }}
-              role="img"
-              aria-label="Gráfico apilado de tokens prompt, completion y reasoning"
-            >
-              {[0, 0.5, 1].map((frac) => {
+            <div className="chart-scroll-x">
+              <svg
+                className="chart-svg-responsive"
+                viewBox={`0 0 ${actSvgW} ${actSvgH}`}
+                style={{ width: '100%', height: 'auto', display: 'block' }}
+                role="img"
+                aria-label="Gráfico apilado de tokens prompt, completion y reasoning"
+              >
+              {[0, 0.25, 0.5, 0.75, 1].map((frac) => {
                 const val = Math.round(maxActivityTokens * frac);
                 const y = padT + actPlotH - frac * actPlotH;
                 return (
@@ -954,18 +1178,18 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                       y1={y}
                       x2={actSvgW - padR}
                       y2={y}
-                      stroke="#dce7f5"
-                      strokeDasharray={frac === 0 ? undefined : '4 4'}
+                      stroke="var(--line)"
+                      strokeDasharray={frac === 0 ? undefined : '2 3'}
                     />
                     <text
                       x={padL - 8}
                       y={y + 4}
                       textAnchor="end"
-                      fontSize="11"
-                      fill="#2c4259"
+                      fontSize="10.5"
+                      fill="var(--fg-3)"
                       fontFamily="var(--font-mono)"
                     >
-                      {val.toLocaleString('es-ES')}
+                      {formatCompactCount(val)}
                     </text>
                   </g>
                 );
@@ -973,7 +1197,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
 
               {visibleActivityItems.slice(0, 16).map((item, idx, arr) => {
                 const slotW = actPlotW / arr.length;
-                const barW = Math.min(54, Math.max(14, slotW * 0.62));
+                const barW = Math.min(34, Math.max(12, slotW * 0.52));
                 const x = padL + idx * slotW + (slotW - barW) / 2;
 
                 const hPrompt = (item.promptTokens / maxActivityTokens) * actPlotH;
@@ -986,46 +1210,72 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
 
                 const shortLabel =
                   item.label.length > 14 ? `${item.label.slice(0, 13)}…` : item.label;
+                const isColHovered = hoveredActivityIndex === idx;
+
+                const canNavigateBar =
+                  (activityGroupBy === 'model' && Boolean(onOpenModel)) ||
+                  (activityGroupBy === 'provider' && Boolean(onOpenProvider));
 
                 return (
                   <g
                     key={item.key}
-                    style={{ cursor: 'pointer' }}
+                    style={{ cursor: canNavigateBar ? 'pointer' : 'default' }}
                     onMouseEnter={() => setHoveredActivityIndex(idx)}
+                    onClick={() => {
+                      if (activityGroupBy === 'model' && onOpenModel) {
+                        onOpenModel(item.key || item.label);
+                      } else if (activityGroupBy === 'provider' && onOpenProvider) {
+                        onOpenProvider(item.key);
+                      }
+                    }}
                   >
-                    {/* Prompt segment */}
+                    <rect
+                      x={padL + idx * slotW + 2}
+                      y={padT}
+                      width={Math.max(4, slotW - 4)}
+                      height={actPlotH}
+                      rx={4}
+                      fill={isColHovered ? 'var(--surface-2)' : 'transparent'}
+                    />
                     <rect
                       x={x}
                       y={yPrompt}
                       width={barW}
                       height={Math.max(0, hPrompt)}
-                      fill="var(--accent)"
-                      rx={2}
+                      fill="var(--c-bar-1)"
+                      opacity={
+                        isolatedTokenSeries && isolatedTokenSeries !== 'prompt' ? 0.2 : 1
+                      }
+                      rx={1.5}
                     />
-                    {/* Completion segment */}
                     <rect
                       x={x}
                       y={yComp}
                       width={barW}
                       height={Math.max(0, hComp)}
-                      fill="var(--ok)"
-                      rx={2}
+                      fill="var(--c-bar-2)"
+                      opacity={
+                        isolatedTokenSeries && isolatedTokenSeries !== 'completion' ? 0.2 : 1
+                      }
+                      rx={1.5}
                     />
-                    {/* Reasoning segment */}
                     <rect
                       x={x}
                       y={yReas}
                       width={barW}
                       height={Math.max(0, hReas)}
-                      fill="var(--partial)"
-                      rx={2}
+                      fill="var(--c-bar-3)"
+                      opacity={
+                        isolatedTokenSeries && isolatedTokenSeries !== 'reasoning' ? 0.2 : 1
+                      }
+                      rx={1.5}
                     />
                     <text
                       x={x + barW / 2}
-                      y={actSvgH - 14}
+                      y={actSvgH - 12}
                       textAnchor="middle"
-                      fontSize="10.5"
-                      fill="#2c4259"
+                      fontSize="10"
+                      fill="var(--fg-3)"
                       fontFamily="var(--font-mono)"
                     >
                       {shortLabel}
@@ -1033,30 +1283,114 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                   </g>
                 );
               })}
-            </svg>
+              </svg>
+            </div>
+
+            {/* Bottom Legend Bar (OpenRouter Activity style) */}
+            <div
+              style={{
+                borderTop: '1px solid var(--line)',
+                paddingTop: 10,
+                marginTop: 6,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: 10,
+                fontSize: '0.78rem',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                <span
+                  className="pct-legend-item"
+                  onMouseEnter={() => setIsolatedTokenSeries('reasoning')}
+                  onMouseLeave={() => setIsolatedTokenSeries(null)}
+                >
+                  <i className="p-dot" style={{ background: 'var(--c-bar-3)' }} />
+                  Reasoning
+                </span>
+                <span
+                  className="pct-legend-item"
+                  onMouseEnter={() => setIsolatedTokenSeries('completion')}
+                  onMouseLeave={() => setIsolatedTokenSeries(null)}
+                >
+                  <i className="p-dot" style={{ background: 'var(--c-bar-2)' }} />
+                  Completion
+                </span>
+                <span
+                  className="pct-legend-item"
+                  onMouseEnter={() => setIsolatedTokenSeries('prompt')}
+                  onMouseLeave={() => setIsolatedTokenSeries(null)}
+                >
+                  <i className="p-dot" style={{ background: 'var(--c-bar-1)' }} />
+                  Prompt
+                </span>
+              </div>
+              <span className="mono" style={{ color: 'var(--fg-3)' }}>
+                {displayedTotals.totalTokens.toLocaleString('es-ES')} tokens
+              </span>
+            </div>
 
             {hoveredActivityIndex !== null && activeActivityItem ? (
               <div
                 className="floating-white-tooltip"
                 style={{ position: 'absolute', top: 10, right: 16 }}
               >
-                <div className="mono" style={{ fontWeight: 700, marginBottom: 6 }}>
+                <div
+                  className="mono"
+                  style={{
+                    fontWeight: 600,
+                    marginBottom: 6,
+                    paddingBottom: 5,
+                    borderBottom: '1px solid var(--tooltip-line)',
+                  }}
+                >
                   {activeActivityItem.label}
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
-                  <span>Prompt:</span>
+                  <span
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      color: 'var(--tooltip-sub)',
+                    }}
+                  >
+                    <i className="p-dot" style={{ background: 'var(--c-bar-1)' }} />
+                    Prompt
+                  </span>
                   <strong className="mono">
                     {activeActivityItem.promptTokens.toLocaleString('es-ES')}
                   </strong>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
-                  <span>Completion:</span>
+                  <span
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      color: 'var(--tooltip-sub)',
+                    }}
+                  >
+                    <i className="p-dot" style={{ background: 'var(--c-bar-2)' }} />
+                    Completion
+                  </span>
                   <strong className="mono">
                     {activeActivityItem.completionTokens.toLocaleString('es-ES')}
                   </strong>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}>
-                  <span>Reasoning:</span>
+                  <span
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      color: 'var(--tooltip-sub)',
+                    }}
+                  >
+                    <i className="p-dot" style={{ background: 'var(--c-bar-3)' }} />
+                    Reasoning
+                  </span>
                   <strong className="mono">
                     {activeActivityItem.reasoningTokens.toLocaleString('es-ES')}
                   </strong>
@@ -1065,17 +1399,29 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({ isAdmin }) => {
                   style={{
                     marginTop: 6,
                     paddingTop: 5,
-                    borderTop: '1px solid #e6eef8',
+                    borderTop: '1px solid var(--tooltip-line)',
                     display: 'flex',
                     justifyContent: 'space-between',
                     gap: 16,
                   }}
                 >
-                  <strong>Total:</strong>
+                  <span style={{ color: 'var(--tooltip-sub)' }}>Total</span>
                   <strong className="mono">
                     {activeActivityItem.totalTokens.toLocaleString('es-ES')}
                   </strong>
                 </div>
+                {(activityGroupBy === 'model' && onOpenModel) ||
+                (activityGroupBy === 'provider' && onOpenProvider) ? (
+                  <div
+                    style={{
+                      marginTop: 5,
+                      fontSize: '0.71rem',
+                      color: 'var(--tooltip-sub)',
+                    }}
+                  >
+                    Clic para abrir {activityGroupBy === 'model' ? 'ficha del modelo' : 'proveedor'} →
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>
