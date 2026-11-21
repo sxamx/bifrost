@@ -213,7 +213,23 @@ if [[ -n "${TOKEN}" ]]; then
   chown "${NODE_USER}:${NODE_GROUP}" "${STATE_FILE}"
 fi
 
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/package.json" && -d "${SCRIPT_DIR}/src" ]]; then
+BIFROST_REPO_URL="${BIFROST_REPO_URL:-https://github.com/sxamx/bifrost.git}"
+NODE_SUBDIR="${INSTALL_DIR}"
+SERVICE_SOURCE=""
+
+if command -v git >/dev/null 2>&1; then
+  if [[ -d "${INSTALL_DIR}/.git" ]]; then
+    log "Actualizando repositorio del agente en ${INSTALL_DIR}..."
+    git -C "${INSTALL_DIR}" fetch --depth 1 origin main
+    git -C "${INSTALL_DIR}" reset --hard origin/main
+  else
+    log "Clonando repositorio del agente en ${INSTALL_DIR} (habilita auto-update)..."
+    rm -rf "${INSTALL_DIR:?}"/* "${INSTALL_DIR:?}"/.[!.]* 2>/dev/null || true
+    git clone --depth 1 "${BIFROST_REPO_URL}" "${INSTALL_DIR}"
+  fi
+  NODE_SUBDIR="${INSTALL_DIR}/nodes"
+  SERVICE_SOURCE="${NODE_SUBDIR}/${SERVICE_NAME}"
+elif [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/package.json" && -d "${SCRIPT_DIR}/src" ]]; then
   REAL_SRC="$(cd "${SCRIPT_DIR}" && pwd -P)"
   REAL_DST="$(cd "${INSTALL_DIR}" && pwd -P)"
   if [[ "${REAL_SRC}" != "${REAL_DST}" ]]; then
@@ -223,6 +239,7 @@ if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/package.json" && -d "${SCRIPT_DIR}
       --exclude='dist' \
       -cf - . | tar -C "${INSTALL_DIR}" -xf -
   fi
+  SERVICE_SOURCE="${INSTALL_DIR}/${SERVICE_NAME}"
 else
   ARCHIVE_URL="${BIFROST_REPO_ARCHIVE:-https://github.com/sxamx/bifrost/archive/refs/heads/main.tar.gz}"
   log "Descargando código del agente desde ${ARCHIVE_URL}..."
@@ -238,16 +255,16 @@ else
     --exclude='node_modules' \
     --exclude='dist' \
     -cf - . | tar -C "${INSTALL_DIR}" -xf -
+  SERVICE_SOURCE="${INSTALL_DIR}/${SERVICE_NAME}"
 fi
 
-log "Instalando dependencias y compilando agente en ${INSTALL_DIR}..."
-if [[ -f "${INSTALL_DIR}/package-lock.json" ]]; then
-  npm --prefix "${INSTALL_DIR}" ci
+log "Instalando dependencias y compilando agente en ${NODE_SUBDIR}..."
+if [[ -f "${NODE_SUBDIR}/package-lock.json" ]]; then
+  npm --prefix "${NODE_SUBDIR}" ci
 else
-  npm --prefix "${INSTALL_DIR}" install
+  npm --prefix "${NODE_SUBDIR}" install
 fi
-npm --prefix "${INSTALL_DIR}" run build
-npm --prefix "${INSTALL_DIR}" prune --omit=dev
+npm --prefix "${NODE_SUBDIR}" run build
 chown -R "${NODE_USER}:${NODE_GROUP}" "${INSTALL_DIR}"
 
 # Pre-generate self-signed TLS cert in public_ip mode if none supplied so fingerprint can be printed
@@ -270,6 +287,10 @@ fi
     echo "BIFROST_NODE_MODE=${MODE}"
     echo "BIFROST_NODE_PORT=${PORT}"
     echo "BIFROST_NODE_DATA_DIR=${DATA_DIR}"
+    echo "NPM_CONFIG_CACHE=${DATA_DIR}/.npm"
+    if [[ -d "${INSTALL_DIR}/.git" ]]; then
+      echo "BIFROST_NODE_REPO_DIR=${INSTALL_DIR}"
+    fi
     if [[ -n "${TLS_CERT}" ]]; then
       echo "BIFROST_NODE_TLS_CERT=${TLS_CERT}"
       echo "BIFROST_NODE_TLS_KEY=${TLS_KEY}"
@@ -278,9 +299,13 @@ fi
 )
 chmod 0600 "${ENV_FILE}"
 
-install -m 0644 "${INSTALL_DIR}/${SERVICE_NAME}" "${SERVICE_DEST}"
+install -m 0644 "${SERVICE_SOURCE}" "${SERVICE_DEST}"
+if [[ "${NODE_SUBDIR}" == "${INSTALL_DIR}" ]]; then
+  sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}|" "${SERVICE_DEST}"
+  sed -i "s|${INSTALL_DIR}/nodes/dist/index.js|${INSTALL_DIR}/dist/index.js|" "${SERVICE_DEST}"
+fi
 if [[ "${NODE_BIN}" != "/usr/bin/node" && "${NODE_BIN}" != "/usr/local/bin/node" ]]; then
-  sed -i "s|^ExecStart=.*|ExecStart=${NODE_BIN} ${INSTALL_DIR}/dist/index.js|" "${SERVICE_DEST}"
+  sed -i "s|^ExecStart=.*|ExecStart=${NODE_BIN} ${NODE_SUBDIR}/dist/index.js|" "${SERVICE_DEST}"
 fi
 
 systemctl daemon-reload

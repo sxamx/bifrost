@@ -8,13 +8,15 @@ Wants=network-online.target
 Type=simple
 User=bifrost-node
 Group=bifrost-node
-WorkingDirectory=/opt/bifrost-node
+WorkingDirectory=/opt/bifrost-node/nodes
 Environment=NODE_ENV=production
 Environment=BIFROST_NODE_MODE=tailscale
 Environment=BIFROST_NODE_PORT=9443
 Environment=BIFROST_NODE_DATA_DIR=/var/lib/bifrost-node
+Environment=BIFROST_NODE_REPO_DIR=/opt/bifrost-node
+Environment=NPM_CONFIG_CACHE=/var/lib/bifrost-node/.npm
 EnvironmentFile=-/etc/default/bifrost-node
-ExecStart=/usr/bin/env node /opt/bifrost-node/dist/index.js
+ExecStart=/usr/bin/env node /opt/bifrost-node/nodes/dist/index.js
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -27,8 +29,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/bifrost-node
-ReadOnlyPaths=/opt/bifrost-node
+ReadWritePaths=/var/lib/bifrost-node /opt/bifrost-node
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
