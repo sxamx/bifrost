@@ -72,6 +72,7 @@ import {
   rotateNodeToken,
   runNodesHealthTick,
   testNodeConnectivity,
+  triggerNodeUpdate,
 } from './nodes.js';
 import { DrainingRegistry, checkUserDailyQuotaUtc, executeChatCompletions } from './router.js';
 import {
@@ -81,7 +82,11 @@ import {
   loadSeedManifests,
   validateProviderManifest,
 } from './schema.js';
-import { checkSystemUpdate } from './update-checker.js';
+import {
+  SystemUpdateError,
+  checkSystemUpdate,
+  triggerSystemUpdate,
+} from './update-checker.js';
 import {
   UserHttpError,
   acceptInvitation,
@@ -651,6 +656,39 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       nowMs: now(),
     });
     return c.json(status);
+  });
+
+  app.post('/api/system/update', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    try {
+      const result = await triggerSystemUpdate({ fetchImpl });
+      writeSystemLog(
+        db,
+        'info',
+        'system',
+        `Triggered Core auto-update (${result.mode})`,
+        { mode: result.mode, triggeredBy: user.username },
+        nowSeconds(),
+      );
+      return c.json(result);
+    } catch (err) {
+      if (err instanceof SystemUpdateError) {
+        writeSystemLog(
+          db,
+          'warn',
+          'system',
+          `Core auto-update rejected/failed: ${err.message}`,
+          { status: err.status, triggeredBy: user.username },
+          nowSeconds(),
+        );
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
   });
 
   // --- Marketplace & Provider Installation (HU-06, HU-23, HU-24) ---
@@ -2488,6 +2526,44 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json(result);
     } catch (err) {
       if (err instanceof NodeOperationError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/nodes/:id/update', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const nodeId = c.req.param('id');
+    try {
+      const result = await triggerNodeUpdate(db, masterKey, nodeId, options.upstreamTls);
+      writeSystemLog(
+        db,
+        'info',
+        'node',
+        `Triggered auto-update for node "${nodeId}"`,
+        { nodeId, triggeredBy: user.username },
+        nowSeconds(),
+      );
+      return c.json({
+        ok: result.ok,
+        message: result.message,
+        restarting: result.restarting,
+      });
+    } catch (err) {
+      if (err instanceof NodeOperationError) {
+        writeSystemLog(
+          db,
+          'error',
+          'node',
+          `Auto-update failed for node "${nodeId}": ${err.message}`,
+          { nodeId, status: err.status, triggeredBy: user.username },
+          nowSeconds(),
+        );
         return c.json({ error: err.message }, err.status);
       }
       throw err;

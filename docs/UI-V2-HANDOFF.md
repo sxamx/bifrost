@@ -57,7 +57,7 @@ Refleja las historias `HU-27` a `HU-41` descritas en [`HISTORIAS-V2.md`](HISTORI
 
 ---
 
-### 2.2 `NodesTab.tsx` (`HU-27`, `HU-28`)
+### 2.2 `NodesTab.tsx` (`HU-27`, `HU-28`, `HU-41`)
 
 **Propiedades en `ExitNodeItem` (`types.ts`):**
 - `id: string`, `name: string`, `mode: NodeMode` (`'tailscale' | 'public_ip'`), `endpoint: string`, `status: NodeStatus` (`'online' | 'unresponsive' | 'offline'`), `assignedKeysCount?: number`.
@@ -65,10 +65,13 @@ Refleja las historias `HU-27` a `HU-41` descritas en [`HISTORIAS-V2.md`](HISTORI
 **Métodos en `api` (`api.ts`):**
 - `api.testNode(nodeId: string): Promise<ExitNodeTestResult>`  
   Donde `ExitNodeTestResult` es `{ ok: boolean; status: NodeStatus | string; latencyMs: number | null; error?: string }`. Conectar al botón **Probar nodo** en cada nodo.
+- `api.updateNode(nodeId: string): Promise<{ ok: boolean; message: string; restarting: boolean }>`  
+  Llama a `POST /api/nodes/:id/update` (que reenvía la orden a `POST /_bifrost/update` en el agente del nodo). Conectar al botón **Actualizar nodo** en cada nodo.
 - `api.deleteNode(nodeId: string): Promise<{ ok: boolean }>` *(ya existente)*
 
 **Requisitos UI:**
 - Añadir botón **Probar nodo** con estado `testing` por fila/tarjeta y feedback inline (`En línea · X ms` o `error` descriptivo).
+- Añadir botón **Actualizar nodo** con estado de carga mientras se envía la orden y feedback inline claro de estado/reinicio (`restarting: true` o `message` del servidor, manejando errores con `ApiError`).
 - En el flujo/confirmación de **Eliminar nodo**, advertir explícitamente si `assignedKeysCount > 0` que esas claves pasarán a estado `no_node` (fuera de servicio) hasta que se les asigne otro nodo.
 
 ---
@@ -254,7 +257,7 @@ export interface FreeQuotaStatus {
 
 ---
 
-### 2.9 Detección de actualizaciones (`HU-41`)
+### 2.9 Detección y ejecución de actualizaciones (`HU-41`)
 
 **Contrato TypeScript en `panel/src/types.ts` (añadido por Backend):**
 ```ts
@@ -267,6 +270,7 @@ export interface SystemUpdateStatus {
   latestPublishedAt: string | null;
   updateAvailable: boolean;
   runtimeMode: 'docker' | 'native';
+  canAutoUpdate: boolean;
   checkedAt: number;
   error?: string | null;
 }
@@ -275,26 +279,30 @@ export interface SystemUpdateStatus {
 **Métodos en `api` (`api.ts`):**
 - `api.getUpdateStatus(refresh?: boolean): Promise<SystemUpdateStatus>`  
   Llama a `GET /api/system/update-status` (o `GET /api/system/update-status?refresh=1` cuando `refresh === true`, saltando la caché de 6 horas del backend).
+- `api.triggerSystemUpdate(): Promise<{ ok: boolean; mode: 'watchtower' | 'native'; message: string; restarting: boolean }>`  
+  Llama a `POST /api/system/update` (solo `admin`, ejecuta Watchtower en Docker o `git pull` + recompilación y reinicio en `systemd`).
 
 **Requisitos UI (`OverviewTab.tsx` o barra superior / topbar — solo `admin`):**
 - Mostrar un banner/badge sutil de actualización exclusivamente para administradores cuando `updateAvailable === true` (evitar ruido visual si está actualizado o para usuarios no administradores).
 - Incluir enlace externo seguro (`target="_blank" rel="noopener noreferrer"`) a `latestCommitUrl` (mostrando el commit abreviado y/o `latestCommitMessage` / `latestPublishedAt`).
 - Incluir botón **Comprobar ahora** que invoque `api.getUpdateStatus(true)` (`refresh=true`) con estado de carga.
-- Mostrar un comando copiable adaptado automáticamente según `runtimeMode`:
-  - Si `runtimeMode === 'docker'`: `docker compose pull && docker compose up -d`
-  - Si `runtimeMode === 'native'`: `git pull && npm run build`
+- **Actualización en 1 clic vs. respaldo manual:**
+  - Si `updateAvailable && canAutoUpdate`: mostrar botón **«Actualizar ahora»** (con estado de carga/confirmación segura y feedback de `message` / `restarting: true`, manejando errores con `ApiError`) que invoque `api.triggerSystemUpdate()`.
+  - Si `canAutoUpdate === false` (respaldo manual): mostrar un comando copiable adaptado automáticamente según `runtimeMode`:
+    - Si `runtimeMode === 'docker'`: `docker compose pull && docker compose up -d`
+    - Si `runtimeMode === 'native'`: `git pull && npm run build`
 
 ---
 
 ## 3. Checklist final de implementación UI
 
 - [ ] **`ProviderVaultCard.tsx`**: switch **Activar / Desactivar** (`status === 'disabled'`), badge `no_node`, botón **Probar clave** (`ProviderKeyTestResult`) y badge/tooltip de advertencia de privacidad (`HU-40`).
-- [ ] **`NodesTab.tsx`**: botón **Probar nodo** (`ExitNodeTestResult`) con estado de carga/latencia y advertencia de claves afectadas al eliminar nodo.
+- [ ] **`NodesTab.tsx`**: botón **Probar nodo** (`ExitNodeTestResult`) con estado de carga/latencia, botón **Actualizar nodo** (`api.updateNode`) con feedback de carga/reinicio (`HU-41`), y advertencia de claves afectadas al eliminar nodo.
 - [ ] **`ModelsTab.tsx`**: interruptor de visibilidad admin (`api.setModelVisibility`), soporte y filtro para modelos deshabilitados y no-texto (`embeddings`), badge `hasCatalogInfo`, saneamiento de `formatReleaseDate` (`>= 2018` o `'No reportada'`) e indicador `providerPrivacy` (`HU-40`).
 - [ ] **`UsersTab.tsx`**: botón **Eliminar** en invitaciones pendientes (`api.deleteInvitation`), buscador de modelos en modales sin perder selección e interruptor/badge `enforceStrictQuota`.
 - [ ] **`ApiKeysTab.tsx`**: selector de expiración (`expiresInDays` / `expiresAt`), columna/badge de expiración y estado **Expirada**, y métricas compactas por clave (`usedTokens` / `requestsCount`).
 - [ ] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`) y opción **Por API key** en `ActivityGroupBy`.
 - [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx`**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter), detalle de `training` y badge de clasificación de límites (`rateLimitKind` / `rateLimitWindows`, `HU-38`).
 - [ ] **`OverviewTab.tsx` / `MetricsTab.tsx` (Cuota gratuita, `HU-39`)**: mostrar ventana activa (`hora` / `día` / `semana`), indicador de confianza (`Exacto por cabecera`, `Configurado`, `Inferido por 429`), `effectiveLimit`, estado `adaptiveAdjusted` y detalle por proveedor (`providerQuotas` / `FreeQuotaStatus.providers`).
-- [ ] **`OverviewTab.tsx` / Topbar (Detección de actualizaciones, `HU-41`)**: solo para `admin`, consumir `api.getUpdateStatus(refresh)` (`SystemUpdateStatus`), mostrar banner/badge sutil cuando `updateAvailable === true`, enlace a `latestCommitUrl`, botón **Comprobar ahora** (`refresh=true`) y comando copiable según `runtimeMode` (`docker compose pull && docker compose up -d` vs `git pull && npm run build`).
+- [ ] **`OverviewTab.tsx` / Topbar (Detección y ejecución de actualizaciones, `HU-41`)**: solo para `admin`, consumir `api.getUpdateStatus(refresh)` (`SystemUpdateStatus`), mostrar banner/badge sutil cuando `updateAvailable === true`, enlace a `latestCommitUrl`, botón **Comprobar ahora** (`refresh=true`), botón **«Actualizar ahora»** (`api.triggerSystemUpdate()`) cuando `updateAvailable && canAutoUpdate`, y comando copiable según `runtimeMode` (`docker compose pull && docker compose up -d` vs `git pull && npm run build`) cuando `canAutoUpdate === false`.
 

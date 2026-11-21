@@ -1,7 +1,11 @@
+import { execFile, execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import path from 'node:path';
 import type { Duplex } from 'node:stream';
+import { promisify } from 'node:util';
 import {
   DEFAULT_GRACE_WINDOW_MS,
   TokenAuthenticator
@@ -16,6 +20,8 @@ import {
   formatMissingTailscaleMessage
 } from './tailscale.js';
 import { loadOrGenerateTlsMaterial } from './tls.js';
+
+const execFileAsync = promisify(execFile);
 
 export const NODE_AGENT_VERSION = '0.1.0';
 export const DEFAULT_NODE_PORT = 9443;
@@ -45,6 +51,9 @@ export interface BifrostNodeOptions {
   now?: () => number;
   detectTailscaleOptions?: DetectTailscaleOptions;
   logger?: NodeLogger;
+  repoDir?: string;
+  runUpdateCommand?: (cmd: string, args: string[], cwd: string) => void | Promise<void>;
+  onUpdateRestart?: () => void;
 }
 
 export interface BifrostNodeInstance {
@@ -123,6 +132,32 @@ function writeRawHttpResponse(socket: Duplex, statusLine: string, headers: strin
   socket.end(lines.join('\r\n'));
 }
 
+function detectNodeCommit(repoDir: string): string | null {
+  const envCommit = (process.env.BIFROST_NODE_COMMIT ?? process.env.BIFROST_BUILD_COMMIT)?.trim();
+  if (envCommit && envCommit.toLowerCase() !== 'unknown') {
+    return envCommit;
+  }
+  try {
+    if (fs.existsSync(path.join(repoDir, '.git'))) {
+      const sha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+        cwd: repoDir,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      }).trim();
+      if (sha.length > 0) {
+        return sha;
+      }
+    }
+  } catch {
+    // Git not available or not a git repository
+  }
+  return null;
+}
+
+async function defaultRunNodeUpdateCommand(cmd: string, args: string[], cwd: string): Promise<void> {
+  await execFileAsync(cmd, args, { cwd, timeout: 180_000 });
+}
+
 export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNodeInstance {
   const mode: NodeMode = options.mode ?? 'tailscale';
   const requestedPort = options.port ?? DEFAULT_NODE_PORT;
@@ -131,6 +166,10 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
   const allowedPorts = new Set<number>(options.allowedPorts ?? [443]);
   const allowPrivateTargets = options.allowPrivateTargets ?? false;
   const connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
+  const resolvedRepoDir =
+    options.repoDir ??
+    (process.env.BIFROST_NODE_REPO_DIR?.trim() || path.resolve(import.meta.dirname, '../..'));
+  const nodeCommit = detectNodeCommit(resolvedRepoDir);
 
   const authenticator = new TokenAuthenticator({
     initialToken: options.token,
@@ -191,7 +230,7 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
     tlsSocket.once('close', () => trackedSockets.delete(tlsSocket));
   });
 
-  // Control plane HTTP endpoints (/_bifrost/health, /_bifrost/rotate)
+  // Control plane HTTP endpoints (/_bifrost/health, /_bifrost/rotate, /_bifrost/update)
   server.on('request', async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const verification = authenticator.verifyHeaders(req.headers);
     if (!verification.authenticated) {
@@ -218,6 +257,7 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
         ok: true,
         uptime_sec: uptimeSec,
         version: NODE_AGENT_VERSION,
+        commit: nodeCommit,
         active_tunnels: activeTunnels
       });
       return;
@@ -257,6 +297,55 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
             ? err.statusCode
             : 400;
         sendJson(res, statusCode, { ok: false, error: 'invalid_rotate_payload' });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/_bifrost/update') {
+      if (verification.matchedSlot !== 'active') {
+        sendJson(
+          res,
+          401,
+          { ok: false, error: 'update_requires_active_token' },
+          { 'WWW-Authenticate': 'Bearer realm="bifrost-node"' }
+        );
+        return;
+      }
+
+      if (!fs.existsSync(path.join(resolvedRepoDir, '.git'))) {
+        sendJson(res, 409, {
+          ok: false,
+          error: 'Node repository (.git) not found for auto-update'
+        });
+        return;
+      }
+
+      const runCmd = options.runUpdateCommand ?? defaultRunNodeUpdateCommand;
+      try {
+        await runCmd('git', ['pull', '--ff-only'], resolvedRepoDir);
+        await runCmd('npm', ['--prefix', 'nodes', 'ci'], resolvedRepoDir);
+        await runCmd('npm', ['--prefix', 'nodes', 'run', 'build'], resolvedRepoDir);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`[bifrost-node] Auto-update failed: ${msg}`);
+        sendJson(res, 500, {
+          ok: false,
+          error: `Node update failed: ${msg}`
+        });
+        return;
+      }
+
+      sendJson(res, 200, {
+        ok: true,
+        restarting: true,
+        message: 'Node updated and restarting.'
+      });
+
+      if (options.onUpdateRestart) {
+        options.onUpdateRestart();
+      } else {
+        const timer = setTimeout(() => process.exit(0), 300);
+        timer.unref();
       }
       return;
     }

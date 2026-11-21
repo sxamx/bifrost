@@ -175,20 +175,23 @@ Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`
 
 ---
 
-### HU-41 — Detección de actualizaciones desde GitHub y publicación automatizada en GHCR
+### HU-41 — Detección de actualizaciones desde GitHub, publicación en GHCR y actualización en 1 clic
 
 **Como** administrador de Bifrost,  
-**quiero** que el panel detecte automáticamente si existen nuevas versiones o commits publicados en GitHub y que cada release o cambio en `main` genere una imagen Docker verificada en GHCR,  
-**para** mantener mi instancia actualizada de forma segura, con instrucciones adaptadas a mi modo de ejecución (`docker` o `native`) y sin riesgo de perder los datos persistentes (`/app/data`).
+**quiero** que el panel detecte automáticamente si existen nuevas versiones o commits publicados en GitHub, que cada release o cambio en `main` genere una imagen Docker verificada en GHCR y poder lanzar la actualización del Core y de los nodos de salida en **1 clic**,  
+**para** mantener toda mi infraestructura actualizada de forma segura, con respaldo de comando manual cuando no esté habilitada la autoactualización y sin riesgo de perder los datos persistentes (`/app/data`).
 
 **Criterios de aceptación:**
 1. **Capa 1 — Detección y aviso en el panel:**
    - El backend consulta GitHub (`sxamx/bifrost`, rama `main` / releases) mediante `GET /api/system/update-status`, cacheando el resultado durante **6 horas** y soportando `?refresh=1` para comprobación bajo demanda.
-   - Compara la versión y commit actuales en ejecución (`version` + `buildCommit`) contra el último commit/publicación remota, detecta `runtimeMode` (`'docker' | 'native'`) y devuelve el estado tipado (`SystemUpdateStatus`).
-   - En el panel (solo visible para usuarios con rol `admin`), cuando `updateAvailable === true`, se muestra un banner/tarjeta sutil de actualización en `OverviewTab` (o barra superior) con enlace al commit remoto, botón **Comprobar ahora** (`refresh=true`) y comando copiable adaptado al `runtimeMode` (`docker compose pull && docker compose up -d` para Docker o `git pull && npm run build` para ejecución nativa).
+   - Compara la versión y commit actuales en ejecución (`version` + `buildCommit`) contra el último commit/publicación remota, detecta `runtimeMode` (`'docker' | 'native'`) y si está disponible la autoactualización (`canAutoUpdate`), devolviendo el estado tipado (`SystemUpdateStatus`).
+   - En el panel (solo visible para usuarios con rol `admin`), cuando `updateAvailable === true`, se muestra un banner/tarjeta sutil de actualización en `OverviewTab` (o barra superior) con enlace al commit remoto, botón **Comprobar ahora** (`refresh=true`), botón **«Actualizar ahora»** cuando `canAutoUpdate === true`, y comando copiable adaptado al `runtimeMode` (`docker compose pull && docker compose up -d` para Docker o `git pull && npm run build` para ejecución nativa) como respaldo cuando `canAutoUpdate === false`.
 2. **Capa 2 — Publicación automatizada y segura en GHCR:**
    - El flujo de GitHub Actions ejecuta la compilación (`build`) y la suite completa de pruebas (`tests`) antes de publicar; la imagen `ghcr.io/sxamx/bifrost` solo se construye y publica si todas las pruebas pasan.
    - Los datos del usuario, base de datos y configuración (`/app/data`) permanecen completamente separados de la imagen Docker (montados mediante volumen externo), garantizando actualizaciones limpias sin pérdida ni sobreescritura de datos.
+3. **Capa 3 — Actualización en 1 clic («Actualizar ahora») para Core y Nodos de salida:**
+   - **Servidor Core (`POST /api/system/update`):** solo accesible para administradores cuando `canAutoUpdate === true`. En Docker dispara la actualización mediante la API HTTP de **Watchtower**; en ejecución nativa (`systemd`) ejecuta `git pull` + recompilación (`build`) y reinicio controlado del servicio, devolviendo `{ ok, mode: 'watchtower' | 'native', message, restarting }`.
+   - **Nodos de salida (`POST /api/nodes/:id/update`):** el Core reenvía de forma autenticada la orden de actualización al endpoint `POST /_bifrost/update` del agente del nodo (`Egress Node`) y devuelve `{ ok, message, restarting }`. Desde `NodesTab`, el administrador dispone del botón **«Actualizar nodo»** con feedback visual de carga/reinicio en curso.
 
 ---
 

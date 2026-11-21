@@ -565,9 +565,9 @@ export async function fetchViaExitNode(
 }
 
 export class NodeOperationError extends Error {
-  public readonly status: 400 | 404 | 502;
+  public readonly status: 400 | 404 | 409 | 502;
 
-  constructor(message: string, status: 400 | 404 | 502) {
+  constructor(message: string, status: 400 | 404 | 409 | 502) {
     super(message);
     this.name = 'NodeOperationError';
     this.status = status;
@@ -1014,4 +1014,89 @@ export async function testNodeConnectivity(params: {
       error: redactSecretsInText(msg),
     };
   }
+}
+
+export interface NodeUpdateTriggerResult {
+  ok: true;
+  message: string;
+  restarting: boolean;
+}
+
+/**
+ * Triggers remote 1-click auto-update on an egress node by calling POST /_bifrost/update
+ * via callNodeControlPlane.
+ */
+export async function triggerNodeUpdate(
+  db: DatabaseSync,
+  masterKey: Buffer,
+  nodeId: string,
+  _upstreamTls?: UpstreamTlsOptions,
+): Promise<NodeUpdateTriggerResult> {
+  const row = db
+    .prepare(
+      `SELECT id, name, mode, endpoint, encrypted_token, tls_fingerprint
+       FROM nodes
+       WHERE id = ?`,
+    )
+    .get(nodeId) as Record<string, unknown> | undefined;
+
+  if (!row) {
+    throw new NodeOperationError(`Node "${nodeId}" not found.`, 404);
+  }
+
+  if (!row.encrypted_token) {
+    throw new NodeOperationError(
+      `Node "${nodeId}" has no stored encrypted credential for update.`,
+      400,
+    );
+  }
+
+  let rawToken: string;
+  try {
+    rawToken = decryptSecret(row.encrypted_token as Uint8Array, masterKey);
+  } catch {
+    throw new NodeOperationError(`Failed to decrypt credentials for node "${nodeId}".`, 400);
+  }
+
+  let res: { status: number; data: Record<string, unknown> };
+  try {
+    res = await callNodeControlPlane({
+      mode: row.mode === 'public_ip' ? 'public_ip' : 'tailscale',
+      endpoint: String(row.endpoint),
+      rawToken,
+      tlsFingerprint:
+        row.tls_fingerprint === null || row.tls_fingerprint === undefined
+          ? null
+          : String(row.tls_fingerprint),
+      method: 'POST',
+      path: '/_bifrost/update',
+      timeoutMs: 60_000,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new NodeOperationError(
+      `Unable to reach node "${String(row.name)}" for auto-update: ${redactSecretsInText(msg)}`,
+      502,
+    );
+  }
+
+  if (res.status !== 200 || res.data?.ok !== true) {
+    const remoteErr =
+      typeof res.data?.error === 'string' && res.data.error.trim().length > 0
+        ? res.data.error.trim()
+        : `HTTP ${res.status}`;
+    throw new NodeOperationError(
+      `Node "${String(row.name)}" rejected auto-update: ${redactSecretsInText(remoteErr)}`,
+      res.status === 409 ? 409 : 502,
+    );
+  }
+
+  return {
+    ok: true,
+    message:
+      typeof res.data.message === 'string' && res.data.message.trim().length > 0
+        ? res.data.message.trim()
+        : 'Node update triggered and restarting.',
+    restarting: res.data.restarting !== undefined ? Boolean(res.data.restarting) : true,
+  };
 }

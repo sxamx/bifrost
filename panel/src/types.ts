@@ -673,6 +673,7 @@ export interface SystemUpdateStatus {
   latestCommitUrl: string | null;
   latestPublishedAt: string | null;
   updateAvailable: boolean;
+  canAutoUpdate: boolean;
   runtimeMode: 'docker' | 'native';
   checkedAt: number;
   error?: string | null;

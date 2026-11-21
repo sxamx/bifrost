@@ -1,5 +1,6 @@
 services:
   bifrost:
+    image: ${BIFROST_IMAGE:-ghcr.io/sxamx/bifrost:latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -15,6 +16,10 @@ services:
       PANEL_DIST_DIR: /app/panel/dist
       BIFROST_MASTER_KEY: "${BIFROST_MASTER_KEY:-}"
       BIFROST_MARKETPLACE_URL: "${BIFROST_MARKETPLACE_URL:-https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json}"
+      BIFROST_WATCHTOWER_URL: "${BIFROST_WATCHTOWER_URL:-}"
+      BIFROST_WATCHTOWER_TOKEN: "${BIFROST_WATCHTOWER_TOKEN:-}"
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     volumes:
       - bifrost_data:/data
     healthcheck:
@@ -29,6 +34,20 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: bifrost-watchtower
+    restart: unless-stopped
+    profiles:
+      - auto-update
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_HTTP_API_UPDATE: "true"
+      WATCHTOWER_HTTP_API_TOKEN: "${BIFROST_WATCHTOWER_TOKEN:-change-me}"
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "true"
 
 volumes:
   bifrost_data:

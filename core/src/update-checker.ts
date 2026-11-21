@@ -1,9 +1,12 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import { promisify } from 'node:util';
 
 import { readExternalCache, writeExternalCache, type FetchLike } from './catalog/cache.js';
+
+const execFileAsync = promisify(execFile);
 
 export const UPDATE_CHECK_CACHE_KEY = 'system_update_status';
 export const UPDATE_CHECK_TTL_SEC = 21600; // 6 hours
@@ -17,6 +20,7 @@ export interface SystemUpdateStatus {
   latestCommitUrl: string | null;
   latestPublishedAt: string | null;
   updateAvailable: boolean;
+  canAutoUpdate: boolean;
   runtimeMode: 'docker' | 'native';
   checkedAt: number;
   error?: string | null;
@@ -31,6 +35,31 @@ export interface CheckSystemUpdateOptions {
   currentCommit?: string | null;
   currentVersion?: string;
   runtimeMode?: 'docker' | 'native';
+  repoDir?: string;
+  watchtowerUrl?: string;
+}
+
+export function defaultRepoDir(): string {
+  return path.resolve(import.meta.dirname, '../..');
+}
+
+export function hasGitRepo(repoDir: string = defaultRepoDir()): boolean {
+  try {
+    return fs.existsSync(path.join(repoDir, '.git'));
+  } catch {
+    return false;
+  }
+}
+
+export function computeCanAutoUpdate(
+  runtimeMode: 'docker' | 'native',
+  repoDir: string = defaultRepoDir(),
+  watchtowerUrl: string | undefined = process.env.BIFROST_WATCHTOWER_URL,
+): boolean {
+  if (runtimeMode === 'docker') {
+    return Boolean(watchtowerUrl && watchtowerUrl.trim().length > 0);
+  }
+  return hasGitRepo(repoDir);
 }
 
 export function detectRuntimeMode(): 'docker' | 'native' {
@@ -107,6 +136,8 @@ export async function checkSystemUpdate(
   const nowSec = Math.floor(nowMs / 1000);
 
   const runtimeMode = options.runtimeMode ?? detectRuntimeMode();
+  const repoDir = options.repoDir ?? defaultRepoDir();
+  const canAutoUpdate = computeCanAutoUpdate(runtimeMode, repoDir, options.watchtowerUrl);
   const currentVersion = options.currentVersion ?? detectCurrentVersion();
   const currentCommit =
     options.currentCommit !== undefined ? options.currentCommit : detectCurrentCommit();
@@ -120,6 +151,7 @@ export async function checkSystemUpdate(
           currentVersion,
           currentCommit,
           runtimeMode,
+          canAutoUpdate,
           updateAvailable:
             currentCommit && cached.data.latestCommit
               ? !isCommitUpToDate(currentCommit, cached.data.latestCommit)
@@ -150,6 +182,7 @@ export async function checkSystemUpdate(
         latestCommitUrl: null,
         latestPublishedAt: null,
         updateAvailable: false,
+        canAutoUpdate,
         runtimeMode,
         checkedAt: nowMs,
         error: `GitHub API returned HTTP ${response.status}`,
@@ -192,6 +225,7 @@ export async function checkSystemUpdate(
       latestCommitUrl,
       latestPublishedAt,
       updateAvailable,
+      canAutoUpdate,
       runtimeMode,
       checkedAt: nowMs,
       error: null,
@@ -214,9 +248,125 @@ export async function checkSystemUpdate(
       latestCommitUrl: null,
       latestPublishedAt: null,
       updateAvailable: false,
+      canAutoUpdate,
       runtimeMode,
       checkedAt: nowMs,
       error: message || 'Failed to check for updates',
     };
   }
+}
+
+export class SystemUpdateError extends Error {
+  public readonly status: 409 | 500 | 502;
+
+  constructor(message: string, status: 409 | 500 | 502) {
+    super(message);
+    this.name = 'SystemUpdateError';
+    this.status = status;
+  }
+}
+
+export interface TriggerSystemUpdateOptions {
+  fetchImpl?: FetchLike;
+  runtimeMode?: 'docker' | 'native';
+  watchtowerUrl?: string;
+  watchtowerToken?: string;
+  repoDir?: string;
+  runCommand?: (cmd: string, args: string[], cwd: string) => void | Promise<void>;
+  onRestart?: () => void;
+}
+
+export interface TriggerSystemUpdateResult {
+  ok: true;
+  mode: 'watchtower' | 'native';
+  message: string;
+  restarting: true;
+}
+
+async function defaultRunCommand(cmd: string, args: string[], cwd: string): Promise<void> {
+  await execFileAsync(cmd, args, { cwd, timeout: 120_000 });
+}
+
+export async function triggerSystemUpdate(
+  options: TriggerSystemUpdateOptions = {},
+): Promise<TriggerSystemUpdateResult> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const runtimeMode = options.runtimeMode ?? detectRuntimeMode();
+  const watchtowerUrl = (options.watchtowerUrl ?? process.env.BIFROST_WATCHTOWER_URL ?? '').trim();
+  const watchtowerToken = (
+    options.watchtowerToken ??
+    process.env.BIFROST_WATCHTOWER_TOKEN ??
+    ''
+  ).trim();
+  const repoDir = options.repoDir ?? defaultRepoDir();
+
+  // Docker + Watchtower mode (or explicit BIFROST_WATCHTOWER_URL)
+  if (watchtowerUrl.length > 0) {
+    const endpoint = `${watchtowerUrl.replace(/\/+$/, '')}/v1/update`;
+    const headers: Record<string, string> = {};
+    if (watchtowerToken.length > 0) {
+      headers.Authorization = `Bearer ${watchtowerToken}`;
+    }
+
+    let response: Response;
+    try {
+      response = await fetchImpl(endpoint, {
+        method: 'POST',
+        headers,
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new SystemUpdateError(`Failed to reach Watchtower at ${endpoint}: ${msg}`, 502);
+    }
+
+    if (!response.ok) {
+      throw new SystemUpdateError(`Watchtower returned HTTP ${response.status}`, 502);
+    }
+
+    return {
+      ok: true,
+      mode: 'watchtower',
+      message: 'Watchtower update triggered. Container is restarting with the latest image.',
+      restarting: true,
+    };
+  }
+
+  if (runtimeMode === 'docker') {
+    throw new SystemUpdateError(
+      'Watchtower is not configured. Set BIFROST_WATCHTOWER_URL (and BIFROST_WATCHTOWER_TOKEN) or enable the auto-update profile in docker-compose.yml.',
+      409,
+    );
+  }
+
+  // Native mode: git pull --ff-only && npm run build + systemd restart
+  if (runtimeMode === 'native' && hasGitRepo(repoDir)) {
+    const runCmd = options.runCommand ?? defaultRunCommand;
+    try {
+      await runCmd('git', ['pull', '--ff-only'], repoDir);
+      await runCmd('npm', ['run', 'build'], repoDir);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new SystemUpdateError(`Native update failed: ${msg}`, 500);
+    }
+
+    if (options.onRestart) {
+      options.onRestart();
+    } else {
+      const timer = setTimeout(() => process.exit(0), 500);
+      timer.unref();
+    }
+
+    return {
+      ok: true,
+      mode: 'native',
+      message: 'Updated repository and rebuilt Core. Restarting service...',
+      restarting: true,
+    };
+  }
+
+  throw new SystemUpdateError(
+    'Auto-update is unavailable: not a git repository and Watchtower is not configured.',
+    409,
+  );
 }

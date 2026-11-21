@@ -2180,4 +2180,34 @@ export const api = {
       method: 'GET',
     });
   },
+
+  triggerSystemUpdate(): Promise<{
+    ok: boolean;
+    mode: 'watchtower' | 'native';
+    message: string;
+    restarting: boolean;
+  }> {
+    return request<{
+      ok: boolean;
+      mode: 'watchtower' | 'native';
+      message: string;
+      restarting: boolean;
+    }>('/api/system/update', {
+      method: 'POST',
+    });
+  },
+
+  updateNode(nodeId: string): Promise<{
+    ok: boolean;
+    message: string;
+    restarting: boolean;
+  }> {
+    return request<{
+      ok: boolean;
+      message: string;
+      restarting: boolean;
+    }>(`/api/nodes/${encodeURIComponent(nodeId)}/update`, {
+      method: 'POST',
+    });
+  },
 };

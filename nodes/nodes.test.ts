@@ -628,4 +628,68 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
     assert.match(helpOut, /--mode/);
     assert.match(helpOut, /--port/);
   });
+
+  it('exposes commit in /_bifrost/health and supports authenticated POST /_bifrost/update', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-node-update-'));
+    fs.mkdirSync(path.join(tmpDir, '.git'));
+    const ranCommands: Array<{ cmd: string; args: string[]; cwd: string }> = [];
+    let restartCalled = false;
+
+    const token = 'node_update_secret_token_123456';
+    const node = createBifrostNodeServer({
+      mode: 'tailscale',
+      bindHost: '127.0.0.1',
+      port: 0,
+      token,
+      logger: SILENT_LOGGER,
+      repoDir: tmpDir,
+      runUpdateCommand: async (cmd, args, cwd) => {
+        ranCommands.push({ cmd, args, cwd });
+      },
+      onUpdateRestart: () => {
+        restartCalled = true;
+      }
+    });
+
+    try {
+      const started = await node.start();
+      const baseUrl = `http://127.0.0.1:${started.port}`;
+
+      // 1. Health includes version and commit
+      const healthRes = await fetch(`${baseUrl}/_bifrost/health`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      assert.equal(healthRes.status, 200);
+      const healthJson = (await healthRes.json()) as { ok: boolean; version: string; commit: string | null };
+      assert.equal(healthJson.ok, true);
+      assert.equal(typeof healthJson.version, 'string');
+      assert.ok('commit' in healthJson);
+
+      // 2. Unauthenticated update -> 401
+      const unauthRes = await fetch(`${baseUrl}/_bifrost/update`, { method: 'POST' });
+      assert.equal(unauthRes.status, 401);
+
+      // 3. Authenticated update -> 200 and executes git pull, npm ci, npm run build
+      const updateRes = await fetch(`${baseUrl}/_bifrost/update`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      assert.equal(updateRes.status, 200);
+      const updateJson = (await updateRes.json()) as { ok: boolean; restarting: boolean; message: string };
+      assert.equal(updateJson.ok, true);
+      assert.equal(updateJson.restarting, true);
+      assert.equal(restartCalled, true);
+      assert.deepEqual(
+        ranCommands.map((c) => [c.cmd, ...c.args]),
+        [
+          ['git', 'pull', '--ff-only'],
+          ['npm', '--prefix', 'nodes', 'ci'],
+          ['npm', '--prefix', 'nodes', 'run', 'build']
+        ]
+      );
+    } finally {
+      await node.stop();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

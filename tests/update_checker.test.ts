@@ -1,14 +1,20 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { createApp } from '../core/src/app.js';
 import { openDatabase } from '../core/src/db.js';
 import {
   GITHUB_COMMITS_MAIN_URL,
+  SystemUpdateError,
   UPDATE_CHECK_TTL_SEC,
   checkSystemUpdate,
   isCommitUpToDate,
+  triggerSystemUpdate,
   type SystemUpdateStatus,
 } from '../core/src/update-checker.js';
 
@@ -260,5 +266,298 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
     const body3 = (await adminRes3.json()) as SystemUpdateStatus;
     assert.equal(githubCalls, 2);
     assert.equal(body3.latestCommit, 'commit2abcdef1234567890');
+  });
+
+  it('computes canAutoUpdate and executes triggerSystemUpdate in Watchtower and native modes', async () => {
+    const db = openDatabase(':memory:');
+
+    const dockerWithoutWt = await checkSystemUpdate({
+      db,
+      currentCommit: '1111111',
+      runtimeMode: 'docker',
+      watchtowerUrl: '',
+      fetchImpl: async () => makeGitHubCommitResponse('2222222222222222222222222222222222222222'),
+    });
+    assert.equal(dockerWithoutWt.canAutoUpdate, false);
+
+    const dockerWithWt = await checkSystemUpdate({
+      db,
+      currentCommit: '1111111',
+      runtimeMode: 'docker',
+      watchtowerUrl: 'http://watchtower:8080',
+      forceRefresh: true,
+      fetchImpl: async () => makeGitHubCommitResponse('2222222222222222222222222222222222222222'),
+    });
+    assert.equal(dockerWithWt.canAutoUpdate, true);
+
+    // Watchtower trigger
+    let wtCalledUrl = '';
+    let wtAuthHeader = '';
+    const wtRes = await triggerSystemUpdate({
+      runtimeMode: 'docker',
+      watchtowerUrl: 'http://watchtower:8080/',
+      watchtowerToken: 'wt-secret-token',
+      fetchImpl: async (input, init) => {
+        wtCalledUrl = String(input);
+        wtAuthHeader = new Headers(init?.headers).get('Authorization') ?? '';
+        assert.equal(init?.method, 'POST');
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+    assert.equal(wtCalledUrl, 'http://watchtower:8080/v1/update');
+    assert.equal(wtAuthHeader, 'Bearer wt-secret-token');
+    assert.equal(wtRes.ok, true);
+    assert.equal(wtRes.mode, 'watchtower');
+    assert.equal(wtRes.restarting, true);
+
+    // Unconfigured Docker throws 409
+    await assert.rejects(
+      () =>
+        triggerSystemUpdate({
+          runtimeMode: 'docker',
+          watchtowerUrl: '',
+        }),
+      (err: unknown) => err instanceof SystemUpdateError && err.status === 409,
+    );
+
+    // Native mode runs git pull --ff-only && npm run build and schedules restart
+    const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-core-update-'));
+    fs.mkdirSync(path.join(tmpRepo, '.git'));
+    const ran: Array<{ cmd: string; args: string[]; cwd: string }> = [];
+    let restarted = false;
+    try {
+      const nativeRes = await triggerSystemUpdate({
+        runtimeMode: 'native',
+        watchtowerUrl: '',
+        repoDir: tmpRepo,
+        runCommand: async (cmd, args, cwd) => {
+          ran.push({ cmd, args, cwd });
+        },
+        onRestart: () => {
+          restarted = true;
+        },
+      });
+      assert.equal(nativeRes.ok, true);
+      assert.equal(nativeRes.mode, 'native');
+      assert.equal(nativeRes.restarting, true);
+      assert.equal(restarted, true);
+      assert.deepEqual(
+        ran.map((r) => [r.cmd, ...r.args]),
+        [
+          ['git', 'pull', '--ff-only'],
+          ['npm', 'run', 'build'],
+        ],
+      );
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('handles POST /api/system/update (Watchtower mock, 403 for guest, 409 when unconfigured)', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+    const watchtowerCalls: Array<{ url: string; auth: string | null }> = [];
+
+    const app = createApp({
+      db,
+      masterKey,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        const auth = new Headers(init?.headers).get('Authorization');
+        watchtowerCalls.push({ url, auth });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+
+    // Setup admin + guest
+    const setupRes = await app.request('http://localhost/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'adminPassword123!' }),
+    });
+    assert.equal(setupRes.status, 201);
+    const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+    const invRes = await app.request('http://localhost/api/invitations', {
+      method: 'POST',
+      headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        dailyTokenLimit: 10000,
+        quotaResetMode: 'utc_midnight',
+        allowedModels: ['*'],
+      }),
+    });
+    const invData = (await invRes.json()) as { token: string };
+    const acceptRes = await app.request(`http://localhost/api/invitations/${invData.token}/accept`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'guest_user', password: 'guestPassword123!' }),
+    });
+    const guestCookie = extractCookiePair(acceptRes.headers.get('set-cookie'));
+
+    // Unauthenticated -> 401
+    const unauthRes = await app.request('http://localhost/api/system/update', { method: 'POST' });
+    assert.equal(unauthRes.status, 401);
+
+    // Guest -> 403
+    const guestRes = await app.request('http://localhost/api/system/update', {
+      method: 'POST',
+      headers: { Cookie: guestCookie },
+    });
+    assert.equal(guestRes.status, 403);
+
+    const prevRuntime = process.env.BIFROST_RUNTIME;
+    const prevWtUrl = process.env.BIFROST_WATCHTOWER_URL;
+    const prevWtToken = process.env.BIFROST_WATCHTOWER_TOKEN;
+
+    try {
+      // Docker without Watchtower -> 409
+      process.env.BIFROST_RUNTIME = 'docker';
+      delete process.env.BIFROST_WATCHTOWER_URL;
+      delete process.env.BIFROST_WATCHTOWER_TOKEN;
+
+      const unconfiguredRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(unconfiguredRes.status, 409);
+
+      // Docker with Watchtower -> 200
+      process.env.BIFROST_WATCHTOWER_URL = 'http://watchtower.internal:8080';
+      process.env.BIFROST_WATCHTOWER_TOKEN = 'wt-token-123';
+
+      const okRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(okRes.status, 200);
+      const okJson = (await okRes.json()) as {
+        ok: boolean;
+        mode: string;
+        message: string;
+        restarting: boolean;
+      };
+      assert.equal(okJson.ok, true);
+      assert.equal(okJson.mode, 'watchtower');
+      assert.equal(okJson.restarting, true);
+      assert.equal(watchtowerCalls.length, 1);
+      assert.equal(watchtowerCalls[0]!.url, 'http://watchtower.internal:8080/v1/update');
+      assert.equal(watchtowerCalls[0]!.auth, 'Bearer wt-token-123');
+    } finally {
+      if (prevRuntime === undefined) delete process.env.BIFROST_RUNTIME;
+      else process.env.BIFROST_RUNTIME = prevRuntime;
+      if (prevWtUrl === undefined) delete process.env.BIFROST_WATCHTOWER_URL;
+      else process.env.BIFROST_WATCHTOWER_URL = prevWtUrl;
+      if (prevWtToken === undefined) delete process.env.BIFROST_WATCHTOWER_TOKEN;
+      else process.env.BIFROST_WATCHTOWER_TOKEN = prevWtToken;
+    }
+  });
+
+  it('handles POST /api/nodes/:id/update against a mock node HTTP server and enforces 403 for guests', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+    const app = createApp({ db, masterKey });
+
+    let receivedAuth = '';
+    let receivedPath = '';
+    const mockNodeServer = http.createServer((req, res) => {
+      receivedAuth = String(req.headers.authorization ?? '');
+      receivedPath = req.url ?? '';
+      if (req.method === 'POST' && req.url === '/_bifrost/update') {
+        const body = JSON.stringify({
+          ok: true,
+          restarting: true,
+          message: 'Mock node updated and restarting.',
+        });
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body).toString(),
+        });
+        res.end(body);
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => mockNodeServer.listen(0, '127.0.0.1', resolve));
+    const addr = mockNodeServer.address() as { port: number };
+
+    try {
+      const setupRes = await app.request('http://localhost/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'adminPassword123!' }),
+      });
+      const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+      const invRes = await app.request('http://localhost/api/invitations', {
+        method: 'POST',
+        headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dailyTokenLimit: 10000,
+          quotaResetMode: 'utc_midnight',
+          allowedModels: ['*'],
+        }),
+      });
+      const invData = (await invRes.json()) as { token: string };
+      const acceptRes = await app.request(
+        `http://localhost/api/invitations/${invData.token}/accept`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'guest_user', password: 'guestPassword123!' }),
+        },
+      );
+      const guestCookie = extractCookiePair(acceptRes.headers.get('set-cookie'));
+
+      // Register node
+      const createNodeRes = await app.request('http://localhost/api/nodes', {
+        method: 'POST',
+        headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Update Test Node',
+          mode: 'tailscale',
+          endpoint: `127.0.0.1:${addr.port}`,
+        }),
+      });
+      assert.equal(createNodeRes.status, 201);
+      const createdNode = (await createNodeRes.json()) as {
+        node: { id: string };
+        rawToken: string;
+      };
+
+      // Guest -> 403
+      const guestRes = await app.request(
+        `http://localhost/api/nodes/${createdNode.node.id}/update`,
+        {
+          method: 'POST',
+          headers: { Cookie: guestCookie },
+        },
+      );
+      assert.equal(guestRes.status, 403);
+
+      // Admin -> 200
+      const adminRes = await app.request(
+        `http://localhost/api/nodes/${createdNode.node.id}/update`,
+        {
+          method: 'POST',
+          headers: { Cookie: adminCookie },
+        },
+      );
+      assert.equal(adminRes.status, 200);
+      const adminJson = (await adminRes.json()) as {
+        ok: boolean;
+        message: string;
+        restarting: boolean;
+      };
+      assert.equal(adminJson.ok, true);
+      assert.equal(adminJson.restarting, true);
+      assert.equal(adminJson.message, 'Mock node updated and restarting.');
+      assert.equal(receivedPath, '/_bifrost/update');
+      assert.equal(receivedAuth, `Bearer ${createdNode.rawToken}`);
+    } finally {
+      await new Promise<void>((resolve) => mockNodeServer.close(() => resolve()));
+    }
   });
 });
