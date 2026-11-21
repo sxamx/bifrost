@@ -191,6 +191,151 @@ function updateKeyHealthy(
   ).run(remaining, resetAt, keyId);
 }
 
+function inferWindowFromResetDelta(resetDeltaSec: number | null): 'hour' | 'day' | 'week' | null {
+  if (resetDeltaSec === null || !Number.isFinite(resetDeltaSec)) return null;
+  if (resetDeltaSec <= 3600) return 'hour';
+  if (resetDeltaSec <= 86400) return 'day';
+  return 'week';
+}
+
+function windowDurationSec(window: 'hour' | 'day' | 'week'): number {
+  if (window === 'hour') return 3600;
+  if (window === 'week') return 604800;
+  return 86400;
+}
+
+function recordRateLimitEvent(
+  db: DatabaseSync,
+  keyId: string,
+  headers: Headers | null,
+  nowSec: number,
+): void {
+  const keyRow = db
+    .prepare(
+      `SELECT pk.provider_id, pk.daily_quota_limit, p.schema_json
+       FROM provider_keys pk
+       JOIN providers p ON p.id = pk.provider_id
+       WHERE pk.id = ?`,
+    )
+    .get(keyId) as
+    | {
+        provider_id: string;
+        daily_quota_limit: number | bigint | null;
+        schema_json: string;
+      }
+    | undefined;
+
+  if (!keyRow) return;
+
+  const parsed = headers
+    ? parseRateLimitHeaders(headers, nowSec)
+    : { remaining: null, resetAt: null };
+  const resetDeltaSec =
+    parsed.resetAt !== null ? Math.max(0, parsed.resetAt - nowSec) : null;
+
+  let manifestWindow: 'hour' | 'day' | 'week' | null = null;
+  try {
+    const manifest = JSON.parse(keyRow.schema_json) as ProviderManifest;
+    const firstWin = manifest.rateLimitWindows?.[0];
+    if (firstWin === 'hour' || firstWin === 'day' || firstWin === 'week') {
+      manifestWindow = firstWin;
+    }
+  } catch {
+    // Ignore malformed manifest JSON
+  }
+
+  const windowHint: 'hour' | 'day' | 'week' =
+    inferWindowFromResetDelta(resetDeltaSec) ?? manifestWindow ?? 'day';
+  const lookbackSec = windowDurationSec(windowHint);
+
+  const usageRow = db
+    .prepare(
+      `SELECT COALESCE(SUM(prompt_tokens + completion_tokens + reasoning_tokens), 0) AS observed_tokens,
+              COUNT(*) AS observed_requests
+       FROM usage_logs
+       WHERE provider_id = ?
+         AND status IN ('ok', 'resumed')
+         AND created_at >= ?
+         AND created_at <= ?`,
+    )
+    .get(keyRow.provider_id, nowSec - lookbackSec, nowSec) as
+    | { observed_tokens: number | bigint; observed_requests: number | bigint }
+    | undefined;
+
+  const observedTokens = Number(usageRow?.observed_tokens ?? 0);
+  const observedRequests = Number(usageRow?.observed_requests ?? 0);
+
+  const cacheKey = `adaptive_rl:${keyRow.provider_id}`;
+  const existingRow = db
+    .prepare(`SELECT payload_json FROM external_cache WHERE cache_key = ?`)
+    .get(cacheKey) as { payload_json: string } | undefined;
+
+  let events: Array<{
+    providerKeyId: string;
+    windowHint: 'hour' | 'day' | 'week';
+    observedTokens: number;
+    observedRequests: number;
+    resetDeltaSec: number | null;
+    createdAt: number;
+  }> = [];
+
+  if (existingRow?.payload_json) {
+    try {
+      const parsed = JSON.parse(existingRow.payload_json) as unknown;
+      if (Array.isArray(parsed)) {
+        events = parsed.filter(
+          (e): e is (typeof events)[number] =>
+            Boolean(e && typeof e === 'object' && typeof (e as { createdAt?: unknown }).createdAt === 'number'),
+        );
+      }
+    } catch {
+      events = [];
+    }
+  }
+
+  events.unshift({
+    providerKeyId: keyId,
+    windowHint,
+    observedTokens,
+    observedRequests,
+    resetDeltaSec,
+    createdAt: nowSec,
+  });
+  const cutoffSec = nowSec - 604800;
+  events = events.filter((e) => e.createdAt >= cutoffSec).slice(0, 50);
+
+  db.prepare(
+    `INSERT INTO external_cache (cache_key, payload_json, etag, fetched_at)
+     VALUES (?, ?, NULL, ?)
+     ON CONFLICT(cache_key) DO UPDATE SET
+       payload_json = excluded.payload_json,
+       fetched_at = excluded.fetched_at`,
+  ).run(cacheKey, JSON.stringify(events), nowSec);
+
+  const configuredLimit =
+    keyRow.daily_quota_limit !== null && keyRow.daily_quota_limit !== undefined
+      ? Number(keyRow.daily_quota_limit)
+      : null;
+
+  if (configuredLimit !== null && observedTokens > 0 && observedTokens < configuredLimit) {
+    writeSystemLog(
+      db,
+      'warn',
+      'system',
+      `Adaptive quota ceiling adjusted for "${keyRow.provider_id}": HTTP 429 observed at ${observedTokens} tokens (${windowHint} window), below configured limit ${configuredLimit}.`,
+      {
+        providerId: keyRow.provider_id,
+        keyId,
+        windowHint,
+        observedTokens,
+        observedRequests,
+        configuredLimit,
+      },
+      nowSec,
+    );
+  }
+}
+
 function markKeyFailure(
   db: DatabaseSync,
   keyId: string,
@@ -206,6 +351,9 @@ function markKeyFailure(
     (httpStatus >= 500 && httpStatus <= 599);
 
   if (isTransientFailure) {
+    if (httpStatus === 429) {
+      recordRateLimitEvent(db, keyId, headers, nowSec);
+    }
     const parsed = headers
       ? parseRateLimitHeaders(headers, nowSec)
       : { remaining: 0, resetAt: null };

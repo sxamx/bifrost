@@ -29,6 +29,8 @@ export interface ProviderStaticModelDef {
 
 export type DataRetentionKind = 'zero' | 'transient' | 'retained' | 'variable';
 export type ProviderTrainingPolicy = 'never' | 'opt_out' | 'allowed' | 'unknown';
+export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens';
+export type ProviderRateLimitWindow = 'hour' | 'day' | 'week';
 
 export interface ProviderPrivacyConfig {
   retention: DataRetentionKind;
@@ -61,6 +63,8 @@ export interface ProviderManifest {
   reviewedAt?: string;
   adapter?: ProviderAdapterConfig;
   privacy?: ProviderPrivacyConfig;
+  rateLimitKind?: ProviderRateLimitKind;
+  rateLimitWindows?: ProviderRateLimitWindow[];
 }
 
 interface JsonSchemaNode {
@@ -287,6 +291,36 @@ function validateProviderSemantics(manifest: Record<string, unknown>): string[] 
       }
       if (priv.note !== undefined && typeof priv.note !== 'string') {
         errors.push('$.privacy.note: must be a string');
+      }
+    }
+  }
+  if (manifest.rateLimitKind !== undefined) {
+    const validKinds: ProviderRateLimitKind[] = ['none', 'requests', 'tokens'];
+    if (
+      typeof manifest.rateLimitKind !== 'string' ||
+      !validKinds.includes(manifest.rateLimitKind as ProviderRateLimitKind)
+    ) {
+      errors.push(`$.rateLimitKind: must be one of ${validKinds.join(', ')}`);
+    }
+  }
+  if (manifest.rateLimitWindows !== undefined) {
+    if (!Array.isArray(manifest.rateLimitWindows)) {
+      errors.push('$.rateLimitWindows: must be an array');
+    } else {
+      const validWindows: ProviderRateLimitWindow[] = ['hour', 'day', 'week'];
+      const seen = new Set<string>();
+      for (let i = 0; i < manifest.rateLimitWindows.length; i++) {
+        const w = manifest.rateLimitWindows[i];
+        if (typeof w !== 'string' || !validWindows.includes(w as ProviderRateLimitWindow)) {
+          errors.push(`$.rateLimitWindows[${i}]: must be one of ${validWindows.join(', ')}`);
+        } else if (seen.has(w)) {
+          errors.push(`$.rateLimitWindows[${i}]: duplicate window "${w}"`);
+        } else {
+          seen.add(w);
+        }
+      }
+      if (manifest.rateLimitKind === 'none' && manifest.rateLimitWindows.length > 0) {
+        errors.push('$.rateLimitWindows: must be empty or omitted when rateLimitKind is "none"');
       }
     }
   }

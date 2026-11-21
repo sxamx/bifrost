@@ -1,5 +1,6 @@
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import { redactSecretsInText } from '../db.js';
+import { computeAdaptiveFreeQuotas } from './adaptive-quota.js';
 import { parseAndScrubMetaJson, scrubSecretsFromText } from './redact.js';
 import {
   buildTimeBuckets,
@@ -130,6 +131,10 @@ export function getSummaryMetrics(
         quotaResetMode,
         nextResetAt,
         earliestProviderResetAt: null,
+        activeWindow: 'day',
+        confidence: 'configured',
+        effectiveLimit: configuredDailyLimit,
+        adaptiveAdjusted: false,
       },
       providersCount: Number(counts?.providers_cnt ?? 0),
       activeModelsCount: Number(counts?.models_cnt ?? 0),
@@ -219,6 +224,9 @@ export function getSummaryMetrics(
     )?.c ?? 0,
   );
 
+  const adaptive = computeAdaptiveFreeQuotas(db, nowSec);
+  const effectiveLimit = adaptive.effectiveLimit ?? configuredDailyLimit;
+
   return {
     quotaToday: {
       configuredDailyLimit,
@@ -229,10 +237,15 @@ export function getSummaryMetrics(
       quotaResetMode: 'utc_midnight',
       nextResetAt: formatIsoUtc(utcNextMidnightSec(nowSec)),
       earliestProviderResetAt,
+      activeWindow: adaptive.activeWindow,
+      confidence: adaptive.confidence,
+      effectiveLimit,
+      adaptiveAdjusted: adaptive.adaptiveAdjusted,
     },
     providersCount,
     activeModelsCount,
     onlineNodesCount,
+    providerQuotas: adaptive.providers,
   };
 }
 
@@ -599,12 +612,21 @@ export function getTokenActivity(
   if (options.filterId) {
     if (options.groupBy === 'model') {
       clauses.push('u.model_full_id = ?');
+      params.push(options.filterId);
     } else if (options.groupBy === 'provider') {
       clauses.push('u.provider_id = ?');
+      params.push(options.filterId);
+    } else if (options.groupBy === 'apiKey') {
+      if (options.filterId === 'session') {
+        clauses.push('u.internal_api_key_id IS NULL');
+      } else {
+        clauses.push('u.internal_api_key_id = ?');
+        params.push(options.filterId);
+      }
     } else {
       clauses.push('u.user_id = ?');
+      params.push(options.filterId);
     }
-    params.push(options.filterId);
   }
 
   const whereSql = clauses.join(' AND ');
@@ -704,6 +726,24 @@ export function getTokenActivity(
       LEFT JOIN providers p ON p.id = u.provider_id
       WHERE ${whereSql}
       GROUP BY u.provider_id, group_label
+    `;
+  } else if (options.groupBy === 'apiKey') {
+    breakdownSql = `
+      SELECT COALESCE(u.internal_api_key_id, 'session') AS group_id,
+             CASE
+               WHEN u.internal_api_key_id IS NULL THEN 'Panel / Sesión'
+               WHEN k.name IS NOT NULL THEN k.name || ' (' || k.key_prefix || '…)'
+               ELSE u.internal_api_key_id
+             END AS group_label,
+             COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
+             COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
+             COALESCE(SUM(u.reasoning_tokens), 0) AS reasoning_tokens,
+             COALESCE(SUM(u.cached_tokens), 0) AS cached_tokens,
+             COUNT(*) AS req_count
+      FROM usage_logs u
+      LEFT JOIN internal_api_keys k ON k.id = u.internal_api_key_id
+      WHERE ${whereSql}
+      GROUP BY COALESCE(u.internal_api_key_id, 'session'), group_label
     `;
   } else {
     breakdownSql = `

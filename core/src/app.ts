@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import { Hono } from 'hono';
+import { type Context, Hono } from 'hono';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import {
   BackupValidationError,
@@ -35,6 +35,7 @@ import {
   type MetricsRange,
   type SystemLogCategory,
   type SystemLogLevel,
+  computeAdaptiveFreeQuotas,
   computePercentiles,
   getLatencyMetrics,
   getProviderErrorRates7d,
@@ -236,6 +237,8 @@ function formatProviderSummaryRow(
       modelsSource: String(row.models_source),
       enabled: Number(row.enabled) === 1,
       privacy: manifest?.privacy ?? null,
+      rateLimitKind: manifest?.rateLimitKind ?? null,
+      rateLimitWindows: manifest?.rateLimitWindows ?? [],
       modelsCount,
     };
   }
@@ -253,6 +256,8 @@ function formatProviderSummaryRow(
     enabled: Number(row.enabled) === 1,
     reviewedAt: manifest?.reviewedAt ?? null,
     privacy: manifest?.privacy ?? null,
+    rateLimitKind: manifest?.rateLimitKind ?? null,
+    rateLimitWindows: manifest?.rateLimitWindows ?? [],
     lastModelsSyncAt:
       row.last_models_sync_at === null || row.last_models_sync_at === undefined
         ? null
@@ -649,6 +654,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       const normalizedManifests = validManifests.map((m) => ({
         ...m,
         privacy: m.privacy ?? null,
+        rateLimitKind: m.rateLimitKind ?? null,
+        rateLimitWindows: m.rateLimitWindows ?? [],
       }));
 
       return c.json({
@@ -661,6 +668,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       const fallback = loadCachedOrSeedCatalog().map((m) => ({
         ...m,
         privacy: m.privacy ?? null,
+        rateLimitKind: m.rateLimitKind ?? null,
+        rateLimitWindows: m.rateLimitWindows ?? [],
       }));
       const errMsg = redactSecretsInText(
         err instanceof Error ? err.message : 'Unable to reach remote marketplace catalog.',
@@ -1886,6 +1895,108 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     return c.json({ models });
   });
 
+  const handleSetModelVisibility = async (
+    c: Context<AppEnv>,
+    fullIdOverride?: string,
+  ) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const rawFullId = fullIdOverride ?? (typeof body.fullId === 'string' ? body.fullId : '');
+    const fullId = rawFullId.trim();
+    if (!fullId) {
+      return c.json({ error: 'Field "fullId" is required.' }, 400);
+    }
+
+    let disabled: boolean;
+    if (typeof body.disabled === 'boolean') {
+      disabled = body.disabled;
+    } else if (typeof body.disabledByAdmin === 'boolean') {
+      disabled = body.disabledByAdmin;
+    } else if (typeof body.visible === 'boolean') {
+      disabled = !body.visible;
+    } else {
+      return c.json({ error: 'Field "disabled" must be a boolean.' }, 400);
+    }
+
+    const existing = db
+      .prepare(
+        `SELECT m.*, p.name AS provider_name, p.schema_json AS provider_schema_json
+         FROM models m
+         JOIN providers p ON p.id = m.provider_id
+         WHERE m.full_id = ?`,
+      )
+      .get(fullId) as Record<string, unknown> | undefined;
+
+    if (!existing) {
+      return c.json({ error: `Model "${fullId}" not found.` }, 404);
+    }
+
+    const disabledFlag = disabled ? 1 : 0;
+    db.prepare(`UPDATE models SET disabled_by_admin = ? WHERE full_id = ?`).run(
+      disabledFlag,
+      fullId,
+    );
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Admin ${disabled ? 'disabled' : 'enabled'} model "${fullId}"`,
+      { adminUserId: user.id, fullId, disabledByAdmin: disabled },
+      nowSeconds(),
+    );
+
+    const updatedRow = db
+      .prepare(
+        `SELECT m.*, p.name AS provider_name, p.schema_json AS provider_schema_json
+         FROM models m
+         JOIN providers p ON p.id = m.provider_id
+         WHERE m.full_id = ?`,
+      )
+      .get(fullId) as Record<string, unknown>;
+
+    const snapshot = readCachedModelsDevSnapshot(db);
+    const hasCachedModelsDev =
+      Object.keys(snapshot.api).length > 0 || Object.keys(snapshot.canonical).length > 0;
+    const formatted = hasCachedModelsDev
+      ? formatModelRow(updatedRow, {
+          providerName: String(updatedRow.provider_name ?? ''),
+          modelsDevSnapshot: snapshot,
+        })
+      : formatModelRow(updatedRow, {
+          providerName: String(updatedRow.provider_name ?? ''),
+        });
+
+    return c.json({
+      ok: true,
+      fullId: formatted.fullId,
+      disabledByAdmin: formatted.disabledByAdmin,
+      model: formatted,
+    });
+  };
+
+  app.post('/api/models/visibility', (c) => handleSetModelVisibility(c));
+
+  app.patch('/api/models/:id/visibility', (c) => {
+    let decodedId = c.req.param('id') ?? '';
+    try {
+      decodedId = decodeURIComponent(decodedId);
+    } catch {
+      return c.json({ error: 'Invalid model identifier encoding.' }, 400);
+    }
+    return handleSetModelVisibility(c, decodedId);
+  });
+
   app.get('/api/models/*', async (c) => {
     const user = c.get('user');
     let rawPathname: string;
@@ -2424,7 +2535,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   // --- Phase 5: Telemetry, Quota Summary, Percentiles, Uptime & Audit Logs (HU-17..HU-20c) ---
 
   const VALID_METRICS_RANGES = new Set<string>(['today', '24h', '7d', '30d']);
-  const VALID_ACTIVITY_GROUP_BY = new Set<string>(['model', 'provider', 'user']);
+  const VALID_ACTIVITY_GROUP_BY = new Set<string>(['model', 'provider', 'user', 'apiKey']);
   const VALID_LOG_LEVELS = new Set<string>(['info', 'warn', 'error']);
   const VALID_LOG_CATEGORIES = new Set<string>([
     'failover',
@@ -2465,7 +2576,44 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       quotaPercentageRemaining,
       nextResetAt: summary.quotaToday.nextResetAt,
       resetMode: summary.quotaToday.quotaResetMode,
+      activeWindow: summary.quotaToday.activeWindow ?? 'day',
+      quotaConfidence: summary.quotaToday.confidence ?? 'inferred',
+      effectiveLimit: summary.quotaToday.effectiveLimit ?? totalDailyLimit,
+      adaptiveAdjusted: Boolean(summary.quotaToday.adaptiveAdjusted),
     });
+  });
+
+  app.get('/api/metrics/free-quota', (c) => {
+    const user = c.get('user');
+    const nowSec = nowSeconds();
+    if (user.role === 'guest') {
+      const summary = getSummaryMetrics(db, {
+        nowSec,
+        userId: user.id,
+        role: user.role,
+      });
+      const limit = summary.quotaToday.configuredDailyLimit;
+      const used = summary.quotaToday.usedTokensToday;
+      const remaining = summary.quotaToday.remainingTokensToday;
+      const pct =
+        limit !== null && limit > 0 && remaining !== null
+          ? round2(Math.max(0, Math.min(100, (remaining / limit) * 100)))
+          : null;
+      return c.json({
+        activeWindow: 'day',
+        confidence: 'configured',
+        configuredLimit: limit,
+        effectiveLimit: limit,
+        usedInWindow: used,
+        remainingInWindow: remaining,
+        quotaPercentageRemaining: pct,
+        adaptiveAdjusted: false,
+        providers: [],
+      });
+    }
+
+    const adaptive = computeAdaptiveFreeQuotas(db, nowSec);
+    return c.json(adaptive);
   });
 
   app.get('/api/metrics/latency', (c) => {
@@ -2574,7 +2722,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     const rawGroupBy = (c.req.query('groupBy') ?? 'model').trim();
     if (!VALID_ACTIVITY_GROUP_BY.has(rawGroupBy)) {
       return c.json(
-        { error: 'Invalid groupBy parameter. Expected one of: model, provider, user.' },
+        { error: 'Invalid groupBy parameter. Expected one of: model, provider, user, apiKey.' },
         400,
       );
     }
@@ -2762,6 +2910,23 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         nowSeconds(),
       );
       return c.json(created, 201);
+    } catch (err) {
+      if (err instanceof UserHttpError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.delete('/api/invitations/:id', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Administrator privileges required.' }, 403);
+    }
+
+    try {
+      deleteInvitation(db, user.id, c.req.param('id'), nowSeconds());
+      return c.json({ ok: true });
     } catch (err) {
       if (err instanceof UserHttpError) {
         return c.json({ error: err.message }, err.status);

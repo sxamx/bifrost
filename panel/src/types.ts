@@ -248,6 +248,40 @@ export interface BackupImportResult {
 
 /* Phase 5 — Quota Hero, Percentile Telemetry, 60d Uptime, Activity & System Logs */
 
+export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens';
+export type ProviderRateLimitWindow = 'hour' | 'day' | 'week';
+export type QuotaConfidence = 'header_exact' | 'configured' | 'inferred';
+
+export interface ProviderAdaptiveQuota {
+  providerId: string;
+  providerName: string;
+  rateLimitKind: ProviderRateLimitKind | null;
+  supportedWindows: ProviderRateLimitWindow[];
+  activeWindow: ProviderRateLimitWindow;
+  confidence: QuotaConfidence;
+  configuredLimit: number | null;
+  inferredLimit: number | null;
+  effectiveLimit: number | null;
+  usedInWindow: number;
+  remainingInWindow: number | null;
+  headerRemaining: number | null;
+  earliestResetAt: string | null;
+  recent429Count7d: number;
+  adaptiveAdjusted: boolean;
+}
+
+export interface FreeQuotaStatus {
+  activeWindow: ProviderRateLimitWindow;
+  confidence: QuotaConfidence;
+  configuredLimit: number | null;
+  effectiveLimit: number | null;
+  usedInWindow: number;
+  remainingInWindow: number | null;
+  quotaPercentageRemaining: number | null;
+  adaptiveAdjusted: boolean;
+  providers: ProviderAdaptiveQuota[];
+}
+
 export interface MetricsSummary {
   quotaPercentageRemaining: number | null;
   usedTokensToday: number;
@@ -257,6 +291,11 @@ export interface MetricsSummary {
   providersCount: number;
   activeModelsCount: number;
   onlineNodesCount: number;
+  activeWindow?: ProviderRateLimitWindow;
+  quotaConfidence?: QuotaConfidence;
+  effectiveLimit?: number | null;
+  adaptiveAdjusted?: boolean;
+  providerQuotas?: ProviderAdaptiveQuota[];
 }
 
 export interface PercentileTuple {
@@ -318,7 +357,7 @@ export interface ProviderReliabilityEntry {
 }
 
 export type ActivityRange = 'today' | '7d' | '30d';
-export type ActivityGroupBy = 'model' | 'provider' | 'user';
+export type ActivityGroupBy = 'model' | 'provider' | 'user' | 'apiKey';
 
 export interface ActivitySeriesItem {
   key: string;
@@ -483,6 +522,8 @@ export interface ProviderManifest {
     accountLabel?: string;
   };
   privacy?: ProviderPrivacyConfig | null;
+  rateLimitKind?: ProviderRateLimitKind | null;
+  rateLimitWindows?: ProviderRateLimitWindow[];
 }
 
 export interface MarketplaceCatalogState {
@@ -555,6 +596,8 @@ export interface ProviderSummary {
   enabled?: boolean;
   reviewedAt?: string | null;
   privacy?: ProviderPrivacyConfig | null;
+  rateLimitKind?: ProviderRateLimitKind | null;
+  rateLimitWindows?: ProviderRateLimitWindow[];
   lastModelsSyncAt?: number | null;
   createdAt?: number;
   manifest?: ProviderManifest;

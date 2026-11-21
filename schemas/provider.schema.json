@@ -155,6 +155,19 @@
           "type": "string"
         }
       }
+    },
+    "rateLimitKind": {
+      "type": "string",
+      "enum": ["none", "requests", "tokens"],
+      "description": "Tipo de límite de cuota gratuita del proveedor (HU-38)."
+    },
+    "rateLimitWindows": {
+      "type": "array",
+      "description": "Ventanas de cuota soportadas por el proveedor (HU-38).",
+      "items": {
+        "type": "string",
+        "enum": ["hour", "day", "week"]
+      }
     }
   }
 }

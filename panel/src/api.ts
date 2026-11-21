@@ -18,6 +18,7 @@ import type {
   EpochBenchmarkRun,
   ExitNodeItem,
   ExitNodeTestResult,
+  FreeQuotaStatus,
   InvitationItem,
   KeysListResponse,
   LatencyBucketPoint,
@@ -36,6 +37,7 @@ import type {
   PercentileTuple,
   PlaygroundChatRequest,
   PlaygroundChatResponse,
+  ProviderAdaptiveQuota,
   ProviderCacheEntry,
   ProviderKeyItem,
   ProviderKeyTestResult,
@@ -43,9 +45,12 @@ import type {
   ProviderManifest,
   ProviderModelItem,
   ProviderPrivacyConfig,
+  ProviderRateLimitKind,
+  ProviderRateLimitWindow,
   ProviderReliabilityEntry,
   ProviderSummary,
   ProvidersResponse,
+  QuotaConfidence,
   QuotaResetMode,
   RotateNodeTokenResult,
   SpeedMetricsData,
@@ -624,6 +629,61 @@ function normalizeProviderPrivacy(raw: unknown): ProviderPrivacyConfig | null {
     result.note = r.note;
   }
   return result;
+}
+
+function normalizeRateLimitKind(raw: unknown): ProviderRateLimitKind | null {
+  return raw === 'none' || raw === 'requests' || raw === 'tokens' ? raw : null;
+}
+
+function normalizeRateLimitWindow(raw: unknown): ProviderRateLimitWindow {
+  return raw === 'hour' || raw === 'week' ? raw : 'day';
+}
+
+function normalizeRateLimitWindows(raw: unknown): ProviderRateLimitWindow[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<ProviderRateLimitWindow>();
+  const out: ProviderRateLimitWindow[] = [];
+  for (const item of raw) {
+    if (item === 'hour' || item === 'day' || item === 'week') {
+      if (!seen.has(item)) {
+        seen.add(item);
+        out.push(item);
+      }
+    }
+  }
+  return out;
+}
+
+function normalizeQuotaConfidence(raw: unknown): QuotaConfidence {
+  return raw === 'header_exact' || raw === 'configured' || raw === 'inferred'
+    ? raw
+    : 'inferred';
+}
+
+function normalizeProviderAdaptiveQuota(raw: unknown): ProviderAdaptiveQuota {
+  const r = asRecord(raw);
+  return {
+    providerId: String(r.providerId ?? r.provider_id ?? ''),
+    providerName: String(r.providerName ?? r.provider_name ?? r.providerId ?? ''),
+    rateLimitKind: normalizeRateLimitKind(r.rateLimitKind ?? r.rate_limit_kind),
+    supportedWindows: normalizeRateLimitWindows(r.supportedWindows ?? r.supported_windows),
+    activeWindow: normalizeRateLimitWindow(r.activeWindow ?? r.active_window),
+    confidence: normalizeQuotaConfidence(r.confidence),
+    configuredLimit: asNullableNum(r.configuredLimit ?? r.configured_limit),
+    inferredLimit: asNullableNum(r.inferredLimit ?? r.inferred_limit),
+    effectiveLimit: asNullableNum(r.effectiveLimit ?? r.effective_limit),
+    usedInWindow: asNum(r.usedInWindow ?? r.used_in_window),
+    remainingInWindow: asNullableNum(r.remainingInWindow ?? r.remaining_in_window),
+    headerRemaining: asNullableNum(r.headerRemaining ?? r.header_remaining),
+    earliestResetAt:
+      typeof r.earliestResetAt === 'string'
+        ? r.earliestResetAt
+        : typeof r.earliest_reset_at === 'string'
+          ? r.earliest_reset_at
+          : null,
+    recent429Count7d: asNum(r.recent429Count7d ?? r.recent_429_count_7d),
+    adaptiveAdjusted: Boolean(r.adaptiveAdjusted ?? r.adaptive_adjusted ?? false),
+  };
 }
 
 function normalizeProviderModel(raw: unknown): ProviderModelItem {
@@ -1258,6 +1318,12 @@ export const api = {
     };
   },
 
+  deleteInvitation(invitationId: string): Promise<{ ok: boolean }> {
+    return request<{ ok: boolean }>(`/api/invitations/${encodeURIComponent(invitationId)}`, {
+      method: 'DELETE',
+    });
+  },
+
   acceptInvitation(
     token: string,
     username: string,
@@ -1371,6 +1437,23 @@ export const api = {
       );
     }
 
+    const quotaToday = asRecord(r.quotaToday);
+    const activeWindow = normalizeRateLimitWindow(
+      r.activeWindow ?? quotaToday.activeWindow
+    );
+    const quotaConfidence = normalizeQuotaConfidence(
+      r.quotaConfidence ?? quotaToday.confidence
+    );
+    const effectiveLimit = asNullableNum(
+      r.effectiveLimit ?? quotaToday.effectiveLimit ?? totalDailyLimit
+    );
+    const adaptiveAdjusted = Boolean(
+      r.adaptiveAdjusted ?? quotaToday.adaptiveAdjusted ?? false
+    );
+    const providerQuotas = Array.isArray(r.providerQuotas)
+      ? r.providerQuotas.map(normalizeProviderAdaptiveQuota)
+      : undefined;
+
     return {
       quotaPercentageRemaining: quotaPct,
       usedTokensToday,
@@ -1383,6 +1466,32 @@ export const api = {
       providersCount: asNum(r.providersCount ?? r.providers_count),
       activeModelsCount: asNum(r.activeModelsCount ?? r.active_models_count ?? r.modelsCount),
       onlineNodesCount: asNum(r.onlineNodesCount ?? r.online_nodes_count),
+      activeWindow,
+      quotaConfidence,
+      effectiveLimit,
+      adaptiveAdjusted,
+      providerQuotas,
+    };
+  },
+
+  async getFreeQuota(): Promise<FreeQuotaStatus> {
+    const raw = await request<unknown>('/api/metrics/free-quota', { method: 'GET' });
+    const r = asRecord(raw);
+    const providers = Array.isArray(r.providers)
+      ? r.providers.map(normalizeProviderAdaptiveQuota)
+      : [];
+    return {
+      activeWindow: normalizeRateLimitWindow(r.activeWindow ?? r.active_window),
+      confidence: normalizeQuotaConfidence(r.confidence),
+      configuredLimit: asNullableNum(r.configuredLimit ?? r.configured_limit),
+      effectiveLimit: asNullableNum(r.effectiveLimit ?? r.effective_limit),
+      usedInWindow: asNum(r.usedInWindow ?? r.used_in_window),
+      remainingInWindow: asNullableNum(r.remainingInWindow ?? r.remaining_in_window),
+      quotaPercentageRemaining: asNullableNum(
+        r.quotaPercentageRemaining ?? r.quota_percentage_remaining
+      ),
+      adaptiveAdjusted: Boolean(r.adaptiveAdjusted ?? r.adaptive_adjusted ?? false),
+      providers,
     };
   },
 
@@ -1835,6 +1944,8 @@ export const api = {
         .map((m) => ({
           ...m,
           privacy: normalizeProviderPrivacy(m.privacy),
+          rateLimitKind: normalizeRateLimitKind(m.rateLimitKind),
+          rateLimitWindows: normalizeRateLimitWindows(m.rateLimitWindows),
         }));
 
       return {

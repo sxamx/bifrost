@@ -188,6 +188,71 @@ export interface ProviderPrivacyConfig {
 
 ---
 
+### 2.8 Prioridad P3 (`HU-38`, `HU-39`: Metadatos de límites y cuotas adaptativas)
+
+**Contrato TypeScript en `panel/src/types.ts` (añadido por Backend):**
+```ts
+export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens';
+export type ProviderRateLimitWindow = 'hour' | 'day' | 'week';
+export type QuotaConfidence = 'header_exact' | 'configured' | 'inferred';
+
+export interface ProviderAdaptiveQuota {
+  providerId: string;
+  providerName: string;
+  rateLimitKind: ProviderRateLimitKind | null;
+  supportedWindows: ProviderRateLimitWindow[];
+  activeWindow: ProviderRateLimitWindow;
+  confidence: QuotaConfidence;
+  configuredLimit: number | null;
+  inferredLimit: number | null;
+  effectiveLimit: number | null;
+  usedInWindow: number;
+  remainingInWindow: number | null;
+  headerRemaining: number | null;
+  earliestResetAt: string | null;
+  recent429Count7d: number;
+  adaptiveAdjusted: boolean;
+}
+
+export interface FreeQuotaStatus {
+  activeWindow: ProviderRateLimitWindow;
+  confidence: QuotaConfidence;
+  configuredLimit: number | null;
+  effectiveLimit: number | null;
+  usedInWindow: number;
+  remainingInWindow: number | null;
+  quotaPercentageRemaining: number | null;
+  adaptiveAdjusted: boolean;
+  providers: ProviderAdaptiveQuota[];
+}
+```
+
+1. **Marketplace & Proveedores (`ProviderManifest` / `ProviderSummary`):**
+   - `rateLimitKind?: ProviderRateLimitKind | null` (`'none' | 'requests' | 'tokens' | null`)
+   - `rateLimitWindows?: ProviderRateLimitWindow[]` (`Array<'hour' | 'day' | 'week'>`)
+   - Normalizados en `api.getMarketplace()` (`MarketplaceCatalogState.manifests`) y disponibles en `ProviderManifest` / `ProviderSummary`.
+   - **Requisito UI (`MarketplaceTab.tsx` / `ProvidersTab.tsx` / `ProviderVaultCard.tsx`):** mostrar un badge de clasificación del límite de tasa en las tarjetas de proveedor (p. ej. *Sin límite*, *Por peticiones* o *Por tokens*, junto con las ventanas `hora` / `día` / `semana` cuando apliquen).
+
+2. **Cuota gratuita adaptativa (`MetricsSummary` vía `api.getMetricsSummary()` y `FreeQuotaStatus` vía `api.getFreeQuota()`):**
+   - En `MetricsSummary` (`/api/metrics/summary`, con respaldo en `quotaToday` del servidor):
+     - `activeWindow?: ProviderRateLimitWindow` (`'hour' | 'day' | 'week'`)
+     - `quotaConfidence?: QuotaConfidence` (`'header_exact' | 'configured' | 'inferred'`; mapeado desde `summary.quotaConfidence` o `quotaToday.confidence`)
+     - `effectiveLimit?: number | null`
+     - `adaptiveAdjusted?: boolean`
+     - `providerQuotas?: ProviderAdaptiveQuota[]`
+   - En `FreeQuotaStatus` (`/api/metrics/free-quota`):
+     - `activeWindow: ProviderRateLimitWindow` (`'hour' | 'day' | 'week'`)
+     - `confidence: QuotaConfidence` (`'header_exact' | 'configured' | 'inferred'`)
+     - `configuredLimit: number | null`, `effectiveLimit: number | null`, `usedInWindow: number`, `remainingInWindow: number | null`, `quotaPercentageRemaining: number | null`
+     - `adaptiveAdjusted: boolean`
+     - `providers: ProviderAdaptiveQuota[]`
+   - **Requisito UI (`OverviewTab.tsx` / `MetricsTab.tsx` — bloque «Cuota gratuita»):**
+     - Mostrar la ventana activa traducida (`hora` / `día` / `semana` para `'hour' | 'day' | 'week'`).
+     - Mostrar el indicador de confianza de la cuota (`Exacto por cabecera` para `'header_exact'`, `Configurado` para `'configured'`, `Inferido por 429` para `'inferred'`).
+     - Usar `effectiveLimit` / cifras en `tabular-nums` (`.mono`) e indicar mediante badge/nota (`InfoTip`) cuando `adaptiveAdjusted === true` o cuando exista desglose en `providerQuotas` / `providers`.
+
+---
+
 ## 3. Checklist final de implementación UI
 
 - [ ] **`ProviderVaultCard.tsx`**: switch **Activar / Desactivar** (`status === 'disabled'`), badge `no_node`, botón **Probar clave** (`ProviderKeyTestResult`) y badge/tooltip de advertencia de privacidad (`HU-40`).
@@ -196,5 +261,6 @@ export interface ProviderPrivacyConfig {
 - [ ] **`UsersTab.tsx`**: botón **Eliminar** en invitaciones pendientes (`api.deleteInvitation`), buscador de modelos en modales sin perder selección e interruptor/badge `enforceStrictQuota`.
 - [ ] **`ApiKeysTab.tsx`**: selector de expiración (`expiresInDays` / `expiresAt`), columna/badge de expiración y estado **Expirada**, y métricas compactas por clave (`usedTokens` / `requestsCount`).
 - [ ] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`) y opción **Por API key** en `ActivityGroupBy`.
-- [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx`**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter) y detalle de `training`.
+- [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx`**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter), detalle de `training` y badge de clasificación de límites (`rateLimitKind` / `rateLimitWindows`, `HU-38`).
+- [ ] **`OverviewTab.tsx` / `MetricsTab.tsx` (Cuota gratuita, `HU-39`)**: mostrar ventana activa (`hora` / `día` / `semana`), indicador de confianza (`Exacto por cabecera`, `Configurado`, `Inferido por 429`), `effectiveLimit`, estado `adaptiveAdjusted` y detalle por proveedor (`providerQuotas` / `FreeQuotaStatus.providers`).
 

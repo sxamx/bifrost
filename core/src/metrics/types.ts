@@ -4,7 +4,7 @@ export type UserRole = 'admin' | 'guest';
 export type QuotaResetMode = 'utc_midnight' | 'rolling_24h';
 export type UptimeDayState = 'ok' | 'partial' | 'error' | 'no_data';
 export type ActivityRange = 'today' | '24h' | '7d' | '30d';
-export type ActivityGroupBy = 'model' | 'provider' | 'user';
+export type ActivityGroupBy = 'model' | 'provider' | 'user' | 'apiKey';
 export type SystemLogLevel = 'info' | 'warn' | 'error';
 export type SystemLogCategory =
   | 'failover'
@@ -31,10 +31,15 @@ export interface SummaryMetricsResult {
     quotaResetMode: QuotaResetMode;
     nextResetAt: string;
     earliestProviderResetAt: string | null;
+    activeWindow?: 'hour' | 'day' | 'week';
+    confidence?: 'header_exact' | 'configured' | 'inferred';
+    effectiveLimit?: number | null;
+    adaptiveAdjusted?: boolean;
   };
   providersCount: number;
   activeModelsCount: number;
   onlineNodesCount: number;
+  providerQuotas?: import('./adaptive-quota.js').ProviderAdaptiveQuota[];
 }
 
 export interface LatencyMetricsOptions {
