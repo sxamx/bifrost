@@ -359,10 +359,24 @@ export async function triggerSystemUpdate(
       response = await fetchImpl(endpoint, {
         method: 'POST',
         headers,
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(45_000),
       });
     } catch (err) {
+      const name = err instanceof Error ? err.name : '';
       const msg = err instanceof Error ? err.message : String(err);
+      const isExpectedRestartInterrupt =
+        name === 'TimeoutError' ||
+        name === 'AbortError' ||
+        /timeout|aborted|ECONNRESET|socket|closed/i.test(msg);
+      if (isExpectedRestartInterrupt) {
+        return {
+          ok: true,
+          upToDate: false,
+          mode: 'watchtower',
+          message: 'Watchtower update triggered. Container is restarting with the latest image.',
+          restarting: true,
+        };
+      }
       throw new SystemUpdateError(`Failed to reach Watchtower at ${endpoint}: ${msg}`, 502);
     }
 
