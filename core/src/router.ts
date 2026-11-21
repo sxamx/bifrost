@@ -1836,3 +1836,380 @@ export async function executeChatCompletions(options: {
     },
   });
 }
+
+export async function executeEmbeddings(options: {
+  db: DatabaseSync;
+  masterKey: Buffer;
+  registry: DrainingRegistry;
+  fetchImpl: typeof fetch;
+  upstreamTls?: UpstreamTlsOptions;
+  now: () => number;
+  userId: string;
+  internalApiKeyId?: string | null;
+  modelFullId: string;
+  modelId: string;
+  providerRow: Record<string, unknown>;
+  requestBody: Record<string, unknown>;
+}): Promise<Response> {
+  const {
+    db,
+    masterKey,
+    registry,
+    fetchImpl,
+    upstreamTls,
+    now,
+    userId,
+    internalApiKeyId = null,
+    modelFullId,
+    modelId,
+    providerRow,
+    requestBody,
+  } = options;
+
+  const startMs = now();
+  const nowSec = Math.floor(startMs / 1000);
+
+  const quotaCheck = checkUserDailyQuotaUtc(db, userId, startMs);
+  if (quotaCheck.exceeded) {
+    return quotaCheck.response;
+  }
+
+  const providerId = String(providerRow.id);
+  if (registry.isProviderDraining(providerId)) {
+    return openAiErrorJson(
+      `Provider "${providerId}" is currently being removed.`,
+      'service_unavailable',
+      'provider_unavailable',
+      503,
+    );
+  }
+
+  const manifest = JSON.parse(String(providerRow.schema_json)) as ProviderManifest;
+  const effectiveBaseUrl =
+    providerRow.package_type === 'experimental-adapter' &&
+    typeof providerRow.adapter_url === 'string' &&
+    providerRow.adapter_url.length > 0
+      ? providerRow.adapter_url
+      : manifest.baseUrl;
+
+  const embeddingsUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/embeddings`;
+
+  const candidates = loadCandidateKeys(db, providerId, registry, nowSec);
+  if (candidates.length === 0) {
+    writeSystemLog(
+      db,
+      'warn',
+      'system',
+      `Embeddings routing failed for "${modelFullId}": provider "${providerId}" has no active API keys with an online exit node available.`,
+      { providerId, modelFullId, userId },
+      nowSec,
+    );
+    return openAiErrorJson(
+      `Provider "${providerId}" has no active API keys with an online exit node available.`,
+      'service_unavailable',
+      'no_provider_keys',
+      503,
+    );
+  }
+
+  const extractSafeUpstreamErrorMessage = async (res: Response): Promise<string> => {
+    const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+    const rawBody = await res.text().catch(() => '');
+    if (contentType.includes('application/json') && rawBody.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+        const errField = parsed.error;
+        const candidate =
+          errField && typeof errField === 'object' && !Array.isArray(errField)
+            ? (errField as Record<string, unknown>).message
+            : typeof errField === 'string'
+              ? errField
+              : parsed.message;
+        if (typeof candidate === 'string' && candidate.trim().length > 0) {
+          return redactSecretsInText(candidate.trim().slice(0, 300));
+        }
+      } catch {
+        // Ignore malformed JSON body
+      }
+    }
+    return `Upstream provider returned HTTP ${res.status}.`;
+  };
+
+  const dispatchRequestForKey = async (
+    key: ProviderKeyRecord,
+    init: RequestInit,
+  ): Promise<Response> => {
+    if (key.node_id) {
+      if (!key.node_encrypted_token || !key.node_endpoint) {
+        throw new Error(`Assigned exit node "${key.node_id}" is missing tunnel credentials`);
+      }
+      const nodeRawToken = decryptSecret(key.node_encrypted_token, masterKey);
+      return fetchViaExitNode(
+        embeddingsUrl,
+        init,
+        {
+          id: key.node_id,
+          name: key.node_name ?? key.node_id,
+          mode: key.node_mode === 'public_ip' ? 'public_ip' : 'tailscale',
+          endpoint: key.node_endpoint,
+          rawToken: nodeRawToken,
+          tlsFingerprint: key.node_tls_fingerprint,
+        },
+        upstreamTls,
+      );
+    }
+    return fetchImpl(embeddingsUrl, { ...init, redirect: 'error' });
+  };
+
+  const triedKeyIds = new Set<string>();
+  let lastStatus: number | null = null;
+  let lastErrorMsg = 'Upstream provider request failed.';
+  let lastKeyId: string | null = null;
+  let lastWasNetwork = false;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const key = candidates[i]!;
+    if (registry.isKeyDraining(key.id) || triedKeyIds.has(key.id)) {
+      continue;
+    }
+    triedKeyIds.add(key.id);
+    lastKeyId = key.id;
+
+    const releaseLease = registry.acquireLease(providerId, key.id);
+    try {
+      const rawSecret = decryptSecret(key.encrypted_secret, masterKey);
+      const headers: Record<string, string> = {
+        ...buildProviderAuthHeaders(manifest.auth, rawSecret),
+        'Content-Type': 'application/json',
+      };
+      const upstreamBody: Record<string, unknown> = {
+        ...requestBody,
+        model: modelId,
+      };
+
+      let res: Response;
+      try {
+        res = await dispatchRequestForKey(key, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(upstreamBody),
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        lastStatus = null;
+        lastWasNetwork = true;
+        lastErrorMsg = redactSecretsInText(`Network/tunnel error: ${msg}`);
+        markKeyFailure(db, key.id, null, lastErrorMsg, null, Math.floor(now() / 1000));
+
+        const nextKey = candidates.slice(i + 1).find((k) => !registry.isKeyDraining(k.id));
+        if (nextKey) {
+          writeSystemLog(
+            db,
+            'warn',
+            'failover',
+            `Key "${key.label}" (…${key.last4}) failed with network/tunnel error on "${providerId}" embeddings; failing over to "${nextKey.label}" (…${nextKey.last4})`,
+            {
+              providerId,
+              failedKeyId: key.id,
+              failedKeyLast4: key.last4,
+              nodeId: key.node_id,
+              nextKeyId: nextKey.id,
+              reason: lastErrorMsg,
+            },
+            Math.floor(now() / 1000),
+          );
+          continue;
+        }
+        break;
+      }
+
+      if (isRetryableKeyFailureStatus(res.status)) {
+        lastStatus = res.status;
+        lastWasNetwork = false;
+        const safeErr = await extractSafeUpstreamErrorMessage(res);
+        lastErrorMsg = redactSecretsInText(`HTTP ${res.status}: ${safeErr.slice(0, 160)}`);
+        markKeyFailure(
+          db,
+          key.id,
+          res.status,
+          lastErrorMsg,
+          res.headers,
+          Math.floor(now() / 1000),
+        );
+
+        const nextKey = candidates.slice(i + 1).find((k) => !registry.isKeyDraining(k.id));
+        if (nextKey) {
+          writeSystemLog(
+            db,
+            'warn',
+            'failover',
+            `Key "${key.label}" (…${key.last4}) returned HTTP ${res.status} on "${providerId}" embeddings; failing over to "${nextKey.label}" (…${nextKey.last4})`,
+            {
+              providerId,
+              failedKeyId: key.id,
+              failedKeyLast4: key.last4,
+              nodeId: key.node_id,
+              nextKeyId: nextKey.id,
+              httpStatus: res.status,
+            },
+            Math.floor(now() / 1000),
+          );
+          continue;
+        }
+        break;
+      }
+
+      if (!res.ok) {
+        const safeErr = await extractSafeUpstreamErrorMessage(res);
+        const endMs = now();
+        const endSec = Math.floor(endMs / 1000);
+        writeSystemLog(
+          db,
+          'error',
+          'system',
+          `Upstream HTTP ${res.status} on "${modelFullId}" embeddings (${providerId}): ${safeErr}`,
+          { providerId, modelFullId, keyId: key.id, httpStatus: res.status },
+          endSec,
+        );
+        recordUsageLog(db, {
+          userId,
+          providerId,
+          providerKeyId: key.id,
+          internalApiKeyId,
+          modelFullId,
+          promptTokens: 0,
+          completionTokens: 0,
+          reasoningTokens: 0,
+          cachedTokens: 0,
+          ttftMs: null,
+          durationMs: Math.max(1, endMs - startMs),
+          status: 'error',
+          errorType: 'upstream',
+          createdAt: endSec,
+        });
+        return openAiErrorJson(safeErr, 'invalid_request_error', 'upstream_error', res.status);
+      }
+
+      const ttftMs = Math.max(1, now() - startMs);
+      let data: Record<string, unknown>;
+      try {
+        data = (await res.json()) as Record<string, unknown>;
+      } catch {
+        const endMs = now();
+        const endSec = Math.floor(endMs / 1000);
+        writeSystemLog(
+          db,
+          'error',
+          'system',
+          `Upstream provider "${providerId}" returned malformed JSON on "${modelFullId}" embeddings`,
+          { providerId, modelFullId, keyId: key.id },
+          endSec,
+        );
+        recordUsageLog(db, {
+          userId,
+          providerId,
+          providerKeyId: key.id,
+          internalApiKeyId,
+          modelFullId,
+          promptTokens: 0,
+          completionTokens: 0,
+          reasoningTokens: 0,
+          cachedTokens: 0,
+          ttftMs,
+          durationMs: Math.max(1, endMs - startMs),
+          status: 'error',
+          errorType: 'upstream',
+          createdAt: endSec,
+        });
+        return openAiErrorJson(
+          'Upstream provider returned malformed JSON response.',
+          'server_error',
+          'malformed_upstream_json',
+          502,
+        );
+      }
+
+      const endMs = now();
+      const durationMs = Math.max(1, endMs - startMs);
+      const endSec = Math.floor(endMs / 1000);
+
+      updateKeyHealthy(db, key.id, res.headers, endSec);
+
+      const usage =
+        data.usage && typeof data.usage === 'object'
+          ? (data.usage as Record<string, unknown>)
+          : {};
+      const promptTokens = Number(usage.prompt_tokens ?? usage.total_tokens ?? 0);
+
+      recordUsageLog(db, {
+        userId,
+        providerId,
+        providerKeyId: key.id,
+        internalApiKeyId,
+        modelFullId,
+        promptTokens: Number.isFinite(promptTokens) && promptTokens > 0 ? Math.floor(promptTokens) : 0,
+        completionTokens: 0,
+        reasoningTokens: 0,
+        cachedTokens: 0,
+        ttftMs,
+        durationMs,
+        status: 'ok',
+        errorType: null,
+        createdAt: endSec,
+      });
+
+      const responsePayload = {
+        ...data,
+        model: modelFullId,
+      };
+
+      return new Response(JSON.stringify(responsePayload), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Bifrost-TTFT-Ms': String(ttftMs),
+        },
+      });
+    } finally {
+      releaseLease();
+    }
+  }
+
+  const failEndMs = now();
+  const failSec = Math.floor(failEndMs / 1000);
+  writeSystemLog(
+    db,
+    'error',
+    'failover',
+    `All candidate keys exhausted for provider "${providerId}" embeddings: ${lastErrorMsg}`,
+    { providerId, triedKeysCount: triedKeyIds.size, lastStatus },
+    failSec,
+  );
+
+  const baseFailType =
+    lastStatus === 429 ? 'rate_limit' : lastWasNetwork ? 'network' : 'upstream';
+
+  recordUsageLog(db, {
+    userId,
+    providerId,
+    providerKeyId: lastKeyId,
+    internalApiKeyId,
+    modelFullId,
+    promptTokens: 0,
+    completionTokens: 0,
+    reasoningTokens: 0,
+    cachedTokens: 0,
+    ttftMs: null,
+    durationMs: Math.max(1, failEndMs - startMs),
+    status: 'error',
+    errorType: baseFailType,
+    createdAt: failSec,
+  });
+
+  return openAiErrorJson(
+    `All configured keys for provider "${providerId}" failed (${lastErrorMsg}).`,
+    lastStatus === 429 ? 'rate_limit_error' : 'service_unavailable',
+    lastStatus === 429 ? 'upstream_rate_limited' : 'upstream_unavailable',
+    lastStatus === 429 ? 429 : 502,
+  );
+}

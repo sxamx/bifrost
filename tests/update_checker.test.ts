@@ -729,4 +729,65 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       await new Promise<void>((resolve) => mockNodeServer.close(() => resolve()));
     }
   });
+
+  it('HU-41: returns updateAvailable: null when node commit is null or latestCommit is unknown', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+
+    const app = createApp({
+      db,
+      masterKey,
+      currentCommit: '1111111',
+      fetchImpl: async () => makeGitHubCommitResponse('2222222000000000000000000000000000000000'),
+    });
+
+    const setupRes = await app.request('http://localhost/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'adminPassword123!' }),
+    });
+    assert.equal(setupRes.status, 201);
+    const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+    // Create a node without running /test (commit is null) and before any update check (latestCommit is null)
+    const createRes = await app.request('http://localhost/api/nodes', {
+      method: 'POST',
+      headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Legacy Node Without Commit',
+        mode: 'tailscale',
+        endpoint: '100.64.0.99:9443',
+      }),
+    });
+    assert.equal(createRes.status, 201);
+    const created = (await createRes.json()) as {
+      node: { id: string; commit: string | null; updateAvailable: boolean | null };
+    };
+    assert.equal(created.node.commit, null);
+    assert.equal(created.node.updateAvailable, null);
+
+    // GET /api/nodes before update check -> updateAvailable === null
+    const listBeforeCheck = await app.request('http://localhost/api/nodes', {
+      headers: { Cookie: adminCookie },
+    });
+    assert.equal(listBeforeCheck.status, 200);
+    const listBeforeJson = (await listBeforeCheck.json()) as {
+      nodes: Array<{ id: string; commit: string | null; updateAvailable: boolean | null }>;
+    };
+    assert.equal(listBeforeJson.nodes[0]!.commit, null);
+    assert.equal(listBeforeJson.nodes[0]!.updateAvailable, null);
+
+    // Populate latestCommit via update-status; node still has commit === null -> updateAvailable must STILL be null
+    await app.request('http://localhost/api/system/update-status?refresh=1', {
+      headers: { Cookie: adminCookie },
+    });
+    const listAfterCheck = await app.request('http://localhost/api/nodes', {
+      headers: { Cookie: adminCookie },
+    });
+    const listAfterJson = (await listAfterCheck.json()) as {
+      nodes: Array<{ id: string; commit: string | null; updateAvailable: boolean | null }>;
+    };
+    assert.equal(listAfterJson.nodes[0]!.commit, null);
+    assert.equal(listAfterJson.nodes[0]!.updateAvailable, null);
+  });
 });

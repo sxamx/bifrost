@@ -75,7 +75,12 @@ import {
   testNodeConnectivity,
   triggerNodeUpdate,
 } from './nodes.js';
-import { DrainingRegistry, checkUserDailyQuotaUtc, executeChatCompletions } from './router.js';
+import {
+  DrainingRegistry,
+  checkUserDailyQuotaUtc,
+  executeChatCompletions,
+  executeEmbeddings,
+} from './router.js';
 import {
   type ProviderManifest,
   buildProviderAuthHeaders,
@@ -1128,9 +1133,25 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         }));
     };
 
+    if (
+      body.status !== undefined &&
+      body.status !== 'active' &&
+      body.status !== 'disabled'
+    ) {
+      return c.json({ error: 'status must be "active" or "disabled".' }, 400);
+    }
+    if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+      return c.json({ error: 'enabled must be a boolean.' }, 400);
+    }
+
+    const requestedDisabled =
+      body.status === 'disabled' || (body.status !== 'active' && body.enabled === false);
+
     let assignedNodeId: string | null = null;
     let forcedNode = 0;
-    let initialKeyStatus: 'active' | 'no_node' = 'active';
+    let initialKeyStatus: 'active' | 'disabled' | 'no_node' = requestedDisabled
+      ? 'disabled'
+      : 'active';
     let initialLastError: string | null = null;
 
     if (typeof body.nodeId === 'string' && body.nodeId.trim().length > 0) {
@@ -1167,7 +1188,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
       assignedNodeId = targetNodeId;
       forcedNode = sameProviderKeys.length > 0 ? 1 : 0;
-      if (nodeRow.status !== 'online') {
+      if (nodeRow.status !== 'online' && !requestedDisabled) {
         initialKeyStatus = 'no_node';
         initialLastError = `Assigned exit node "${nodeRow.name}" is ${nodeRow.status}`;
       }
@@ -1591,11 +1612,14 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json({ error: 'Provider key not found.' }, 404);
     }
 
-    if (keyRow.status === 'no_node' && !keyRow.node_id) {
+    const currentKeyStatus = String(keyRow.status ?? 'active');
+
+    if (currentKeyStatus === 'no_node' && !keyRow.node_id) {
       return c.json({
         ok: false,
         httpStatus: null,
         latencyMs: 0,
+        status: currentKeyStatus,
         message: 'Key has no assigned exit node (status: no_node) and will not route directly.',
       });
     }
@@ -1608,6 +1632,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         ok: false,
         httpStatus: null,
         latencyMs: 0,
+        status: currentKeyStatus,
         message: 'Provider manifest schema is invalid.',
       });
     }
@@ -1632,6 +1657,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         ok: false,
         httpStatus: null,
         latencyMs: 0,
+        status: currentKeyStatus,
         message: 'Failed to decrypt provider key.',
       });
     }
@@ -1647,6 +1673,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
             ok: false,
             httpStatus: null,
             latencyMs: 0,
+            status: currentKeyStatus,
             message: `Assigned exit node "${String(keyRow.node_id)}" is missing tunnel credentials.`,
           });
         }
@@ -1682,32 +1709,71 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
       const latencyMs = Math.max(0, now() - startMs);
       if (res.ok) {
+        // HU-29: Clear last_error on success; recover error/rate_limited -> active, but NEVER auto-activate disabled keys
+        const nextStatus =
+          currentKeyStatus === 'error' || currentKeyStatus === 'rate_limited'
+            ? 'active'
+            : currentKeyStatus;
+        db.prepare(`UPDATE provider_keys SET status = ?, last_error = NULL WHERE id = ?`).run(
+          nextStatus,
+          keyId,
+        );
         return c.json({
           ok: true,
           httpStatus: res.status,
           latencyMs,
+          status: nextStatus,
           message: 'Provider key verified successfully.',
         });
       }
 
       const rawText = await res.text().catch(() => '');
-      const safeSnippet = redactSecretsInText(rawText.slice(0, 160)).replace(rawSecret, '[REDACTED]');
+      const safeSnippet = redactSecretsInText(rawText.slice(0, 160))
+        .split(rawSecret)
+        .join('[REDACTED]');
+      const errorMessage = safeSnippet
+        ? `Upstream returned HTTP ${res.status}: ${safeSnippet}`
+        : `Upstream returned HTTP ${res.status}.`;
+
+      let nextStatus = currentKeyStatus;
+      if (currentKeyStatus === 'active') {
+        if (res.status === 401 || res.status === 403) {
+          nextStatus = 'error';
+        } else if (res.status === 429 || res.status >= 500) {
+          nextStatus = 'rate_limited';
+        }
+      }
+
+      db.prepare(`UPDATE provider_keys SET status = ?, last_error = ? WHERE id = ?`).run(
+        nextStatus,
+        errorMessage,
+        keyId,
+      );
+
       return c.json({
         ok: false,
         httpStatus: res.status,
         latencyMs,
-        message: safeSnippet
-          ? `Upstream returned HTTP ${res.status}: ${safeSnippet}`
-          : `Upstream returned HTTP ${res.status}.`,
+        status: nextStatus,
+        message: errorMessage,
       });
     } catch (err) {
       const latencyMs = Math.max(0, now() - startMs);
       const rawErr = err instanceof Error ? err.message : 'Upstream key test failed.';
-      const safeMsg = redactSecretsInText(rawErr).replace(rawSecret, '[REDACTED]');
+      const safeMsg = redactSecretsInText(rawErr).split(rawSecret).join('[REDACTED]');
+      const nextStatus = currentKeyStatus === 'active' ? 'rate_limited' : currentKeyStatus;
+
+      db.prepare(`UPDATE provider_keys SET status = ?, last_error = ? WHERE id = ?`).run(
+        nextStatus,
+        safeMsg,
+        keyId,
+      );
+
       return c.json({
         ok: false,
         httpStatus: null,
         latencyMs,
+        status: nextStatus,
         message: safeMsg,
       });
     }
@@ -2101,7 +2167,11 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       )
       .get(decodedFullId) as Record<string, unknown> | undefined;
 
-    if (!modelRow || isProviderOrAllKeysDraining(String(modelRow.provider_id))) {
+    if (
+      !modelRow ||
+      isProviderOrAllKeysDraining(String(modelRow.provider_id)) ||
+      (user.role !== 'admin' && Number(modelRow.disabled_by_admin ?? 0) === 1)
+    ) {
       return c.json({ error: `Model "${decodedFullId}" not found.` }, 404);
     }
 
@@ -2318,9 +2388,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       row.last_commit === null || row.last_commit === undefined
         ? null
         : String(row.last_commit);
-    const updateAvailable = Boolean(
-      commit && latestCommit && !isCommitUpToDate(commit, latestCommit),
-    );
+    const updateAvailable: boolean | null =
+      commit && latestCommit ? !isCommitUpToDate(commit, latestCommit) : null;
     return {
       id: nodeId,
       name: String(row.name),
@@ -3456,6 +3525,118 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     }
 
     return executeChatCompletions({
+      db,
+      masterKey,
+      registry,
+      fetchImpl,
+      upstreamTls: options.upstreamTls,
+      now,
+      userId: user.id,
+      internalApiKeyId: c.get('apiKeyId') ?? null,
+      modelFullId: modelRow.full_id,
+      modelId: modelRow.model_id,
+      providerRow,
+      requestBody: body,
+    });
+  });
+
+  app.post('/v1/embeddings', async (c) => {
+    const user = c.get('user');
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json(
+        openAiError(
+          'Malformed JSON request body.',
+          'invalid_request_error',
+          'invalid_json',
+        ),
+        400,
+      );
+    }
+
+    const requestedModel = typeof body.model === 'string' ? body.model.trim() : '';
+    if (!requestedModel) {
+      return c.json(
+        openAiError(
+          'Missing required parameter: "model".',
+          'invalid_request_error',
+          'missing_model',
+          'model',
+        ),
+        400,
+      );
+    }
+
+    const rawInput = body.input;
+    const validInput =
+      (typeof rawInput === 'string' && rawInput.length > 0) ||
+      (Array.isArray(rawInput) && rawInput.length > 0);
+    if (!validInput) {
+      return c.json(
+        openAiError(
+          'Missing or empty required parameter: "input".',
+          'invalid_request_error',
+          'invalid_input',
+          'input',
+        ),
+        400,
+      );
+    }
+
+    if (user.role === 'guest' && !isGuestModelAllowed(user.id, requestedModel)) {
+      return c.json(
+        openAiError(
+          `You do not have access to model "${requestedModel}".`,
+          'permission_error',
+          'model_not_allowed',
+          'model',
+        ),
+        403,
+      );
+    }
+
+    const modelRow = db
+      .prepare(
+        `SELECT m.full_id, m.model_id, m.provider_id
+         FROM models m
+         JOIN providers p ON p.id = m.provider_id
+         WHERE m.full_id = ? AND m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1`,
+      )
+      .get(requestedModel) as
+      | { full_id: string; model_id: string; provider_id: string }
+      | undefined;
+
+    if (!modelRow || isProviderOrAllKeysDraining(modelRow.provider_id)) {
+      return c.json(
+        openAiError(
+          `No active provider or model is configured for "${requestedModel}" yet.`,
+          'invalid_request_error',
+          'model_not_found',
+          'model',
+        ),
+        404,
+      );
+    }
+
+    const providerRow = db
+      .prepare(`SELECT * FROM providers WHERE id = ? AND enabled = 1`)
+      .get(modelRow.provider_id) as Record<string, unknown> | undefined;
+
+    if (!providerRow) {
+      return c.json(
+        openAiError(
+          `Provider "${modelRow.provider_id}" is not enabled.`,
+          'service_unavailable',
+          'provider_unavailable',
+        ),
+        503,
+      );
+    }
+
+    return executeEmbeddings({
       db,
       masterKey,
       registry,

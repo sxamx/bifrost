@@ -1059,4 +1059,491 @@ describe('Bifrost v1.1 Features (P0-P2)', () => {
       }
     });
   });
+
+  // =========================================================================
+  // QA Audit Fixes — HU-27, HU-28, HU-29, HU-30
+  // =========================================================================
+
+  describe('QA Fixes: HU-27, HU-28, HU-29, HU-30', () => {
+    it('HU-27: POST /api/providers/:id/keys honors status="disabled" and enabled=false without routing disabled keys', async () => {
+      const { db, app, adminCookie } = await setupAdminAndProvider({});
+      try {
+        // Create with status: 'disabled'
+        const res1 = await app.request('http://localhost/api/providers/test-openrouter/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            label: 'Disabled By Status',
+            secret: 'sk-test-disabled-1111',
+            status: 'disabled',
+          }),
+        });
+        assert.equal(res1.status, 201);
+        const body1 = (await res1.json()) as { key: { id: string; status: string } };
+        assert.equal(body1.key.status, 'disabled');
+
+        // Create with enabled: false
+        const res2 = await app.request('http://localhost/api/providers/test-openrouter/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            label: 'Disabled By Flag',
+            secret: 'sk-test-disabled-2222',
+            enabled: false,
+          }),
+        });
+        assert.equal(res2.status, 201);
+        const body2 = (await res2.json()) as { key: { id: string; status: string } };
+        assert.equal(body2.key.status, 'disabled');
+
+        // Invalid status -> 400
+        const badRes = await app.request('http://localhost/api/providers/test-openrouter/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            label: 'Bad Status',
+            secret: 'sk-test-disabled-3333',
+            status: 'bogus',
+          }),
+        });
+        assert.equal(badRes.status, 400);
+
+        // Persisted as disabled in DB
+        const dbRow = db
+          .prepare(`SELECT status FROM provider_keys WHERE id = ?`)
+          .get(body1.key.id) as { status: string };
+        assert.equal(dbRow.status, 'disabled');
+      } finally {
+        db.close();
+      }
+    });
+
+    it('HU-28: POST /api/nodes/:id/test marks online node unresponsive on failure and logs warn entries without leaking token', async () => {
+      let clockMs = Date.UTC(2026, 10, 21, 14, 0, 0);
+      let healthMode: 'healthy' | 'unhealthy_503' = 'healthy';
+      let expectedNodeToken = '';
+
+      const mockNodeServer = await startMockHttpServer((req, res) => {
+        if (req.url === '/_bifrost/health') {
+          const auth = String(req.headers['proxy-authorization'] ?? req.headers.authorization ?? '');
+          if (auth !== `Bearer ${expectedNodeToken}`) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false }));
+            return;
+          }
+          if (healthMode === 'unhealthy_503') {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+
+      const { db, app, adminCookie } = await setupAdminAndProvider({ now: () => clockMs });
+      try {
+        const createNodeRes = await app.request('http://localhost/api/nodes', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: 'Node HU-28',
+            mode: 'tailscale',
+            endpoint: `127.0.0.1:${mockNodeServer.port}`,
+          }),
+        });
+        assert.equal(createNodeRes.status, 201);
+        const { node, rawToken } = (await createNodeRes.json()) as {
+          node: { id: string; status: string };
+          rawToken: string;
+        };
+        expectedNodeToken = rawToken;
+
+        // Bring online first (offline -> online transition logged)
+        const okRes = await app.request(`http://localhost/api/nodes/${node.id}/test`, {
+          method: 'POST',
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(okRes.status, 200);
+        const okBody = (await okRes.json()) as { ok: boolean; status: string };
+        assert.equal(okBody.ok, true);
+        assert.equal(okBody.status, 'online');
+
+        // Now fail with 503 -> must transition online -> unresponsive in DB and response
+        healthMode = 'unhealthy_503';
+        clockMs += 1000;
+        const failRes = await app.request(`http://localhost/api/nodes/${node.id}/test`, {
+          method: 'POST',
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(failRes.status, 200);
+        const failBody = (await failRes.json()) as { ok: boolean; status: string; error?: string };
+        assert.equal(failBody.ok, false);
+        assert.equal(failBody.status, 'unresponsive');
+
+        const dbNode = db.prepare(`SELECT status FROM nodes WHERE id = ?`).get(node.id) as {
+          status: string;
+        };
+        assert.equal(dbNode.status, 'unresponsive');
+
+        // Verify system_logs recorded warn/node entries and never leaked rawToken
+        const logs = db
+          .prepare(
+            `SELECT level, category, message, meta_json
+             FROM system_logs
+             WHERE category = 'node' AND level = 'warn'
+             ORDER BY id ASC`,
+          )
+          .all() as Array<{
+          level: string;
+          category: string;
+          message: string;
+          meta_json: string | null;
+        }>;
+        assert.ok(logs.length >= 2, 'Expected warn/node logs for status transition and failure');
+        assert.ok(logs.some((l) => /to "online"/.test(l.message)));
+        assert.ok(logs.some((l) => /failed.*HTTP 503/i.test(l.message)));
+        for (const l of logs) {
+          assert.ok(!l.message.includes(rawToken), 'Log message must not leak node token');
+          assert.ok(
+            !(l.meta_json ?? '').includes(rawToken),
+            'Log metadata must not leak node token',
+          );
+        }
+      } finally {
+        await new Promise<void>((resolve) => mockNodeServer.server.close(() => resolve()));
+        db.close();
+      }
+    });
+
+    it('HU-29: POST /api/providers/:id/keys/:keyId/test persists/clears last_error and never auto-activates disabled keys', async () => {
+      let clockMs = Date.UTC(2026, 10, 21, 15, 0, 0);
+      let mode: 'ok' | '401' | '429' = '401';
+      const secretActive = 'sk-test-hu29-active-9999';
+      const secretDisabled = 'sk-test-hu29-disabled-8888';
+
+      const mockFetch: typeof fetch = async () => {
+        clockMs += 15;
+        if (mode === '401') {
+          return new Response(JSON.stringify({ error: `Invalid key ${secretActive}` }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (mode === '429') {
+          return new Response(JSON.stringify({ error: 'Rate limit exceeded' }), {
+            status: 429,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+
+      const { db, app, adminCookie } = await setupAdminAndProvider({
+        fetchImpl: mockFetch,
+        now: () => clockMs,
+      });
+
+      try {
+        // 1. Active key: 401 -> status='error' + redacted last_error; 200 -> status='active' + last_error=NULL
+        const kActiveRes = await app.request(
+          'http://localhost/api/providers/test-openrouter/keys',
+          {
+            method: 'POST',
+            headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ label: 'Active Key', secret: secretActive, status: 'active' }),
+          },
+        );
+        const kActiveId = ((await kActiveRes.json()) as { key: { id: string } }).key.id;
+
+        mode = '401';
+        const fail401 = await app.request(
+          `http://localhost/api/providers/test-openrouter/keys/${kActiveId}/test`,
+          { method: 'POST', headers: { Cookie: adminCookie } },
+        );
+        const fail401Json = (await fail401.json()) as { ok: boolean; status: string };
+        assert.equal(fail401Json.ok, false);
+        assert.equal(fail401Json.status, 'error');
+
+        let row = db
+          .prepare(`SELECT status, last_error FROM provider_keys WHERE id = ?`)
+          .get(kActiveId) as { status: string; last_error: string | null };
+        assert.equal(row.status, 'error');
+        assert.ok(row.last_error && !row.last_error.includes(secretActive));
+
+        // 200 recovers error -> active and clears last_error
+        mode = 'ok';
+        const ok1 = await app.request(
+          `http://localhost/api/providers/test-openrouter/keys/${kActiveId}/test`,
+          { method: 'POST', headers: { Cookie: adminCookie } },
+        );
+        const ok1Json = (await ok1.json()) as { ok: boolean; status: string };
+        assert.equal(ok1Json.ok, true);
+        assert.equal(ok1Json.status, 'active');
+
+        row = db
+          .prepare(`SELECT status, last_error FROM provider_keys WHERE id = ?`)
+          .get(kActiveId) as { status: string; last_error: string | null };
+        assert.equal(row.status, 'active');
+        assert.equal(row.last_error, null);
+
+        // 429 on active -> rate_limited
+        mode = '429';
+        const fail429 = await app.request(
+          `http://localhost/api/providers/test-openrouter/keys/${kActiveId}/test`,
+          { method: 'POST', headers: { Cookie: adminCookie } },
+        );
+        const fail429Json = (await fail429.json()) as { ok: boolean; status: string };
+        assert.equal(fail429Json.status, 'rate_limited');
+
+        // 2. Disabled key: 401 saves last_error while keeping 'disabled'; 200 clears last_error and STILL keeps 'disabled'
+        const kDisRes = await app.request('http://localhost/api/providers/test-openrouter/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            label: 'Disabled Key',
+            secret: secretDisabled,
+            status: 'disabled',
+          }),
+        });
+        const kDisId = ((await kDisRes.json()) as { key: { id: string } }).key.id;
+
+        mode = '401';
+        const disFail = await app.request(
+          `http://localhost/api/providers/test-openrouter/keys/${kDisId}/test`,
+          { method: 'POST', headers: { Cookie: adminCookie } },
+        );
+        const disFailJson = (await disFail.json()) as { ok: boolean; status: string };
+        assert.equal(disFailJson.ok, false);
+        assert.equal(disFailJson.status, 'disabled');
+
+        row = db
+          .prepare(`SELECT status, last_error FROM provider_keys WHERE id = ?`)
+          .get(kDisId) as { status: string; last_error: string | null };
+        assert.equal(row.status, 'disabled');
+        assert.ok(row.last_error && row.last_error.includes('401'));
+
+        mode = 'ok';
+        const disOk = await app.request(
+          `http://localhost/api/providers/test-openrouter/keys/${kDisId}/test`,
+          { method: 'POST', headers: { Cookie: adminCookie } },
+        );
+        const disOkJson = (await disOk.json()) as { ok: boolean; status: string };
+        assert.equal(disOkJson.ok, true);
+        assert.equal(disOkJson.status, 'disabled');
+
+        row = db
+          .prepare(`SELECT status, last_error FROM provider_keys WHERE id = ?`)
+          .get(kDisId) as { status: string; last_error: string | null };
+        assert.equal(row.status, 'disabled');
+        assert.equal(row.last_error, null);
+      } finally {
+        db.close();
+      }
+    });
+
+    it('HU-30: syncs free embedding models, hides admin-disabled models on GET /api/models/* for guests, and serves POST /v1/embeddings with failover & usage logging', async () => {
+      let clockMs = Date.UTC(2026, 10, 21, 16, 0, 0);
+      let embedCalls = 0;
+
+      const mockFetch: typeof fetch = async (input, init) => {
+        const url = String(input);
+        clockMs += 10;
+        if (url.endsWith('/models')) {
+          return new Response(
+            JSON.stringify({
+              data: [
+                {
+                  id: 'text-embedding-3:free',
+                  name: 'Free Embedding 3',
+                  type: 'embedding',
+                  pricing: { prompt: '0', completion: '0' },
+                  architecture: { input_modalities: ['text'], output_modalities: ['embeddings'] },
+                },
+                {
+                  id: 'whisper-audio:free',
+                  name: 'Audio Model',
+                  type: 'audio',
+                  pricing: { prompt: '0', completion: '0' },
+                },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        if (url.endsWith('/embeddings')) {
+          embedCalls += 1;
+          const headersObj = new Headers(init?.headers);
+          const auth = headersObj.get('authorization') ?? '';
+          if (auth.includes('sk-emb-key1')) {
+            return new Response(JSON.stringify({ error: { message: 'rate limited' } }), {
+              status: 429,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          return new Response(
+            JSON.stringify({
+              object: 'list',
+              data: [{ object: 'embedding', index: 0, embedding: [0.1, 0.2, 0.3] }],
+              model: 'text-embedding-3:free',
+              usage: { prompt_tokens: 12, total_tokens: 12 },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        return new Response(JSON.stringify({ error: 'not found' }), { status: 404 });
+      };
+
+      const { db, app, adminCookie } = await setupAdminAndProvider({
+        fetchImpl: mockFetch,
+        now: () => clockMs,
+      });
+
+      try {
+        // Install an API-sourced provider so reload-models fetches /models through matchesFreeRule
+        const embProvRes = await app.request('http://localhost/api/providers', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            schemaVersion: '1.0',
+            id: 'test-embed-api',
+            name: 'Test Embed API',
+            packageType: 'official-json',
+            baseUrl: 'https://api.embed.example.com/v1',
+            auth: { type: 'bearer', header: 'Authorization', prefix: 'Bearer ' },
+            modelsSource: 'api',
+            modelsEndpoint: '/models',
+            freeRule: { priceZeroPaths: ['pricing.prompt', 'pricing.completion'] },
+          }),
+        });
+        assert.equal(embProvRes.status, 201);
+
+        // Add two active keys to test failover on /v1/embeddings
+        await app.request('http://localhost/api/providers/test-embed-api/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label: 'Emb Key 1', secret: 'sk-emb-key1-1111' }),
+        });
+        await app.request('http://localhost/api/providers/test-embed-api/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label: 'Emb Key 2', secret: 'sk-emb-key2-2222' }),
+        });
+
+        // Sync models -> embedding model is synced, audio model excluded
+        const syncRes = await app.request(
+          'http://localhost/api/providers/test-embed-api/reload-models',
+          { method: 'POST', headers: { Cookie: adminCookie } },
+        );
+        assert.equal(syncRes.status, 200);
+        const embModelId = 'test-embed-api/text-embedding-3:free';
+        const syncedModels = db
+          .prepare(`SELECT full_id FROM models WHERE provider_id = 'test-embed-api' AND active = 1`)
+          .all() as Array<{ full_id: string }>;
+        assert.ok(syncedModels.some((m) => m.full_id === embModelId));
+        assert.ok(!syncedModels.some((m) => m.full_id.includes('whisper-audio')));
+
+        // Create internal API key for admin and call POST /v1/embeddings
+        const adminKeyRes = await app.request('http://localhost/api/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'Embeddings Key' }),
+        });
+        const { rawKey: adminApiKey } = (await adminKeyRes.json()) as { rawKey: string };
+
+        const embRes = await app.request('http://localhost/v1/embeddings', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${adminApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: embModelId,
+            input: 'hello bifrost embeddings',
+          }),
+        });
+        assert.equal(embRes.status, 200);
+        const embJson = (await embRes.json()) as {
+          object: string;
+          model: string;
+          data: Array<{ embedding: number[] }>;
+          usage: { prompt_tokens: number; total_tokens: number };
+        };
+        assert.equal(embJson.object, 'list');
+        assert.equal(embJson.model, embModelId);
+        assert.deepEqual(embJson.data[0]?.embedding, [0.1, 0.2, 0.3]);
+        assert.equal(embedCalls, 2, 'Should fail over from 429 key1 to healthy key2');
+
+        // Usage logged in usage_logs
+        const usageRow = db
+          .prepare(
+            `SELECT model_full_id, prompt_tokens, status FROM usage_logs WHERE model_full_id = ?`,
+          )
+          .get(embModelId) as { model_full_id: string; prompt_tokens: number; status: string };
+        assert.equal(usageRow.model_full_id, embModelId);
+        assert.equal(usageRow.prompt_tokens, 12);
+        assert.equal(usageRow.status, 'ok');
+
+        // Guest with allowed_models = [embModelId]: once admin disables model, GET /api/models/* -> 404 and POST /v1/embeddings -> 404
+        const guestCookie = await createGuestSession(app, adminCookie, 'guest_emb', [embModelId]);
+        const guestKeyRes = await app.request('http://localhost/api/keys', {
+          method: 'POST',
+          headers: { Cookie: guestCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'Guest Emb Key' }),
+        });
+        const { rawKey: guestApiKey } = (await guestKeyRes.json()) as { rawKey: string };
+
+        // Before disabling: guest can view GET /api/models/*
+        const guestDetailOk = await app.request(
+          `http://localhost/api/models/${encodeURIComponent(embModelId)}`,
+          { headers: { Cookie: guestCookie } },
+        );
+        assert.equal(guestDetailOk.status, 200);
+
+        // Disable model by admin
+        const disableRes = await app.request(
+          `http://localhost/api/models/${encodeURIComponent(embModelId)}/visibility`,
+          {
+            method: 'PATCH',
+            headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disabledByAdmin: true }),
+          },
+        );
+        assert.equal(disableRes.status, 200);
+
+        // Guest GET /api/models/* -> 404
+        const guestDetailHidden = await app.request(
+          `http://localhost/api/models/${encodeURIComponent(embModelId)}`,
+          { headers: { Cookie: guestCookie } },
+        );
+        assert.equal(guestDetailHidden.status, 404);
+
+        // Admin GET /api/models/* -> still 200
+        const adminDetailStillOk = await app.request(
+          `http://localhost/api/models/${encodeURIComponent(embModelId)}`,
+          { headers: { Cookie: adminCookie } },
+        );
+        assert.equal(adminDetailStillOk.status, 200);
+
+        // Guest POST /v1/embeddings on disabled model -> 404
+        const guestEmbDisabled = await app.request('http://localhost/v1/embeddings', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${guestApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ model: embModelId, input: 'blocked' }),
+        });
+        assert.equal(guestEmbDisabled.status, 404);
+      } finally {
+        db.close();
+      }
+    });
+  });
 });

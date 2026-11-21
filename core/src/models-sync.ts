@@ -136,8 +136,6 @@ function matchesFreeRule(rawModel: Record<string, unknown>, freeRule?: ProviderF
 
   const modelType = typeof rawModel.type === 'string' ? rawModel.type.toLowerCase() : '';
   if (
-    modelType === 'embedding' ||
-    modelType === 'embeddings' ||
     modelType === 'rerank' ||
     modelType === 'moderation' ||
     modelType === 'tts' ||
@@ -154,7 +152,11 @@ function matchesFreeRule(rawModel: Record<string, unknown>, freeRule?: ProviderF
       : null;
   if (arch && Array.isArray(arch.output_modalities) && arch.output_modalities.length > 0) {
     const outputs = arch.output_modalities.map((m) => String(m).toLowerCase());
-    if (!outputs.includes('text')) {
+    if (
+      !outputs.includes('text') &&
+      !outputs.includes('embedding') &&
+      !outputs.includes('embeddings')
+    ) {
       return false;
     }
   }

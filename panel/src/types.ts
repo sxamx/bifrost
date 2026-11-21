@@ -424,7 +424,7 @@ export interface ExitNodeItem {
   mode: NodeMode;
   endpoint: string;
   commit?: string | null;
-  updateAvailable?: boolean;
+  updateAvailable?: boolean | null;
   status: NodeStatus;
   lastSeenAt: number | null;
   lastRotatedAt: number | null;

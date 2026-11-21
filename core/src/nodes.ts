@@ -959,6 +959,10 @@ export async function testNodeConnectivity(params: {
     };
   }
 
+  const nodeName = String(row.name ?? nodeId);
+  const redactToken = (text: string): string =>
+    redactSecretsInText(text).split(rawToken).join('[REDACTED]');
+
   const startMs = nowFn();
   try {
     const res = await callNodeControlPlane({
@@ -1016,6 +1020,17 @@ export async function testNodeConnectivity(params: {
         throw err;
       }
 
+      if (currentStatus !== 'online') {
+        writeSystemLog(
+          db,
+          'warn',
+          'node',
+          `Exit node "${nodeName}" connectivity test succeeded; status changed from "${currentStatus}" to "online"`,
+          { nodeId, previousStatus: currentStatus, status: 'online', latencyMs },
+          nowSec,
+        );
+      }
+
       return {
         ok: true,
         status: 'online',
@@ -1023,19 +1038,61 @@ export async function testNodeConnectivity(params: {
       };
     }
 
+    const nextStatus: NodeStatus = currentStatus === 'offline' ? 'offline' : 'unresponsive';
+    if (nextStatus !== currentStatus) {
+      db.prepare(`UPDATE nodes SET status = ? WHERE id = ?`).run(nextStatus, nodeId);
+    }
+
+    const errorMessage = `Node health endpoint returned HTTP ${res.status}`;
+    writeSystemLog(
+      db,
+      'warn',
+      'node',
+      `Exit node "${nodeName}" connectivity test failed (HTTP ${res.status}); status is "${nextStatus}"`,
+      {
+        nodeId,
+        previousStatus: currentStatus,
+        status: nextStatus,
+        httpStatus: res.status,
+        latencyMs,
+      },
+      nowSec,
+    );
+
     return {
       ok: false,
-      status: currentStatus,
+      status: nextStatus,
       latencyMs,
-      error: `Node health endpoint returned HTTP ${res.status}`,
+      error: errorMessage,
     };
   } catch (err) {
+    const nowSec = Math.floor(nowFn() / 1000);
     const msg = err instanceof Error ? err.message : 'Node connectivity test failed.';
+    const safeError = redactToken(msg);
+    const nextStatus: NodeStatus = currentStatus === 'offline' ? 'offline' : 'unresponsive';
+    if (nextStatus !== currentStatus) {
+      db.prepare(`UPDATE nodes SET status = ? WHERE id = ?`).run(nextStatus, nodeId);
+    }
+
+    writeSystemLog(
+      db,
+      'warn',
+      'node',
+      `Exit node "${nodeName}" connectivity test failed (${safeError}); status is "${nextStatus}"`,
+      {
+        nodeId,
+        previousStatus: currentStatus,
+        status: nextStatus,
+        error: safeError,
+      },
+      nowSec,
+    );
+
     return {
       ok: false,
-      status: currentStatus,
+      status: nextStatus,
       latencyMs: null,
-      error: redactSecretsInText(msg),
+      error: safeError,
     };
   }
 }

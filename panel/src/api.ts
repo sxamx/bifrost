@@ -516,11 +516,13 @@ function normalizeExitNode(raw: unknown): ExitNodeItem {
           ? r.last_commit
           : null,
     updateAvailable:
-      r.updateAvailable !== undefined
-        ? Boolean(r.updateAvailable)
-        : r.update_available !== undefined
-          ? Boolean(r.update_available)
-          : false,
+      r.updateAvailable === null || r.update_available === null
+        ? null
+        : typeof r.updateAvailable === 'boolean'
+          ? r.updateAvailable
+          : typeof r.update_available === 'boolean'
+            ? r.update_available
+            : null,
     status: rawStatus,
     lastSeenAt:
       typeof r.lastSeenAt === 'number'
