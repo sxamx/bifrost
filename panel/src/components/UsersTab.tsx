@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type {
   CreateInvitationResult,
   InvitationItem,
@@ -207,11 +208,11 @@ export const UsersTab: React.FC = () => {
   }
 
   async function handleCopyInviteLink(url: string) {
-    try {
-      await navigator.clipboard.writeText(url);
+    const ok = await copyTextToClipboard(url);
+    if (ok) {
       setCopiedInviteUrl(true);
       window.setTimeout(() => setCopiedInviteUrl(false), 2400);
-    } catch {
+    } else {
       setCopiedInviteUrl(false);
     }
   }

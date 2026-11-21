@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type {
   CreateNodeResult,
   ExitNodeItem,
@@ -138,10 +139,16 @@ export const NodesTab: React.FC<NodesTabProps> = ({
     setUpdatingId(node.id);
     try {
       const res = await api.updateNode(node.id);
-      setBanner(
-        res.message ||
-          `Actualización enviada al nodo «${node.name}». El agente se reiniciará en unos segundos.`
-      );
+      if (res.upToDate) {
+        setBanner(
+          res.message || `El nodo «${node.name}» ya está al día con la última versión.`
+        );
+      } else {
+        setBanner(
+          res.message ||
+            `Actualización enviada al nodo «${node.name}». El agente se reiniciará en unos segundos.`
+        );
+      }
       await onNodesChanged();
     } catch (err) {
       setErrorBanner(
@@ -249,11 +256,11 @@ export const NodesTab: React.FC<NodesTabProps> = ({
   }
 
   async function copyToClipboard(text: string, setter: (v: boolean) => void) {
-    try {
-      await navigator.clipboard.writeText(text);
+    const ok = await copyTextToClipboard(text);
+    if (ok) {
       setter(true);
       window.setTimeout(() => setter(false), 2400);
-    } catch {
+    } else {
       setter(false);
     }
   }
@@ -433,14 +440,18 @@ export const NodesTab: React.FC<NodesTabProps> = ({
                             >
                               {testingId === node.id ? 'Probando…' : 'Probar'}
                             </button>
-                            <button
-                              type="button"
-                              className="btn btn-secondary btn-sm"
-                              disabled={updatingId === node.id}
-                              onClick={() => void handleUpdateNode(node)}
-                            >
-                              {updatingId === node.id ? 'Actualizando…' : 'Actualizar'}
-                            </button>
+                            {node.updateAvailable === true ? (
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-sm"
+                                disabled={updatingId === node.id}
+                                onClick={() => void handleUpdateNode(node)}
+                              >
+                                {updatingId === node.id ? 'Actualizando…' : 'Actualizar nodo'}
+                              </button>
+                            ) : node.updateAvailable === false ? (
+                              <span className="meta-tag verified">Al día</span>
+                            ) : null}
                             <button
                               type="button"
                               className="btn btn-secondary btn-sm"
