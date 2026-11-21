@@ -662,3 +662,18 @@ export type ActiveTab =
   | 'users'
   | 'logs'
   | 'backups';
+
+/* System Update Status (HU-41 Capa 1) */
+
+export interface SystemUpdateStatus {
+  currentVersion: string;
+  currentCommit: string | null;
+  latestCommit: string | null;
+  latestCommitMessage: string | null;
+  latestCommitUrl: string | null;
+  latestPublishedAt: string | null;
+  updateAvailable: boolean;
+  runtimeMode: 'docker' | 'native';
+  checkedAt: number;
+  error?: string | null;
+}

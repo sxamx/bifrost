@@ -81,6 +81,7 @@ import {
   loadSeedManifests,
   validateProviderManifest,
 } from './schema.js';
+import { checkSystemUpdate } from './update-checker.js';
 import {
   UserHttpError,
   acceptInvitation,
@@ -632,6 +633,24 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         keysCount: Number(keysRow?.count ?? 0),
       },
     });
+  });
+
+  // --- System Update Status (HU-41 Capa 1) ---
+
+  app.get('/api/system/update-status', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const forceRefresh = c.req.query('refresh') === '1';
+    const status = await checkSystemUpdate({
+      db,
+      fetchImpl,
+      forceRefresh,
+      nowMs: now(),
+    });
+    return c.json(status);
   });
 
   // --- Marketplace & Provider Installation (HU-06, HU-23, HU-24) ---

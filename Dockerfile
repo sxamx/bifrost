@@ -43,10 +43,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+ARG BIFROST_BUILD_COMMIT=unknown
+
 ENV NODE_ENV=production \
     PORT=8080 \
     DATA_DIR=/data \
-    PANEL_DIST_DIR=/app/panel/dist
+    PANEL_DIST_DIR=/app/panel/dist \
+    BIFROST_BUILD_COMMIT=$BIFROST_BUILD_COMMIT
 
 WORKDIR /app
 

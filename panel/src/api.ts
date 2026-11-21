@@ -57,6 +57,7 @@ import type {
   StatusResponse,
   SystemLogEntry,
   SystemLogsResponse,
+  SystemUpdateStatus,
   UptimeDayCell,
 } from './types';
 
@@ -2168,6 +2169,15 @@ export const api = {
   revokeKey(id: string): Promise<{ ok: boolean }> {
     return request<{ ok: boolean }>(`/api/keys/${encodeURIComponent(id)}`, {
       method: 'DELETE',
+    });
+  },
+
+  /* System Update Status (HU-41 Capa 1) */
+
+  getUpdateStatus(refresh?: boolean): Promise<SystemUpdateStatus> {
+    const query = refresh ? '?refresh=1' : '';
+    return request<SystemUpdateStatus>(`/api/system/update-status${query}`, {
+      method: 'GET',
     });
   },
 };

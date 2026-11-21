@@ -1,4 +1,4 @@
-# Historias de Usuario — V2 (`HU-27` a `HU-40`)
+# Historias de Usuario — V2 (`HU-27` a `HU-41`)
 
 Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`). Todas las historias siguen el formato de criterios de aceptación verificables y mantienen las garantías de seguridad y arquitectura descritas en [`DECISIONS.md`](DECISIONS.md) y [`ARQUITECTURA.md`](ARQUITECTURA.md).
 
@@ -172,6 +172,23 @@ Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`
 3. En la bóveda de proveedores (`ProviderVaultCard`), los proveedores instalados/activos que retienen prompts (`retention === 'retained'`) o permiten entrenamiento (`training === 'allowed'` u `'opt_out'`, como NVIDIA NIM free-tier) muestran un distintivo/tooltip de advertencia visible.
 4. En `ModelsTab`, cada modelo muestra el indicador de privacidad/ZDR de su proveedor (`providerPrivacy` / `privacy`) para que los usuarios conozcan el tratamiento de datos antes de enrutar prompts.
 5. Para agregadores o routers como OpenRouter (`retention: 'variable'`), la interfaz explica explícitamente mediante nota/tooltip (`InfoTip` o texto contextual) que la retención y el entrenamiento dependen del proveedor/modelo upstream subyacente seleccionado.
+
+---
+
+### HU-41 — Detección de actualizaciones desde GitHub y publicación automatizada en GHCR
+
+**Como** administrador de Bifrost,  
+**quiero** que el panel detecte automáticamente si existen nuevas versiones o commits publicados en GitHub y que cada release o cambio en `main` genere una imagen Docker verificada en GHCR,  
+**para** mantener mi instancia actualizada de forma segura, con instrucciones adaptadas a mi modo de ejecución (`docker` o `native`) y sin riesgo de perder los datos persistentes (`/app/data`).
+
+**Criterios de aceptación:**
+1. **Capa 1 — Detección y aviso en el panel:**
+   - El backend consulta GitHub (`sxamx/bifrost`, rama `main` / releases) mediante `GET /api/system/update-status`, cacheando el resultado durante **6 horas** y soportando `?refresh=1` para comprobación bajo demanda.
+   - Compara la versión y commit actuales en ejecución (`version` + `buildCommit`) contra el último commit/publicación remota, detecta `runtimeMode` (`'docker' | 'native'`) y devuelve el estado tipado (`SystemUpdateStatus`).
+   - En el panel (solo visible para usuarios con rol `admin`), cuando `updateAvailable === true`, se muestra un banner/tarjeta sutil de actualización en `OverviewTab` (o barra superior) con enlace al commit remoto, botón **Comprobar ahora** (`refresh=true`) y comando copiable adaptado al `runtimeMode` (`docker compose pull && docker compose up -d` para Docker o `git pull && npm run build` para ejecución nativa).
+2. **Capa 2 — Publicación automatizada y segura en GHCR:**
+   - El flujo de GitHub Actions ejecuta la compilación (`build`) y la suite completa de pruebas (`tests`) antes de publicar; la imagen `ghcr.io/sxamx/bifrost` solo se construye y publica si todas las pruebas pasan.
+   - Los datos del usuario, base de datos y configuración (`/app/data`) permanecen completamente separados de la imagen Docker (montados mediante volumen externo), garantizando actualizaciones limpias sin pérdida ni sobreescritura de datos.
 
 ---
 

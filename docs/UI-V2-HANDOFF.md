@@ -1,7 +1,7 @@
 # Guía de Handoff UI — Bifrost V2
 
 Documento técnico para implementar los cambios de interfaz de la V2 en el panel (`panel/src/`).  
-Refleja las historias `HU-27` a `HU-37` + `HU-40` (P2) descritas en [`HISTORIAS-V2.md`](HISTORIAS-V2.md).
+Refleja las historias `HU-27` a `HU-41` descritas en [`HISTORIAS-V2.md`](HISTORIAS-V2.md).
 
 ---
 
@@ -15,6 +15,7 @@ Refleja las historias `HU-27` a `HU-37` + `HU-40` (P2) descritas en [`HISTORIAS-
 5. `ApiKeysTab.tsx`
 6. `MetricsTab.tsx`
 7. `MarketplaceTab.tsx` *(o la vista de catálogo del Marketplace dentro de `ProvidersTab.tsx`)*
+8. `OverviewTab.tsx` *(y barra superior / topbar en `App.tsx` si aplica)*
 
 ### Archivos que NO debes tocar
 - `panel/src/api.ts` (el cliente HTTP y normalizadores se proveen desde backend/API)
@@ -253,6 +254,38 @@ export interface FreeQuotaStatus {
 
 ---
 
+### 2.9 Detección de actualizaciones (`HU-41`)
+
+**Contrato TypeScript en `panel/src/types.ts` (añadido por Backend):**
+```ts
+export interface SystemUpdateStatus {
+  currentVersion: string;
+  currentCommit: string | null;
+  latestCommit: string | null;
+  latestCommitMessage: string | null;
+  latestCommitUrl: string | null;
+  latestPublishedAt: string | null;
+  updateAvailable: boolean;
+  runtimeMode: 'docker' | 'native';
+  checkedAt: number;
+  error?: string | null;
+}
+```
+
+**Métodos en `api` (`api.ts`):**
+- `api.getUpdateStatus(refresh?: boolean): Promise<SystemUpdateStatus>`  
+  Llama a `GET /api/system/update-status` (o `GET /api/system/update-status?refresh=1` cuando `refresh === true`, saltando la caché de 6 horas del backend).
+
+**Requisitos UI (`OverviewTab.tsx` o barra superior / topbar — solo `admin`):**
+- Mostrar un banner/badge sutil de actualización exclusivamente para administradores cuando `updateAvailable === true` (evitar ruido visual si está actualizado o para usuarios no administradores).
+- Incluir enlace externo seguro (`target="_blank" rel="noopener noreferrer"`) a `latestCommitUrl` (mostrando el commit abreviado y/o `latestCommitMessage` / `latestPublishedAt`).
+- Incluir botón **Comprobar ahora** que invoque `api.getUpdateStatus(true)` (`refresh=true`) con estado de carga.
+- Mostrar un comando copiable adaptado automáticamente según `runtimeMode`:
+  - Si `runtimeMode === 'docker'`: `docker compose pull && docker compose up -d`
+  - Si `runtimeMode === 'native'`: `git pull && npm run build`
+
+---
+
 ## 3. Checklist final de implementación UI
 
 - [ ] **`ProviderVaultCard.tsx`**: switch **Activar / Desactivar** (`status === 'disabled'`), badge `no_node`, botón **Probar clave** (`ProviderKeyTestResult`) y badge/tooltip de advertencia de privacidad (`HU-40`).
@@ -263,4 +296,5 @@ export interface FreeQuotaStatus {
 - [ ] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`) y opción **Por API key** en `ActivityGroupBy`.
 - [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx`**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter), detalle de `training` y badge de clasificación de límites (`rateLimitKind` / `rateLimitWindows`, `HU-38`).
 - [ ] **`OverviewTab.tsx` / `MetricsTab.tsx` (Cuota gratuita, `HU-39`)**: mostrar ventana activa (`hora` / `día` / `semana`), indicador de confianza (`Exacto por cabecera`, `Configurado`, `Inferido por 429`), `effectiveLimit`, estado `adaptiveAdjusted` y detalle por proveedor (`providerQuotas` / `FreeQuotaStatus.providers`).
+- [ ] **`OverviewTab.tsx` / Topbar (Detección de actualizaciones, `HU-41`)**: solo para `admin`, consumir `api.getUpdateStatus(refresh)` (`SystemUpdateStatus`), mostrar banner/badge sutil cuando `updateAvailable === true`, enlace a `latestCommitUrl`, botón **Comprobar ahora** (`refresh=true`) y comando copiable según `runtimeMode` (`docker compose pull && docker compose up -d` vs `git pull && npm run build`).
 
