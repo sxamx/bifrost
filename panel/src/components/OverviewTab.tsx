@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type {
   AuthUser,
   DashboardStats,
@@ -268,11 +269,11 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   }, []);
 
   async function handleCopyEndpoint() {
-    try {
-      await navigator.clipboard.writeText(baseUrl);
+    const ok = await copyTextToClipboard(baseUrl);
+    if (ok) {
       setCopiedEndpoint(true);
       window.setTimeout(() => setCopiedEndpoint(false), 2200);
-    } catch {
+    } else {
       setCopiedEndpoint(false);
     }
   }
@@ -561,9 +562,11 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                       updateStatus.runtimeMode === 'docker'
                         ? 'docker compose pull && docker compose up -d'
                         : 'git pull && npm run build && systemctl restart bifrost';
-                    void navigator.clipboard.writeText(cmd);
-                    setCopiedUpdateCmd(true);
-                    window.setTimeout(() => setCopiedUpdateCmd(false), 2200);
+                    void copyTextToClipboard(cmd).then((ok) => {
+                      if (!ok) return;
+                      setCopiedUpdateCmd(true);
+                      window.setTimeout(() => setCopiedUpdateCmd(false), 2200);
+                    });
                   }}
                 >
                   {copiedUpdateCmd

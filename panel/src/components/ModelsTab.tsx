@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
+import { copyTextToClipboard } from '../clipboard';
 import type {
   ActivitySeriesItem,
   ModelSpeedEntry,
@@ -415,11 +416,13 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
 
   const handleCopyModelId = useCallback((fullId: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    void navigator.clipboard.writeText(fullId);
-    setCopiedId(fullId);
-    window.setTimeout(() => {
-      setCopiedId((prev) => (prev === fullId ? null : prev));
-    }, 1800);
+    void copyTextToClipboard(fullId).then((ok) => {
+      if (!ok) return;
+      setCopiedId(fullId);
+      window.setTimeout(() => {
+        setCopiedId((prev) => (prev === fullId ? null : prev));
+      }, 1800);
+    });
   }, []);
 
   const openModelDetail = useCallback(
