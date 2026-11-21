@@ -284,7 +284,8 @@ if [[ "${NODE_BIN}" != "/usr/bin/node" && "${NODE_BIN}" != "/usr/local/bin/node"
 fi
 
 systemctl daemon-reload
-systemctl enable --now bifrost-node
+systemctl enable bifrost-node
+systemctl restart bifrost-node
 
 log "Servicio bifrost-node activo en modo '${MODE}' (puerto ${PORT})."
 if [[ "${MODE}" == "public_ip" ]]; then
