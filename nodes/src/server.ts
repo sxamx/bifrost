@@ -323,7 +323,7 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
       const runCmd = options.runUpdateCommand ?? defaultRunNodeUpdateCommand;
       try {
         await runCmd('git', ['pull', '--ff-only'], resolvedRepoDir);
-        await runCmd('npm', ['--prefix', 'nodes', 'ci'], resolvedRepoDir);
+        await runCmd('npm', ['--prefix', 'nodes', 'ci', '--include=dev'], resolvedRepoDir);
         await runCmd('npm', ['--prefix', 'nodes', 'run', 'build'], resolvedRepoDir);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

@@ -683,7 +683,7 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
         ranCommands.map((c) => [c.cmd, ...c.args]),
         [
           ['git', 'pull', '--ff-only'],
-          ['npm', '--prefix', 'nodes', 'ci'],
+          ['npm', '--prefix', 'nodes', 'ci', '--include=dev'],
           ['npm', '--prefix', 'nodes', 'run', 'build']
         ]
       );
