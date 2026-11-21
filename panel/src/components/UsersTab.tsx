@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
-import { copyTextToClipboard } from '../clipboard';
 import type {
   CreateInvitationResult,
   InvitationItem,
@@ -26,7 +25,7 @@ export const UsersTab: React.FC = () => {
   const [loading, setLoading] = useState(true);
 
   // Create Invitation Form State (HU-04)
-  const [inviteDailyLimit, setInviteDailyLimit] = useState('50000');
+  const [inviteDailyLimit, setInviteDailyLimit] = useState(50000);
   const [inviteResetMode, setInviteResetMode] = useState<QuotaResetMode>('utc_midnight');
   const [inviteWildcardAll, setInviteWildcardAll] = useState(true);
   const [inviteSelectedModels, setInviteSelectedModels] = useState<string[]>([]);
@@ -44,9 +43,16 @@ export const UsersTab: React.FC = () => {
   const [editSelectedModels, setEditSelectedModels] = useState<string[]>([]);
   const [savingEdit, setSavingEdit] = useState(false);
 
-  // Delete Guest User Confirmation State
+  // Delete Guest User & Invitation Confirmation State
   const [userToDelete, setUserToDelete] = useState<ManagedUserItem | null>(null);
   const [deletingUser, setDeletingUser] = useState(false);
+  const [deletingInviteId, setDeletingInviteId] = useState<string | null>(null);
+
+  // HU-33 & HU-35 Model search + strict quota state
+  const [inviteEnforceStrict, setInviteEnforceStrict] = useState(false);
+  const [inviteModelSearch, setInviteModelSearch] = useState('');
+  const [editEnforceStrict, setEditEnforceStrict] = useState(false);
+  const [editModelSearch, setEditModelSearch] = useState('');
 
   const [banner, setBanner] = useState<string | null>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
@@ -80,8 +86,7 @@ export const UsersTab: React.FC = () => {
     setErrorBanner(null);
     setBanner(null);
 
-    const parsedInviteLimit = Number(inviteDailyLimit.trim());
-    if (!Number.isFinite(parsedInviteLimit) || parsedInviteLimit <= 0) {
+    if (!Number.isFinite(inviteDailyLimit) || inviteDailyLimit <= 0) {
       setErrorBanner('Define una cuota diaria positiva en tokens para el invitado.');
       return;
     }
@@ -97,8 +102,9 @@ export const UsersTab: React.FC = () => {
     setCreatingInvite(true);
     try {
       const res = await api.createInvitation({
-        dailyTokenLimit: Math.floor(parsedInviteLimit),
+        dailyTokenLimit: Math.floor(inviteDailyLimit),
         quotaResetMode: inviteResetMode,
+        enforceStrictQuota: inviteEnforceStrict,
         allowedModels,
       });
       setCreatedInvite(res);
@@ -117,9 +123,27 @@ export const UsersTab: React.FC = () => {
     setEditingUser(u);
     setEditLimitInput(u.dailyTokenLimit !== null ? String(u.dailyTokenLimit) : '50000');
     setEditResetMode(u.quotaResetMode);
+    setEditEnforceStrict(Boolean(u.enforceStrictQuota));
+    setEditModelSearch('');
     const hasStar = u.allowedModels.includes('*') || u.allowedModels.length === 0;
     setEditWildcardAll(hasStar);
     setEditSelectedModels(hasStar ? [] : [...u.allowedModels]);
+  }
+
+  async function handleDeleteInvitation(invId: string) {
+    setErrorBanner(null);
+    setDeletingInviteId(invId);
+    try {
+      await api.deleteInvitation(invId);
+      setBanner('Invitación pendiente eliminada.');
+      await loadData();
+    } catch (err) {
+      setErrorBanner(
+        err instanceof ApiError ? err.message : 'No se pudo eliminar la invitación.'
+      );
+    } finally {
+      setDeletingInviteId(null);
+    }
   }
 
   async function handleSaveUserEdit(e: React.FormEvent) {
@@ -144,6 +168,7 @@ export const UsersTab: React.FC = () => {
       await api.updateUserQuotaAndModels(editingUser.id, {
         dailyTokenLimit: Math.floor(parsedLimit),
         quotaResetMode: editResetMode,
+        enforceStrictQuota: editEnforceStrict,
         allowedModels,
       });
       const updatedName = editingUser.username;
@@ -182,11 +207,11 @@ export const UsersTab: React.FC = () => {
   }
 
   async function handleCopyInviteLink(url: string) {
-    const ok = await copyTextToClipboard(url);
-    if (ok) {
+    try {
+      await navigator.clipboard.writeText(url);
       setCopiedInviteUrl(true);
       window.setTimeout(() => setCopiedInviteUrl(false), 2400);
-    } else {
+    } catch {
       setCopiedInviteUrl(false);
     }
   }
@@ -282,11 +307,11 @@ export const UsersTab: React.FC = () => {
               <input
                 id="inv-daily-limit"
                 type="number"
-                min={1}
-                step={1}
+                min={100}
+                step={1000}
                 className="input mono"
                 value={inviteDailyLimit}
-                onChange={(e) => setInviteDailyLimit(e.target.value)}
+                onChange={(e) => setInviteDailyLimit(Number(e.target.value))}
                 disabled={creatingInvite}
               />
             </div>
@@ -310,6 +335,20 @@ export const UsersTab: React.FC = () => {
           </div>
 
           <div className="field">
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={inviteEnforceStrict}
+                onChange={(e) => setInviteEnforceStrict(e.target.checked)}
+                disabled={creatingInvite}
+              />
+              <span>
+                Cuota estricta (bloquear de inmediato al alcanzar el límite sin margen extra)
+              </span>
+            </label>
+          </div>
+
+          <div className="field">
             <span className="field-label">Modelos permitidos para este invitado</span>
             <label className="checkbox-row">
               <input
@@ -328,22 +367,45 @@ export const UsersTab: React.FC = () => {
                   (*).
                 </p>
               ) : (
-                <div className="models-checklist-box">
-                  {models.map((m) => (
-                    <label key={m.fullId} className="checkbox-row" style={{ fontSize: '0.82rem' }}>
-                      <input
-                        type="checkbox"
-                        checked={inviteSelectedModels.includes(m.fullId)}
-                        onChange={() =>
-                          setInviteSelectedModels((prev) =>
-                            toggleModelInArray(prev, m.fullId)
-                          )
-                        }
-                      />
-                      <span className="mono">{m.fullId}</span>
-                    </label>
-                  ))}
-                </div>
+                <>
+                  <input
+                    type="search"
+                    className="input"
+                    style={{ marginBottom: 8 }}
+                    placeholder={`Buscar modelos… (${inviteSelectedModels.length} seleccionados)`}
+                    value={inviteModelSearch}
+                    onChange={(e) => setInviteModelSearch(e.target.value)}
+                  />
+                  <div className="models-checklist-box">
+                    {models
+                      .filter((m) => {
+                        const q = inviteModelSearch.trim().toLowerCase();
+                        return (
+                          !q ||
+                          m.fullId.toLowerCase().includes(q) ||
+                          m.name.toLowerCase().includes(q)
+                        );
+                      })
+                      .map((m) => (
+                        <label
+                          key={m.fullId}
+                          className="checkbox-row"
+                          style={{ fontSize: '0.82rem' }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={inviteSelectedModels.includes(m.fullId)}
+                            onChange={() =>
+                              setInviteSelectedModels((prev) =>
+                                toggleModelInArray(prev, m.fullId)
+                              )
+                            }
+                          />
+                          <span className="mono">{m.fullId}</span>
+                        </label>
+                      ))}
+                  </div>
+                </>
               )
             ) : null}
           </div>
@@ -397,9 +459,16 @@ export const UsersTab: React.FC = () => {
                         </span>
                       </td>
                       <td className="mono">
-                        {isAdminRow || u.dailyTokenLimit === null
-                          ? 'Ilimitado'
-                          : `${u.dailyTokenLimit.toLocaleString('es-ES')} tok`}
+                        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                          <span>
+                            {isAdminRow || u.dailyTokenLimit === null
+                              ? 'Ilimitado'
+                              : `${u.dailyTokenLimit.toLocaleString('es-ES')} tok`}
+                          </span>
+                          {!isAdminRow && u.enforceStrictQuota ? (
+                            <span className="status-badge rate_limited">Estricta</span>
+                          ) : null}
+                        </div>
                       </td>
                       <td style={{ color: 'var(--sub)', fontSize: '0.85rem' }}>
                         {u.quotaResetMode === 'rolling_24h' ? 'Móvil 24 h' : '00:00 UTC'}
@@ -470,6 +539,7 @@ export const UsersTab: React.FC = () => {
                   <th>Cuota asignada</th>
                   <th>Estado</th>
                   <th>Expira</th>
+                  <th style={{ textAlign: 'right' }}>Acción</th>
                 </tr>
               </thead>
               <tbody>
@@ -478,7 +548,14 @@ export const UsersTab: React.FC = () => {
                     <td>
                       <code className="key-prefix-pill">{inv.id.slice(0, 10)}</code>
                     </td>
-                    <td className="mono">{inv.dailyTokenLimit.toLocaleString('es-ES')} tok/día</td>
+                    <td className="mono">
+                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span>{inv.dailyTokenLimit.toLocaleString('es-ES')} tok/día</span>
+                        {inv.enforceStrictQuota ? (
+                          <span className="status-badge rate_limited">Estricta</span>
+                        ) : null}
+                      </div>
+                    </td>
                     <td>
                       {inv.usedAt ? (
                         <span className="status-badge offline">Canjeada</span>
@@ -488,6 +565,20 @@ export const UsersTab: React.FC = () => {
                     </td>
                     <td style={{ color: 'var(--sub)', fontSize: '0.85rem' }}>
                       {formatShortDate(inv.expiresAt)}
+                    </td>
+                    <td style={{ textAlign: 'right' }}>
+                      {!inv.usedAt ? (
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          disabled={deletingInviteId === inv.id}
+                          onClick={() => void handleDeleteInvitation(inv.id)}
+                        >
+                          {deletingInviteId === inv.id ? 'Eliminando…' : 'Eliminar'}
+                        </button>
+                      ) : (
+                        <span className="field-hint">—</span>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -526,7 +617,6 @@ export const UsersTab: React.FC = () => {
                   id="edit-user-limit"
                   type="number"
                   min={1}
-                  step={1}
                   className="input mono"
                   value={editLimitInput}
                   onChange={(e) => setEditLimitInput(e.target.value)}
@@ -551,6 +641,18 @@ export const UsersTab: React.FC = () => {
               </div>
 
               <div className="field">
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={editEnforceStrict}
+                    onChange={(e) => setEditEnforceStrict(e.target.checked)}
+                    disabled={savingEdit}
+                  />
+                  <span>Cuota estricta (sin margen extra al agotar límite)</span>
+                </label>
+              </div>
+
+              <div className="field">
                 <span className="field-label">Modelos permitidos</span>
                 <label className="checkbox-row">
                   <input
@@ -563,26 +665,45 @@ export const UsersTab: React.FC = () => {
                 </label>
 
                 {!editWildcardAll ? (
-                  <div className="models-checklist-box">
-                    {models.map((m) => (
-                      <label
-                        key={m.fullId}
-                        className="checkbox-row"
-                        style={{ fontSize: '0.82rem' }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={editSelectedModels.includes(m.fullId)}
-                          onChange={() =>
-                            setEditSelectedModels((prev) =>
-                              toggleModelInArray(prev, m.fullId)
-                            )
-                          }
-                        />
-                        <span className="mono">{m.fullId}</span>
-                      </label>
-                    ))}
-                  </div>
+                  <>
+                    <input
+                      type="search"
+                      className="input"
+                      style={{ marginBottom: 8 }}
+                      placeholder={`Buscar modelos… (${editSelectedModels.length} seleccionados)`}
+                      value={editModelSearch}
+                      onChange={(e) => setEditModelSearch(e.target.value)}
+                    />
+                    <div className="models-checklist-box">
+                      {models
+                        .filter((m) => {
+                          const q = editModelSearch.trim().toLowerCase();
+                          return (
+                            !q ||
+                            m.fullId.toLowerCase().includes(q) ||
+                            m.name.toLowerCase().includes(q)
+                          );
+                        })
+                        .map((m) => (
+                          <label
+                            key={m.fullId}
+                            className="checkbox-row"
+                            style={{ fontSize: '0.82rem' }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={editSelectedModels.includes(m.fullId)}
+                              onChange={() =>
+                                setEditSelectedModels((prev) =>
+                                  toggleModelInArray(prev, m.fullId)
+                                )
+                              }
+                            />
+                            <span className="mono">{m.fullId}</span>
+                          </label>
+                        ))}
+                    </div>
+                  </>
                 ) : null}
               </div>
 

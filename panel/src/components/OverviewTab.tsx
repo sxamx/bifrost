@@ -1,7 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../api';
-import { copyTextToClipboard } from '../clipboard';
-import type { AuthUser, DashboardStats, MetricsSummary, ProviderSummary } from '../types';
+import type {
+  AuthUser,
+  DashboardStats,
+  FreeQuotaStatus,
+  MetricsSummary,
+  ProviderRateLimitWindow,
+  ProviderSummary,
+  QuotaConfidence,
+  SystemUpdateStatus,
+} from '../types';
 import { InfoTip } from './InfoTip';
 import { OnboardingCard } from './OnboardingCard';
 
@@ -139,6 +147,18 @@ const MiniSparkline: React.FC<MiniSparkProps> = ({ points, labels, color, unit }
   );
 };
 
+function formatActiveWindowLabel(w?: ProviderRateLimitWindow | null): string {
+  if (w === 'hour') return 'Ventana: hora';
+  if (w === 'week') return 'Ventana: semana';
+  return 'Ventana: día';
+}
+
+function formatConfidenceLabel(c?: QuotaConfidence | null): string {
+  if (c === 'header_exact') return 'Exacto por cabecera';
+  if (c === 'inferred') return 'Inferido por 429';
+  return 'Configurado';
+}
+
 export const OverviewTab: React.FC<OverviewTabProps> = ({
   user,
   stats,
@@ -151,9 +171,17 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   onOpenMarketplaceInfo,
 }) => {
   const [summary, setSummary] = useState<MetricsSummary | null>(null);
+  const [freeQuota, setFreeQuota] = useState<FreeQuotaStatus | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(true);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [copiedEndpoint, setCopiedEndpoint] = useState(false);
+
+  // HU-41 System Update State (admin only)
+  const [updateStatus, setUpdateStatus] = useState<SystemUpdateStatus | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [triggeringUpdate, setTriggeringUpdate] = useState(false);
+  const [updateFeedback, setUpdateFeedback] = useState<string | null>(null);
+  const [copiedUpdateCmd, setCopiedUpdateCmd] = useState(false);
 
   const isAdmin = user.role === 'admin';
   const effectiveProvidersCount = providersLoaded
@@ -166,13 +194,11 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   useEffect(() => {
     let cancelled = false;
     setSummaryLoading(true);
-    api
-      .getMetricsSummary()
-      .then((data) => {
-        if (!cancelled) setSummary(data);
-      })
-      .catch(() => {
-        if (!cancelled) setSummary(null);
+    Promise.allSettled([api.getMetricsSummary(), api.getFreeQuota()])
+      .then(([sumRes, fqRes]) => {
+        if (cancelled) return;
+        setSummary(sumRes.status === 'fulfilled' ? sumRes.value : null);
+        setFreeQuota(fqRes.status === 'fulfilled' ? fqRes.value : null);
       })
       .finally(() => {
         if (!cancelled) setSummaryLoading(false);
@@ -184,6 +210,57 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   }, [providers.length, keysCount]);
 
   useEffect(() => {
+    if (!isAdmin) return;
+    let cancelled = false;
+    api
+      .getUpdateStatus(false)
+      .then((st) => {
+        if (!cancelled) setUpdateStatus(st);
+      })
+      .catch(() => {
+        // Silent if backend does not expose or offline
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isAdmin]);
+
+  async function handleCheckUpdateNow() {
+    if (!isAdmin) return;
+    setCheckingUpdate(true);
+    setUpdateFeedback(null);
+    try {
+      const st = await api.getUpdateStatus(true);
+      setUpdateStatus(st);
+      if (!st.updateAvailable) {
+        setUpdateFeedback('Bifrost ya está en la última versión disponible.');
+      }
+    } catch {
+      setUpdateFeedback('No se pudo comprobar actualizaciones en este momento.');
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  async function handleTriggerUpdateNow() {
+    if (!isAdmin) return;
+    setTriggeringUpdate(true);
+    setUpdateFeedback(null);
+    try {
+      const res = await api.triggerSystemUpdate();
+      setUpdateFeedback(
+        res.message || 'Actualización iniciada. El servicio se reiniciará en unos instantes.'
+      );
+    } catch (err) {
+      setUpdateFeedback(
+        err instanceof Error ? err.message : 'No se pudo iniciar la actualización automática.'
+      );
+    } finally {
+      setTriggeringUpdate(false);
+    }
+  }
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       setNowMs(Date.now());
     }, 1000);
@@ -191,11 +268,11 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   }, []);
 
   async function handleCopyEndpoint() {
-    const ok = await copyTextToClipboard(baseUrl);
-    if (ok) {
+    try {
+      await navigator.clipboard.writeText(baseUrl);
       setCopiedEndpoint(true);
       window.setTimeout(() => setCopiedEndpoint(false), 2200);
-    } else {
+    } catch {
       setCopiedEndpoint(false);
     }
   }
@@ -208,12 +285,19 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
     }
   }
 
+  const effectiveActiveWindow = freeQuota?.activeWindow ?? summary?.activeWindow ?? 'day';
+  const effectiveConfidence = freeQuota?.confidence ?? summary?.quotaConfidence ?? 'configured';
+  const effectiveAdaptiveAdjusted = Boolean(
+    freeQuota?.adaptiveAdjusted ?? summary?.adaptiveAdjusted
+  );
   const totalLimit =
+    freeQuota?.effectiveLimit ??
+    summary?.effectiveLimit ??
     summary?.totalDailyLimit ??
     (typeof user.dailyTokenLimit === 'number' && user.dailyTokenLimit > 0
       ? user.dailyTokenLimit
       : null);
-  const usedToday = summary?.usedTokensToday ?? 0;
+  const usedToday = freeQuota?.usedInWindow ?? summary?.usedTokensToday ?? 0;
   const hasConfiguredLimit = totalLimit !== null && totalLimit > 0;
 
   const pctRemaining =
@@ -413,16 +497,99 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
         </article>
       </section>
 
+      {/* HU-41 System Update Banner (admin only) */}
+      {isAdmin && updateStatus?.updateAvailable ? (
+        <section className="card" aria-label="Actualización disponible de Bifrost">
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 14,
+              flexWrap: 'wrap',
+            }}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span className="status-badge active">Actualización disponible</span>
+                <strong style={{ fontSize: '0.94rem' }}>
+                  {updateStatus.latestCommitMessage || 'Nueva versión de Bifrost disponible'}
+                </strong>
+                {updateStatus.latestCommitUrl ? (
+                  <a
+                    href={updateStatus.latestCommitUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="meta-tag accent mono"
+                    style={{ textDecoration: 'none' }}
+                  >
+                    {updateStatus.latestCommit?.slice(0, 7) || 'commit'} ↗
+                  </a>
+                ) : null}
+              </div>
+              {updateFeedback ? (
+                <span className="field-hint" style={{ color: 'var(--ok)' }}>
+                  {updateFeedback}
+                </span>
+              ) : null}
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={checkingUpdate}
+                onClick={() => void handleCheckUpdateNow()}
+              >
+                {checkingUpdate ? 'Comprobando…' : 'Comprobar ahora'}
+              </button>
+              {updateStatus.canAutoUpdate ? (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  disabled={triggeringUpdate}
+                  onClick={() => void handleTriggerUpdateNow()}
+                >
+                  {triggeringUpdate ? 'Actualizando…' : 'Actualizar ahora'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  onClick={() => {
+                    const cmd =
+                      updateStatus.runtimeMode === 'docker'
+                        ? 'docker compose pull && docker compose up -d'
+                        : 'git pull && npm run build && systemctl restart bifrost';
+                    void navigator.clipboard.writeText(cmd);
+                    setCopiedUpdateCmd(true);
+                    window.setTimeout(() => setCopiedUpdateCmd(false), 2200);
+                  }}
+                >
+                  {copiedUpdateCmd
+                    ? '✓ Comando copiado'
+                    : `Copiar comando (${updateStatus.runtimeMode})`}
+                </button>
+              )}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
       {/* HU-17 Primary Hero Block: "Cuota gratuita de hoy" */}
       <section className="quota-hero-card" aria-labelledby="daily-quota-hero-title">
         <div className="quota-hero-top">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-              <span className="meta-tag accent">Balance diario UTC</span>
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span className="meta-tag accent">{formatActiveWindowLabel(effectiveActiveWindow)}</span>
+              <span className="meta-tag">{formatConfidenceLabel(effectiveConfidence)}</span>
+              {effectiveAdaptiveAdjusted ? (
+                <span className="status-badge rate_limited">Ajuste adaptativo 429</span>
+              ) : null}
               <h2 id="daily-quota-hero-title" className="card-title">
                 Cuota gratuita de hoy
               </h2>
-              <InfoTip text="Calculada en el reloj UTC del servidor combinando los topes diarios configurados en tus claves y las cabeceras x-ratelimit-* reportadas por los proveedores." />
+              <InfoTip text="Calculada en el reloj UTC del servidor combinando los topes configurados en tus claves, cabeceras x-ratelimit-* y ajuste adaptativo ante respuestas 429." />
             </div>
 
             {summaryLoading && !summary ? (

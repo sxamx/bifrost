@@ -4,7 +4,10 @@ import type {
   ExitNodeItem,
   ModelSyncDiff,
   ProviderKeyItem,
+  ProviderKeyTestResult,
   ProviderModelItem,
+  ProviderRateLimitKind,
+  ProviderRateLimitWindow,
   ProviderSummary,
 } from '../types';
 import { InfoTip } from './InfoTip';
@@ -53,11 +56,28 @@ function statusBadgeLabel(status: ProviderKeyItem['status']): string {
     case 'rate_limited':
       return 'Rate limit';
     case 'no_node':
-      return 'Sin servicio';
+      return 'Sin nodo / Fuera de servicio';
+    case 'disabled':
+      return 'Desactivada';
     case 'error':
     default:
       return 'Error';
   }
+}
+
+function formatRateLimitKind(kind?: ProviderRateLimitKind | null): string | null {
+  if (!kind) return null;
+  if (kind === 'requests') return 'Límite por peticiones';
+  if (kind === 'tokens') return 'Límite por tokens';
+  if (kind === 'none') return 'Sin límite fijo';
+  return null;
+}
+
+function formatRateLimitWindow(w: ProviderRateLimitWindow): string {
+  if (w === 'hour') return 'hora';
+  if (w === 'day') return 'día';
+  if (w === 'week') return 'semana';
+  return w;
 }
 
 export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
@@ -83,6 +103,11 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
   // HU-08 & HU-11d Node Assignment & IP-Sharing Warning state
   const [updatingKeyNodeId, setUpdatingKeyNodeId] = useState<string | null>(null);
   const [collisionPrompt, setCollisionPrompt] = useState<PendingCollisionConfirmation | null>(null);
+
+  // HU-27 & HU-29 Key toggle & test state
+  const [togglingKeyId, setTogglingKeyId] = useState<string | null>(null);
+  const [testingKeyId, setTestingKeyId] = useState<string | null>(null);
+  const [keyTestResults, setKeyTestResults] = useState<Record<string, ProviderKeyTestResult>>({});
 
   const [syncingModels, setSyncingModels] = useState(false);
   const [reloadDiff, setReloadDiff] = useState<ModelSyncDiff | null>(null);
@@ -266,6 +291,44 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
     }
   }
 
+  async function handleToggleKey(key: ProviderKeyItem) {
+    setCardError(null);
+    setTogglingKeyId(key.id);
+    try {
+      const nextEnabled = key.status === 'disabled';
+      await api.toggleProviderKey(provider.id, key.id, nextEnabled);
+      await onRefreshAll();
+    } catch (err) {
+      setCardError(
+        err instanceof ApiError ? err.message : 'No se pudo cambiar el estado de la clave.'
+      );
+    } finally {
+      setTogglingKeyId(null);
+    }
+  }
+
+  async function handleTestKey(key: ProviderKeyItem) {
+    setCardError(null);
+    setTestingKeyId(key.id);
+    try {
+      const res = await api.testProviderKey(provider.id, key.id);
+      setKeyTestResults((prev) => ({ ...prev, [key.id]: res }));
+      await onRefreshAll();
+    } catch (err) {
+      setKeyTestResults((prev) => ({
+        ...prev,
+        [key.id]: {
+          ok: false,
+          httpStatus: err instanceof ApiError ? err.status : null,
+          latencyMs: 0,
+          message: err instanceof ApiError ? err.message : 'Error al probar la clave.',
+        },
+      }));
+    } finally {
+      setTestingKeyId(null);
+    }
+  }
+
   const filteredModels = useMemo(() => {
     const q = modelSearch.trim().toLowerCase();
     if (!q) return models;
@@ -278,6 +341,16 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
   }, [models, modelSearch]);
 
   const visibleModels = filteredModels.slice(0, visibleModelsLimit);
+  const privacy = provider.privacy ?? provider.manifest?.privacy ?? null;
+  const hasPrivacyWarning = Boolean(
+    privacy &&
+      (privacy.retention === 'retained' ||
+        privacy.training === 'allowed' ||
+        privacy.training === 'opt_out')
+  );
+  const rateLimitKind = provider.rateLimitKind ?? provider.manifest?.rateLimitKind ?? null;
+  const rateLimitWindows = provider.rateLimitWindows ?? provider.manifest?.rateLimitWindows ?? [];
+  const rateLimitLabel = formatRateLimitKind(rateLimitKind);
 
   return (
     <article className="provider-card" aria-labelledby={`prov-heading-${provider.id}`}>
@@ -310,6 +383,28 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
             <span className="meta-tag accent">
               {isStaticSource ? 'Catálogo estático' : 'Catálogo vía API'}
             </span>
+            {rateLimitLabel ? (
+              <span className="meta-tag">
+                {rateLimitLabel}
+                {rateLimitWindows.length > 0
+                  ? ` · ${rateLimitWindows.map(formatRateLimitWindow).join('/')}`
+                  : ''}
+              </span>
+            ) : null}
+            {hasPrivacyWarning && privacy ? (
+              <span
+                className="status-badge rate_limited"
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+              >
+                Sin ZDR / Entrenamiento
+                <InfoTip
+                  text={
+                    privacy.note ||
+                    `Retención: ${privacy.retention}. Política de entrenamiento: ${privacy.training}. Evita enviar datos sensibles por este proveedor.`
+                  }
+                />
+              </span>
+            ) : null}
           </div>
 
           <div
@@ -553,35 +648,91 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
                         </div>
                       </td>
                       <td>
-                        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
-                          <span className={`status-badge ${k.status}`}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
                             <span
-                              className={`status-dot ${
-                                k.status === 'active'
-                                  ? 'ok'
-                                  : k.status === 'rate_limited'
-                                    ? 'partial'
-                                    : 'err'
+                              className={`status-badge ${
+                                k.status === 'disabled' ? 'offline' : k.status
                               }`}
-                            />
-                            {statusBadgeLabel(k.status)}
-                          </span>
-                          {k.lastError ? (
-                            <InfoTip
-                              label={`Detalle de error en ${k.label}`}
-                              text={`Último motivo reportado: ${k.lastError}`}
-                            />
+                            >
+                              <span
+                                className={`status-dot ${
+                                  k.status === 'active'
+                                    ? 'ok'
+                                    : k.status === 'rate_limited'
+                                      ? 'partial'
+                                      : k.status === 'disabled'
+                                        ? 'muted'
+                                        : 'err'
+                                }`}
+                              />
+                              {statusBadgeLabel(k.status)}
+                            </span>
+                            {k.lastError ? (
+                              <InfoTip
+                                label={`Detalle de error en ${k.label}`}
+                                text={`Último motivo reportado: ${k.lastError}`}
+                              />
+                            ) : null}
+                          </div>
+                          {keyTestResults[k.id] ? (
+                            <span
+                              className="mono"
+                              style={{
+                                fontSize: '0.72rem',
+                                color: keyTestResults[k.id].ok ? 'var(--ok)' : 'var(--err)',
+                              }}
+                            >
+                              {keyTestResults[k.id].ok
+                                ? `OK · ${keyTestResults[k.id].latencyMs} ms`
+                                : keyTestResults[k.id].message}
+                            </span>
                           ) : null}
                         </div>
                       </td>
                       <td style={{ textAlign: 'right' }}>
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          onClick={() => onRequestDeleteKey(provider, k)}
+                        <div
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'flex-end',
+                            gap: 6,
+                            flexWrap: 'wrap',
+                          }}
                         >
-                          Quitar clave
-                        </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            disabled={testingKeyId === k.id || k.status === 'no_node'}
+                            title={
+                              k.status === 'no_node'
+                                ? 'Asigna un nodo en línea o modo directo para probar esta clave'
+                                : 'Probar validez y latencia de esta clave'
+                            }
+                            onClick={() => void handleTestKey(k)}
+                          >
+                            {testingKeyId === k.id ? 'Probando…' : 'Probar'}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            disabled={togglingKeyId === k.id}
+                            onClick={() => void handleToggleKey(k)}
+                          >
+                            {togglingKeyId === k.id
+                              ? '…'
+                              : k.status === 'disabled'
+                                ? 'Activar'
+                                : 'Desactivar'}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-danger btn-sm"
+                            onClick={() => onRequestDeleteKey(provider, k)}
+                          >
+                            Quitar
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );

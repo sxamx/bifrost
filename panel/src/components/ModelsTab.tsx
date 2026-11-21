@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
-import { copyTextToClipboard } from '../clipboard';
 import type {
   ActivitySeriesItem,
   ModelSpeedEntry,
@@ -245,6 +244,7 @@ const ModelTelemetryBlock: React.FC<ModelTelemetryBlockProps> = ({ model }) => {
 };
 
 interface ModelsTabProps {
+  isAdmin?: boolean;
   initialModelFullId?: string | null;
   onInitialModelConsumed?: () => void;
   onNavigateCompare?: () => void;
@@ -252,6 +252,7 @@ interface ModelsTabProps {
 }
 
 type CapabilityFilter = 'all' | 'tools' | 'reasoning' | 'structured' | 'multimodal';
+type VisibilityFilter = 'all' | 'active' | 'disabled';
 
 function formatContextTokens(val: number | null | undefined): string {
   if (!val || val <= 0) return '—';
@@ -273,16 +274,56 @@ function formatFirstSeenUtc(ts: number | undefined): string {
 
 function formatReleaseDate(model: ProviderModelItem): string {
   if (model.releaseDate && model.releaseDate.trim()) {
-    return model.releaseDate.trim();
+    const clean = model.releaseDate.trim();
+    const yearMatch = /^(\d{4})/.exec(clean);
+    if (!yearMatch || Number(yearMatch[1]) >= 2018) {
+      return clean;
+    }
+    return 'No reportada';
   }
   if (model.upstreamCreatedAt && Number.isFinite(model.upstreamCreatedAt)) {
     const ms =
       model.upstreamCreatedAt < 10_000_000_000
         ? model.upstreamCreatedAt * 1000
         : model.upstreamCreatedAt;
-    return new Date(ms).toISOString().slice(0, 10);
+    const d = new Date(ms);
+    if (d.getUTCFullYear() >= 2018) {
+      return d.toISOString().slice(0, 10);
+    }
   }
   return 'No reportada';
+}
+
+function formatPrivacyPill(
+  privacy: ProviderModelItem['providerPrivacy']
+): { label: string; cls: string; tip: string } | null {
+  if (!privacy) return null;
+  if (privacy.retention === 'zero' && privacy.training === 'never') {
+    return {
+      label: 'ZDR estricto',
+      cls: 'meta-tag verified',
+      tip: privacy.note || 'Sin retención de prompts y sin entrenamiento.',
+    };
+  }
+  if (privacy.retention === 'retained' || privacy.training === 'allowed') {
+    return {
+      label: 'Sin ZDR',
+      cls: 'status-badge error',
+      tip: privacy.note || 'Este proveedor puede retener prompts o entrenar con ellos.',
+    };
+  }
+  if (privacy.retention === 'variable') {
+    return {
+      label: 'ZDR variable',
+      cls: 'status-badge rate_limited',
+      tip: privacy.note || 'Depende del proveedor upstream enrutado.',
+    };
+  }
+  return {
+    label: 'Retención temporal',
+    cls: 'meta-tag',
+    tip: privacy.note || 'Retención temporal limitada.',
+  };
 }
 
 function formatReferencePricing(model: ProviderModelItem): string {
@@ -297,6 +338,7 @@ function formatReferencePricing(model: ProviderModelItem): string {
 }
 
 export const ModelsTab: React.FC<ModelsTabProps> = ({
+  isAdmin = false,
   initialModelFullId,
   onInitialModelConsumed,
   onNavigateCompare,
@@ -309,6 +351,8 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [providerFilter, setProviderFilter] = useState<string>('all');
   const [capFilter, setCapFilter] = useState<CapabilityFilter>('all');
+  const [visibilityFilter, setVisibilityFilter] = useState<VisibilityFilter>('all');
+  const [togglingModelId, setTogglingModelId] = useState<string | null>(null);
 
   const [selectedFullId, setSelectedFullId] = useState<string | null>(null);
   const [detailModel, setDetailModel] = useState<ProviderModelItem | null>(null);
@@ -321,7 +365,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
     setError(null);
     try {
       const fetched = await api.getModels();
-      setModels(fetched.filter((m) => m.active !== false));
+      setModels(fetched);
     } catch (err) {
       setError(
         err instanceof ApiError
@@ -333,13 +377,45 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
     }
   }, []);
 
+  const handleToggleModelVisibility = useCallback(
+    async (model: ProviderModelItem, e?: React.MouseEvent) => {
+      e?.stopPropagation();
+      if (!isAdmin) return;
+      setTogglingModelId(model.fullId);
+      setError(null);
+      try {
+        const nextDisabled = !model.disabledByAdmin;
+        await api.setModelVisibility(model.fullId, nextDisabled);
+        setModels((prev) =>
+          prev.map((m) =>
+            m.fullId === model.fullId ? { ...m, disabledByAdmin: nextDisabled } : m
+          )
+        );
+        setDetailModel((prev) =>
+          prev && prev.fullId === model.fullId
+            ? { ...prev, disabledByAdmin: nextDisabled }
+            : prev
+        );
+      } catch (err) {
+        setError(
+          err instanceof ApiError
+            ? err.message
+            : 'No se pudo actualizar la visibilidad del modelo.'
+        );
+      } finally {
+        setTogglingModelId(null);
+      }
+    },
+    [isAdmin]
+  );
+
   useEffect(() => {
     void loadModels();
   }, [loadModels]);
 
   const handleCopyModelId = useCallback((fullId: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
-    void copyTextToClipboard(fullId);
+    void navigator.clipboard.writeText(fullId);
     setCopiedId(fullId);
     window.setTimeout(() => {
       setCopiedId((prev) => (prev === fullId ? null : prev));
@@ -416,6 +492,9 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
   const filteredModels = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return models.filter((m) => {
+      if (visibilityFilter === 'active' && m.disabledByAdmin) return false;
+      if (visibilityFilter === 'disabled' && !m.disabledByAdmin) return false;
+      if (!isAdmin && m.disabledByAdmin) return false;
       if (providerFilter !== 'all' && m.providerId !== providerFilter) {
         return false;
       }
@@ -436,7 +515,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
         (m.family ?? '').toLowerCase().includes(q)
       );
     });
-  }, [models, providerFilter, capFilter, searchQuery]);
+  }, [models, providerFilter, capFilter, visibilityFilter, isAdmin, searchQuery]);
 
   /* DETAIL VIEW (HU-14, HU-14b, HU-14c, HU-15, HU-16) */
   if (selectedFullId && detailModel) {
@@ -694,7 +773,29 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
             </select>
           </div>
 
-          <div className="subnav-bar" role="group" aria-label="Filtro por capacidad">
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+            {isAdmin ? (
+              <div className="subnav-bar" role="group" aria-label="Filtro por estado de visibilidad">
+                {(
+                  [
+                    ['all', 'Todos'],
+                    ['active', 'Activos'],
+                    ['disabled', 'Deshabilitados'],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={`vis-${key}`}
+                    type="button"
+                    className={`subnav-btn${visibilityFilter === key ? ' active' : ''}`}
+                    onClick={() => setVisibilityFilter(key)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
+            <div className="subnav-bar" role="group" aria-label="Filtro por capacidad">
             {(
               [
                 ['all', 'Todos'],
@@ -713,6 +814,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                 {label}
               </button>
             ))}
+            </div>
           </div>
         </div>
       </section>
@@ -780,9 +882,35 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                             color: 'var(--sub)',
                             textTransform: 'uppercase',
                             letterSpacing: '0.03em',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 6,
+                            flexWrap: 'wrap',
                           }}
                         >
-                          {model.providerName || model.providerId}
+                          <span>{model.providerName || model.providerId}</span>
+                          {model.hasCatalogInfo ? (
+                            <span className="meta-tag accent" style={{ textTransform: 'none' }}>
+                              Catálogo
+                            </span>
+                          ) : null}
+                          {(() => {
+                            const p = formatPrivacyPill(model.providerPrivacy);
+                            return p ? (
+                              <span
+                                className={p.cls}
+                                style={{ textTransform: 'none', display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                                title={p.tip}
+                              >
+                                {p.label}
+                              </span>
+                            ) : null;
+                          })()}
+                          {model.disabledByAdmin ? (
+                            <span className="status-badge offline" style={{ textTransform: 'none' }}>
+                              Deshabilitado
+                            </span>
+                          ) : null}
                         </div>
                         <h3
                           style={{
@@ -791,6 +919,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                             textOverflow: 'ellipsis',
                             whiteSpace: 'nowrap',
                             cursor: 'pointer',
+                            opacity: model.disabledByAdmin ? 0.58 : 1,
                           }}
                           onClick={() => void openModelDetail(model.fullId)}
                         >
@@ -798,6 +927,21 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                         </h3>
                       </div>
                     </div>
+
+                    {isAdmin ? (
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        disabled={togglingModelId === model.fullId}
+                        onClick={(e) => void handleToggleModelVisibility(model, e)}
+                      >
+                        {togglingModelId === model.fullId
+                          ? '…'
+                          : model.disabledByAdmin
+                            ? 'Habilitar'
+                            : 'Deshabilitar'}
+                      </button>
+                    ) : null}
                   </div>
 
                   {/* Copyable provider/model ID on every card (HU-15) */}

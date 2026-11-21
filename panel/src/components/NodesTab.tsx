@@ -1,9 +1,9 @@
 import React, { useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
-import { copyTextToClipboard } from '../clipboard';
 import type {
   CreateNodeResult,
   ExitNodeItem,
+  ExitNodeTestResult,
   NodeAssignedKeyRef,
   NodeMode,
   ProviderSummary,
@@ -71,8 +71,11 @@ export const NodesTab: React.FC<NodesTabProps> = ({
   const [copiedCommand, setCopiedCommand] = useState(false);
   const [copiedToken, setCopiedToken] = useState(false);
 
-  // Rotation & Delete state (HU-11c & HU-13)
+  // Rotation, Test, Update & Delete state (HU-11c, HU-13, HU-28, HU-41)
   const [rotatingId, setRotatingId] = useState<string | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, ExitNodeTestResult>>({});
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
   const [nodeToDelete, setNodeToDelete] = useState<ExitNodeItem | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
@@ -106,6 +109,50 @@ export const NodesTab: React.FC<NodesTabProps> = ({
     }
     return map;
   }, [nodes, providers]);
+
+  async function handleTestNode(node: ExitNodeItem) {
+    setErrorBanner(null);
+    setTestingId(node.id);
+    try {
+      const res = await api.testNode(node.id);
+      setTestResults((prev) => ({ ...prev, [node.id]: res }));
+      await onNodesChanged();
+    } catch (err) {
+      setTestResults((prev) => ({
+        ...prev,
+        [node.id]: {
+          ok: false,
+          status: 'unresponsive',
+          latencyMs: null,
+          error: err instanceof ApiError ? err.message : 'No se pudo contactar al nodo.',
+        },
+      }));
+    } finally {
+      setTestingId(null);
+    }
+  }
+
+  async function handleUpdateNode(node: ExitNodeItem) {
+    setErrorBanner(null);
+    setBanner(null);
+    setUpdatingId(node.id);
+    try {
+      const res = await api.updateNode(node.id);
+      setBanner(
+        res.message ||
+          `Actualización enviada al nodo «${node.name}». El agente se reiniciará en unos segundos.`
+      );
+      await onNodesChanged();
+    } catch (err) {
+      setErrorBanner(
+        err instanceof ApiError
+          ? err.message
+          : `No se pudo iniciar la actualización del nodo «${node.name}».`
+      );
+    } finally {
+      setUpdatingId(null);
+    }
+  }
 
   async function handleCreateNode(e: React.FormEvent) {
     e.preventDefault();
@@ -202,11 +249,11 @@ export const NodesTab: React.FC<NodesTabProps> = ({
   }
 
   async function copyToClipboard(text: string, setter: (v: boolean) => void) {
-    const ok = await copyTextToClipboard(text);
-    if (ok) {
+    try {
+      await navigator.clipboard.writeText(text);
       setter(true);
       window.setTimeout(() => setter(false), 2400);
-    } else {
+    } catch {
       setter(false);
     }
   }
@@ -363,27 +410,66 @@ export const NodesTab: React.FC<NodesTabProps> = ({
                       <td style={{ textAlign: 'right' }}>
                         <div
                           style={{
-                            display: 'inline-flex',
-                            alignItems: 'center',
-                            gap: 8,
-                            justifyContent: 'flex-end',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'flex-end',
+                            gap: 4,
                           }}
                         >
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            disabled={rotatingId === node.id}
-                            onClick={() => void handleRotateToken(node)}
+                          <div
+                            style={{
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              justifyContent: 'flex-end',
+                              flexWrap: 'wrap',
+                            }}
                           >
-                            {rotatingId === node.id ? 'Rotando…' : 'Rotar token'}
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-danger btn-sm"
-                            onClick={() => setNodeToDelete(node)}
-                          >
-                            Quitar nodo
-                          </button>
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm"
+                              disabled={testingId === node.id}
+                              onClick={() => void handleTestNode(node)}
+                            >
+                              {testingId === node.id ? 'Probando…' : 'Probar'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm"
+                              disabled={updatingId === node.id}
+                              onClick={() => void handleUpdateNode(node)}
+                            >
+                              {updatingId === node.id ? 'Actualizando…' : 'Actualizar'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm"
+                              disabled={rotatingId === node.id}
+                              onClick={() => void handleRotateToken(node)}
+                            >
+                              {rotatingId === node.id ? 'Rotando…' : 'Rotar token'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-danger btn-sm"
+                              onClick={() => setNodeToDelete(node)}
+                            >
+                              Quitar
+                            </button>
+                          </div>
+                          {testResults[node.id] ? (
+                            <span
+                              className="mono"
+                              style={{
+                                fontSize: '0.72rem',
+                                color: testResults[node.id].ok ? 'var(--ok)' : 'var(--err)',
+                              }}
+                            >
+                              {testResults[node.id].ok
+                                ? `En línea · ${testResults[node.id].latencyMs ?? 0} ms`
+                                : testResults[node.id].error || 'Sin respuesta'}
+                            </span>
+                          ) : null}
                         </div>
                       </td>
                     </tr>
@@ -641,26 +727,30 @@ export const NodesTab: React.FC<NodesTabProps> = ({
               Confirmar retiro del nodo «{nodeToDelete.name}»
             </h2>
 
-            {keysAffectedOnDelete.length > 0 ? (
+            {keysAffectedOnDelete.length > 0 || (nodeToDelete.assignedKeysCount ?? 0) > 0 ? (
               <>
                 <p style={{ color: 'var(--sub)', fontSize: '0.93rem' }}>
-                  Al quitar este nodo (<code className="mono">{nodeToDelete.endpoint}</code>), las
-                  siguientes <strong>{keysAffectedOnDelete.length}</strong>{' '}
-                  {keysAffectedOnDelete.length === 1
-                    ? 'clave de proveedor quedará'
-                    : 'claves de proveedor quedarán'}{' '}
-                  <strong style={{ color: 'var(--err)' }}>sin servicio</strong> hasta que les
-                  asignes otro nodo o salida directa:
+                  Al quitar este nodo (<code className="mono">{nodeToDelete.endpoint}</code>),{' '}
+                  <strong>
+                    {Math.max(keysAffectedOnDelete.length, nodeToDelete.assignedKeysCount ?? 0)}
+                  </strong>{' '}
+                  {Math.max(keysAffectedOnDelete.length, nodeToDelete.assignedKeysCount ?? 0) === 1
+                    ? 'clave de proveedor pasará'
+                    : 'claves de proveedor pasarán'}{' '}
+                  a estado <code className="mono" style={{ color: 'var(--err)' }}>no_node</code>{' '}
+                  (sin servicio) hasta que les asignes otro nodo o salida directa:
                 </p>
 
-                <ul className="affected-keys-list">
-                  {keysAffectedOnDelete.map((item) => (
-                    <li key={item.id}>
-                      <strong>{item.providerName}</strong> — {item.label} (
-                      <code className="mono">{formatLast4(item.last4)}</code>)
-                    </li>
-                  ))}
-                </ul>
+                {keysAffectedOnDelete.length > 0 ? (
+                  <ul className="affected-keys-list">
+                    {keysAffectedOnDelete.map((item) => (
+                      <li key={item.id}>
+                        <strong>{item.providerName}</strong> — {item.label} (
+                        <code className="mono">{formatLast4(item.last4)}</code>)
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
               </>
             ) : (
               <p style={{ color: 'var(--sub)', fontSize: '0.93rem' }}>
