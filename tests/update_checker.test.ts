@@ -363,6 +363,9 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       masterKey,
       fetchImpl: async (input, init) => {
         const url = String(input);
+        if (url === GITHUB_COMMITS_MAIN_URL) {
+          return makeGitHubCommitResponse('ffffffffffffffffffffffffffffffffffffffff');
+        }
         const auth = new Headers(init?.headers).get('Authorization');
         watchtowerCalls.push({ url, auth });
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -556,6 +559,172 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       assert.equal(adminJson.message, 'Mock node updated and restarting.');
       assert.equal(receivedPath, '/_bifrost/update');
       assert.equal(receivedAuth, `Bearer ${createdNode.rawToken}`);
+    } finally {
+      await new Promise<void>((resolve) => mockNodeServer.close(() => resolve()));
+    }
+  });
+
+  it('skips Watchtower and native rebuild when Core is already up-to-date', async () => {
+    const db = openDatabase(':memory:');
+    let watchtowerCalled = false;
+
+    const wtRes = await triggerSystemUpdate({
+      db,
+      runtimeMode: 'docker',
+      watchtowerUrl: 'http://watchtower.internal:8080',
+      currentCommit: 'abc1234',
+      fetchImpl: async (input) => {
+        if (String(input) === GITHUB_COMMITS_MAIN_URL) {
+          return makeGitHubCommitResponse('abc1234567890abcdef1234567890abcdef12345');
+        }
+        watchtowerCalled = true;
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+    assert.equal(wtRes.ok, true);
+    assert.equal(wtRes.upToDate, true);
+    assert.equal(wtRes.mode, 'watchtower');
+    assert.equal(wtRes.restarting, false);
+    assert.equal(wtRes.message, 'Bifrost is already on the latest version.');
+    assert.equal(watchtowerCalled, false);
+
+    const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-core-uptodate-'));
+    fs.mkdirSync(path.join(tmpRepo, '.git'));
+    const ran: string[] = [];
+    let restarted = false;
+    try {
+      const nativeRes = await triggerSystemUpdate({
+        db,
+        runtimeMode: 'native',
+        watchtowerUrl: '',
+        repoDir: tmpRepo,
+        currentCommit: 'abc1234',
+        fetchImpl: async () => makeGitHubCommitResponse('abc1234567890abcdef1234567890abcdef12345'),
+        runCommand: async (cmd) => {
+          ran.push(cmd);
+        },
+        onRestart: () => {
+          restarted = true;
+        },
+      });
+      assert.equal(nativeRes.ok, true);
+      assert.equal(nativeRes.upToDate, true);
+      assert.equal(nativeRes.mode, 'native');
+      assert.equal(nativeRes.restarting, false);
+      assert.equal(ran.length, 0);
+      assert.equal(restarted, false);
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('persists node commit from /_bifrost/health and exposes commit + updateAvailable on GET /api/nodes', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+
+    let nodeHealthCommit = '1111111';
+    const mockNodeServer = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/_bifrost/health') {
+        const body = JSON.stringify({
+          ok: true,
+          uptime_sec: 42,
+          version: '0.1.0',
+          commit: nodeHealthCommit,
+          active_tunnels: 0,
+        });
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body).toString(),
+        });
+        res.end(body);
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => mockNodeServer.listen(0, '127.0.0.1', resolve));
+    const addr = mockNodeServer.address() as { port: number };
+
+    try {
+      const app = createApp({
+        db,
+        masterKey,
+        fetchImpl: async (input) => {
+          if (String(input) === GITHUB_COMMITS_MAIN_URL) {
+            return makeGitHubCommitResponse('2222222222222222222222222222222222222222');
+          }
+          return new Response('not found', { status: 404 });
+        },
+      });
+
+      const setupRes = await app.request('http://localhost/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'adminPassword123!' }),
+      });
+      const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+      // Populate external_cache with system_update_status (latestCommit = 2222222...)
+      const statusRes = await app.request('http://localhost/api/system/update-status?refresh=1', {
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(statusRes.status, 200);
+
+      // Register node
+      const createNodeRes = await app.request('http://localhost/api/nodes', {
+        method: 'POST',
+        headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Commit Check Node',
+          mode: 'tailscale',
+          endpoint: `127.0.0.1:${addr.port}`,
+        }),
+      });
+      assert.equal(createNodeRes.status, 201);
+      const createdNode = (await createNodeRes.json()) as { node: { id: string } };
+
+      // Test connectivity -> persists last_commit = '1111111'
+      const testRes = await app.request(
+        `http://localhost/api/nodes/${createdNode.node.id}/test`,
+        {
+          method: 'POST',
+          headers: { Cookie: adminCookie },
+        },
+      );
+      assert.equal(testRes.status, 200);
+
+      // GET /api/nodes -> commit='1111111', updateAvailable=true
+      const listRes1 = await app.request('http://localhost/api/nodes', {
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(listRes1.status, 200);
+      const listJson1 = (await listRes1.json()) as {
+        nodes: Array<{ id: string; commit: string | null; updateAvailable: boolean }>;
+      };
+      assert.equal(listJson1.nodes.length, 1);
+      assert.equal(listJson1.nodes[0]!.commit, '1111111');
+      assert.equal(listJson1.nodes[0]!.updateAvailable, true);
+
+      // Node updates to '2222222', test connectivity again -> updateAvailable=false
+      nodeHealthCommit = '2222222';
+      const testRes2 = await app.request(
+        `http://localhost/api/nodes/${createdNode.node.id}/test`,
+        {
+          method: 'POST',
+          headers: { Cookie: adminCookie },
+        },
+      );
+      assert.equal(testRes2.status, 200);
+
+      const listRes2 = await app.request('http://localhost/api/nodes', {
+        headers: { Cookie: adminCookie },
+      });
+      const listJson2 = (await listRes2.json()) as {
+        nodes: Array<{ id: string; commit: string | null; updateAvailable: boolean }>;
+      };
+      assert.equal(listJson2.nodes[0]!.commit, '2222222');
+      assert.equal(listJson2.nodes[0]!.updateAvailable, false);
     } finally {
       await new Promise<void>((resolve) => mockNodeServer.close(() => resolve()));
     }

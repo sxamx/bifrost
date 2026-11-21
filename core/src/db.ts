@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   token_hash TEXT NOT NULL,
   encrypted_token BLOB,
   tls_fingerprint TEXT,
+  last_commit TEXT,
   prev_token_hash TEXT,
   prev_token_expires_at INTEGER,
   last_seen_at INTEGER,
@@ -190,6 +191,9 @@ function ensureNodesColumns(db: DatabaseSync): void {
   }
   if (!colNames.has('tls_fingerprint')) {
     db.exec(`ALTER TABLE nodes ADD COLUMN tls_fingerprint TEXT;`);
+  }
+  if (!colNames.has('last_commit')) {
+    db.exec(`ALTER TABLE nodes ADD COLUMN last_commit TEXT;`);
   }
 }
 

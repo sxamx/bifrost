@@ -692,4 +692,52 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('skips npm ci and restart on POST /_bifrost/update when checkHasUpdates returns false', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-node-uptodate-'));
+    fs.mkdirSync(path.join(tmpDir, '.git'));
+    const ranCommands: Array<{ cmd: string; args: string[]; cwd: string }> = [];
+    let restartCalled = false;
+
+    const token = 'node_uptodate_secret_token_123456';
+    const node = createBifrostNodeServer({
+      mode: 'tailscale',
+      bindHost: '127.0.0.1',
+      port: 0,
+      token,
+      logger: SILENT_LOGGER,
+      repoDir: tmpDir,
+      checkHasUpdates: async () => false,
+      runUpdateCommand: async (cmd, args, cwd) => {
+        ranCommands.push({ cmd, args, cwd });
+      },
+      onUpdateRestart: () => {
+        restartCalled = true;
+      }
+    });
+
+    try {
+      const started = await node.start();
+      const res = await fetch(`http://127.0.0.1:${started.port}/_bifrost/update`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      assert.equal(res.status, 200);
+      const json = (await res.json()) as {
+        ok: boolean;
+        upToDate: boolean;
+        restarting: boolean;
+        message: string;
+      };
+      assert.equal(json.ok, true);
+      assert.equal(json.upToDate, true);
+      assert.equal(json.restarting, false);
+      assert.equal(json.message, 'Node is already on the latest version.');
+      assert.equal(ranCommands.length, 0);
+      assert.equal(restartCalled, false);
+    } finally {
+      await node.stop();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

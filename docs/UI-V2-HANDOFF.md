@@ -60,18 +60,18 @@ Refleja las historias `HU-27` a `HU-41` descritas en [`HISTORIAS-V2.md`](HISTORI
 ### 2.2 `NodesTab.tsx` (`HU-27`, `HU-28`, `HU-41`)
 
 **Propiedades en `ExitNodeItem` (`types.ts`):**
-- `id: string`, `name: string`, `mode: NodeMode` (`'tailscale' | 'public_ip'`), `endpoint: string`, `status: NodeStatus` (`'online' | 'unresponsive' | 'offline'`), `assignedKeysCount?: number`.
+- `id: string`, `name: string`, `mode: NodeMode` (`'tailscale' | 'public_ip'`), `endpoint: string`, `status: NodeStatus` (`'online' | 'unresponsive' | 'offline'`), `assignedKeysCount?: number`, `commit?: string | null`, `updateAvailable?: boolean`.
 
 **Métodos en `api` (`api.ts`):**
 - `api.testNode(nodeId: string): Promise<ExitNodeTestResult>`  
   Donde `ExitNodeTestResult` es `{ ok: boolean; status: NodeStatus | string; latencyMs: number | null; error?: string }`. Conectar al botón **Probar nodo** en cada nodo.
-- `api.updateNode(nodeId: string): Promise<{ ok: boolean; message: string; restarting: boolean }>`  
+- `api.updateNode(nodeId: string): Promise<{ ok: boolean; upToDate?: boolean; message: string; restarting: boolean }>`  
   Llama a `POST /api/nodes/:id/update` (que reenvía la orden a `POST /_bifrost/update` en el agente del nodo). Conectar al botón **Actualizar nodo** en cada nodo.
 - `api.deleteNode(nodeId: string): Promise<{ ok: boolean }>` *(ya existente)*
 
 **Requisitos UI:**
 - Añadir botón **Probar nodo** con estado `testing` por fila/tarjeta y feedback inline (`En línea · X ms` o `error` descriptivo).
-- Añadir botón **Actualizar nodo** con estado de carga mientras se envía la orden y feedback inline claro de estado/reinicio (`restarting: true` o `message` del servidor, manejando errores con `ApiError`).
+- Para **«Actualizar nodo»**, mostrar o habilitar la acción de actualización únicamente cuando `node.updateAvailable === true` (o mostrar un badge **«Al día»** cuando sea `false`), con estado de carga mientras se envía la orden; manejar `upToDate === true` de forma limpia sin esperar un reinicio, y mostrar feedback inline claro para el resto de estados (`restarting: true` o `message` del servidor, manejando errores con `ApiError`).
 - En el flujo/confirmación de **Eliminar nodo**, advertir explícitamente si `assignedKeysCount > 0` que esas claves pasarán a estado `no_node` (fuera de servicio) hasta que se les asigne otro nodo.
 
 ---
@@ -279,7 +279,7 @@ export interface SystemUpdateStatus {
 **Métodos en `api` (`api.ts`):**
 - `api.getUpdateStatus(refresh?: boolean): Promise<SystemUpdateStatus>`  
   Llama a `GET /api/system/update-status` (o `GET /api/system/update-status?refresh=1` cuando `refresh === true`, saltando la caché de 6 horas del backend).
-- `api.triggerSystemUpdate(): Promise<{ ok: boolean; mode: 'watchtower' | 'native'; message: string; restarting: boolean }>`  
+- `api.triggerSystemUpdate(): Promise<{ ok: boolean; mode: 'watchtower' | 'native'; upToDate?: boolean; message: string; restarting: boolean }>`  
   Llama a `POST /api/system/update` (solo `admin`, ejecuta Watchtower en Docker o `git pull` + recompilación y reinicio en `systemd`).
 
 **Requisitos UI (`OverviewTab.tsx` o barra superior / topbar — solo `admin`):**
@@ -297,7 +297,7 @@ export interface SystemUpdateStatus {
 ## 3. Checklist final de implementación UI
 
 - [ ] **`ProviderVaultCard.tsx`**: switch **Activar / Desactivar** (`status === 'disabled'`), badge `no_node`, botón **Probar clave** (`ProviderKeyTestResult`) y badge/tooltip de advertencia de privacidad (`HU-40`).
-- [ ] **`NodesTab.tsx`**: botón **Probar nodo** (`ExitNodeTestResult`) con estado de carga/latencia, botón **Actualizar nodo** (`api.updateNode`) con feedback de carga/reinicio (`HU-41`), y advertencia de claves afectadas al eliminar nodo.
+- [ ] **`NodesTab.tsx`**: botón **Probar nodo** (`ExitNodeTestResult`) con estado de carga/latencia, botón **Actualizar nodo** (`api.updateNode`) habilitado/visible solo cuando `node.updateAvailable === true` (o badge **«Al día»** si `false`, manejando `upToDate === true` sin esperar reinicio) con feedback de carga/reinicio (`HU-41`), y advertencia de claves afectadas al eliminar nodo.
 - [ ] **`ModelsTab.tsx`**: interruptor de visibilidad admin (`api.setModelVisibility`), soporte y filtro para modelos deshabilitados y no-texto (`embeddings`), badge `hasCatalogInfo`, saneamiento de `formatReleaseDate` (`>= 2018` o `'No reportada'`) e indicador `providerPrivacy` (`HU-40`).
 - [ ] **`UsersTab.tsx`**: botón **Eliminar** en invitaciones pendientes (`api.deleteInvitation`), buscador de modelos en modales sin perder selección e interruptor/badge `enforceStrictQuota`.
 - [ ] **`ApiKeysTab.tsx`**: selector de expiración (`expiresInDays` / `expiresAt`), columna/badge de expiración y estado **Expirada**, y métricas compactas por clave (`usedTokens` / `requestsCount`).

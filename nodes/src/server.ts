@@ -52,6 +52,7 @@ export interface BifrostNodeOptions {
   detectTailscaleOptions?: DetectTailscaleOptions;
   logger?: NodeLogger;
   repoDir?: string;
+  checkHasUpdates?: (repoDir: string) => boolean | Promise<boolean>;
   runUpdateCommand?: (cmd: string, args: string[], cwd: string) => void | Promise<void>;
   onUpdateRestart?: () => void;
 }
@@ -156,6 +157,18 @@ function detectNodeCommit(repoDir: string): string | null {
 
 async function defaultRunNodeUpdateCommand(cmd: string, args: string[], cwd: string): Promise<void> {
   await execFileAsync(cmd, args, { cwd, timeout: 180_000 });
+}
+
+async function defaultCheckNodeHasUpdates(repoDir: string): Promise<boolean> {
+  await execFileAsync('git', ['fetch', '--depth', '1', 'origin', 'main'], {
+    cwd: repoDir,
+    timeout: 30_000
+  });
+  const [{ stdout: localSha }, { stdout: remoteSha }] = await Promise.all([
+    execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, timeout: 10_000 }),
+    execFileAsync('git', ['rev-parse', 'origin/main'], { cwd: repoDir, timeout: 10_000 })
+  ]);
+  return localSha.trim() !== remoteSha.trim();
 }
 
 export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNodeInstance {
@@ -322,6 +335,22 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
 
       const runCmd = options.runUpdateCommand ?? defaultRunNodeUpdateCommand;
       try {
+        const hasUpdates = options.checkHasUpdates
+          ? await options.checkHasUpdates(resolvedRepoDir)
+          : options.runUpdateCommand
+            ? true
+            : await defaultCheckNodeHasUpdates(resolvedRepoDir);
+
+        if (!hasUpdates) {
+          sendJson(res, 200, {
+            ok: true,
+            upToDate: true,
+            restarting: false,
+            message: 'Node is already on the latest version.'
+          });
+          return;
+        }
+
         await runCmd('git', ['pull', '--ff-only'], resolvedRepoDir);
         await runCmd('npm', ['--prefix', 'nodes', 'ci', '--include=dev'], resolvedRepoDir);
         await runCmd('npm', ['--prefix', 'nodes', 'run', 'build'], resolvedRepoDir);
@@ -337,6 +366,7 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
 
       sendJson(res, 200, {
         ok: true,
+        upToDate: false,
         restarting: true,
         message: 'Node updated and restarting.'
       });

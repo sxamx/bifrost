@@ -769,6 +769,7 @@ export async function runNodesHealthTick(
     }
 
     let healthy = false;
+    let nodeCommit: string | null = null;
     try {
       const res = await callNodeControlPlane({
         mode: row.mode === 'public_ip' ? 'public_ip' : 'tailscale',
@@ -783,6 +784,9 @@ export async function runNodesHealthTick(
         timeoutMs,
       });
       healthy = res.status === 200 && res.data.ok === true;
+      if (healthy && typeof res.data.commit === 'string' && res.data.commit.trim().length > 0) {
+        nodeCommit = res.data.commit.trim();
+      }
     } catch {
       healthy = false;
     }
@@ -791,10 +795,16 @@ export async function runNodesHealthTick(
       onlineCount++;
       db.exec('BEGIN IMMEDIATE');
       try {
-        db.prepare(`UPDATE nodes SET status = 'online', last_seen_at = ? WHERE id = ?`).run(
-          nowSec,
-          nodeId,
-        );
+        if (nodeCommit !== null) {
+          db.prepare(
+            `UPDATE nodes SET status = 'online', last_seen_at = ?, last_commit = ? WHERE id = ?`,
+          ).run(nowSec, nodeCommit, nodeId);
+        } else {
+          db.prepare(`UPDATE nodes SET status = 'online', last_seen_at = ? WHERE id = ?`).run(
+            nowSec,
+            nodeId,
+          );
+        }
 
         const restored = db
           .prepare(
@@ -966,15 +976,29 @@ export async function testNodeConnectivity(params: {
 
     const latencyMs = Math.max(0, nowFn() - startMs);
     const healthy = res.status === 200 && res.data?.ok === true;
+    const nodeCommit =
+      healthy && typeof res.data?.commit === 'string' && res.data.commit.trim().length > 0
+        ? res.data.commit.trim()
+        : null;
     const nowSec = Math.floor(nowFn() / 1000);
 
     if (healthy) {
       db.exec('BEGIN IMMEDIATE');
       try {
         if (res.peerFingerprint && !row.tls_fingerprint && row.mode === 'public_ip') {
+          if (nodeCommit !== null) {
+            db.prepare(
+              `UPDATE nodes SET status = 'online', last_seen_at = ?, tls_fingerprint = ?, last_commit = ? WHERE id = ?`,
+            ).run(nowSec, res.peerFingerprint, nodeCommit, nodeId);
+          } else {
+            db.prepare(
+              `UPDATE nodes SET status = 'online', last_seen_at = ?, tls_fingerprint = ? WHERE id = ?`,
+            ).run(nowSec, res.peerFingerprint, nodeId);
+          }
+        } else if (nodeCommit !== null) {
           db.prepare(
-            `UPDATE nodes SET status = 'online', last_seen_at = ?, tls_fingerprint = ? WHERE id = ?`,
-          ).run(nowSec, res.peerFingerprint, nodeId);
+            `UPDATE nodes SET status = 'online', last_seen_at = ?, last_commit = ? WHERE id = ?`,
+          ).run(nowSec, nodeCommit, nodeId);
         } else {
           db.prepare(`UPDATE nodes SET status = 'online', last_seen_at = ? WHERE id = ?`).run(
             nowSec,
@@ -1018,6 +1042,7 @@ export async function testNodeConnectivity(params: {
 
 export interface NodeUpdateTriggerResult {
   ok: true;
+  upToDate?: boolean;
   message: string;
   restarting: boolean;
 }
@@ -1093,6 +1118,7 @@ export async function triggerNodeUpdate(
 
   return {
     ok: true,
+    ...(res.data.upToDate !== undefined ? { upToDate: Boolean(res.data.upToDate) } : {}),
     message:
       typeof res.data.message === 'string' && res.data.message.trim().length > 0
         ? res.data.message.trim()

@@ -267,20 +267,23 @@ export class SystemUpdateError extends Error {
 }
 
 export interface TriggerSystemUpdateOptions {
+  db?: DatabaseSync;
   fetchImpl?: FetchLike;
   runtimeMode?: 'docker' | 'native';
   watchtowerUrl?: string;
   watchtowerToken?: string;
   repoDir?: string;
+  currentCommit?: string | null;
   runCommand?: (cmd: string, args: string[], cwd: string) => void | Promise<void>;
   onRestart?: () => void;
 }
 
 export interface TriggerSystemUpdateResult {
   ok: true;
+  upToDate?: boolean;
   mode: 'watchtower' | 'native';
   message: string;
-  restarting: true;
+  restarting: boolean;
 }
 
 async function defaultRunCommand(cmd: string, args: string[], cwd: string): Promise<void> {
@@ -300,8 +303,51 @@ export async function triggerSystemUpdate(
   ).trim();
   const repoDir = options.repoDir ?? defaultRepoDir();
 
+  const mode: 'watchtower' | 'native' | null =
+    watchtowerUrl.length > 0
+      ? 'watchtower'
+      : runtimeMode === 'docker'
+        ? null
+        : hasGitRepo(repoDir)
+          ? 'native'
+          : null;
+
+  if (!mode) {
+    if (runtimeMode === 'docker') {
+      throw new SystemUpdateError(
+        'Watchtower is not configured. Set BIFROST_WATCHTOWER_URL (and BIFROST_WATCHTOWER_TOKEN) or enable the auto-update profile in docker-compose.yml.',
+        409,
+      );
+    }
+    throw new SystemUpdateError(
+      'Auto-update is unavailable: not a git repository and Watchtower is not configured.',
+      409,
+    );
+  }
+
+  if (options.db) {
+    const status = await checkSystemUpdate({
+      db: options.db,
+      fetchImpl,
+      forceRefresh: true,
+      runtimeMode,
+      repoDir,
+      watchtowerUrl,
+      currentCommit: options.currentCommit,
+    });
+    if (status.currentCommit && status.latestCommit && !status.updateAvailable) {
+      return {
+        ok: true,
+        upToDate: true,
+        mode,
+        message: 'Bifrost is already on the latest version.',
+        restarting: false,
+      };
+    }
+  }
+
   // Docker + Watchtower mode (or explicit BIFROST_WATCHTOWER_URL)
-  if (watchtowerUrl.length > 0) {
+  if (mode === 'watchtower') {
     const endpoint = `${watchtowerUrl.replace(/\/+$/, '')}/v1/update`;
     const headers: Record<string, string> = {};
     if (watchtowerToken.length > 0) {
@@ -326,47 +372,35 @@ export async function triggerSystemUpdate(
 
     return {
       ok: true,
+      upToDate: false,
       mode: 'watchtower',
       message: 'Watchtower update triggered. Container is restarting with the latest image.',
       restarting: true,
     };
   }
 
-  if (runtimeMode === 'docker') {
-    throw new SystemUpdateError(
-      'Watchtower is not configured. Set BIFROST_WATCHTOWER_URL (and BIFROST_WATCHTOWER_TOKEN) or enable the auto-update profile in docker-compose.yml.',
-      409,
-    );
-  }
-
   // Native mode: git pull --ff-only && npm run build + systemd restart
-  if (runtimeMode === 'native' && hasGitRepo(repoDir)) {
-    const runCmd = options.runCommand ?? defaultRunCommand;
-    try {
-      await runCmd('git', ['pull', '--ff-only'], repoDir);
-      await runCmd('npm', ['run', 'build'], repoDir);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new SystemUpdateError(`Native update failed: ${msg}`, 500);
-    }
-
-    if (options.onRestart) {
-      options.onRestart();
-    } else {
-      const timer = setTimeout(() => process.exit(0), 500);
-      timer.unref();
-    }
-
-    return {
-      ok: true,
-      mode: 'native',
-      message: 'Updated repository and rebuilt Core. Restarting service...',
-      restarting: true,
-    };
+  const runCmd = options.runCommand ?? defaultRunCommand;
+  try {
+    await runCmd('git', ['pull', '--ff-only'], repoDir);
+    await runCmd('npm', ['run', 'build'], repoDir);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new SystemUpdateError(`Native update failed: ${msg}`, 500);
   }
 
-  throw new SystemUpdateError(
-    'Auto-update is unavailable: not a git repository and Watchtower is not configured.',
-    409,
-  );
+  if (options.onRestart) {
+    options.onRestart();
+  } else {
+    const timer = setTimeout(() => process.exit(0), 500);
+    timer.unref();
+  }
+
+  return {
+    ok: true,
+    upToDate: false,
+    mode: 'native',
+    message: 'Updated repository and rebuilt Core. Restarting service...',
+    restarting: true,
+  };
 }

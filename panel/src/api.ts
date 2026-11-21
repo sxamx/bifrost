@@ -509,6 +509,18 @@ function normalizeExitNode(raw: unknown): ExitNodeItem {
     name: String(r.name ?? 'Nodo'),
     mode: rawMode,
     endpoint: String(r.endpoint ?? ''),
+    commit:
+      typeof r.commit === 'string'
+        ? r.commit
+        : typeof r.last_commit === 'string'
+          ? r.last_commit
+          : null,
+    updateAvailable:
+      r.updateAvailable !== undefined
+        ? Boolean(r.updateAvailable)
+        : r.update_available !== undefined
+          ? Boolean(r.update_available)
+          : false,
     status: rawStatus,
     lastSeenAt:
       typeof r.lastSeenAt === 'number'
@@ -2183,12 +2195,14 @@ export const api = {
 
   triggerSystemUpdate(): Promise<{
     ok: boolean;
+    upToDate?: boolean;
     mode: 'watchtower' | 'native';
     message: string;
     restarting: boolean;
   }> {
     return request<{
       ok: boolean;
+      upToDate?: boolean;
       mode: 'watchtower' | 'native';
       message: string;
       restarting: boolean;
@@ -2199,11 +2213,13 @@ export const api = {
 
   updateNode(nodeId: string): Promise<{
     ok: boolean;
+    upToDate?: boolean;
     message: string;
     restarting: boolean;
   }> {
     return request<{
       ok: boolean;
+      upToDate?: boolean;
       message: string;
       restarting: boolean;
     }>(`/api/nodes/${encodeURIComponent(nodeId)}/update`, {

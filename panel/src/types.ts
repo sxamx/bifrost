@@ -423,6 +423,8 @@ export interface ExitNodeItem {
   name: string;
   mode: NodeMode;
   endpoint: string;
+  commit?: string | null;
+  updateAvailable?: boolean;
   status: NodeStatus;
   lastSeenAt: number | null;
   lastRotatedAt: number | null;

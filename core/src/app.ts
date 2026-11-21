@@ -18,6 +18,7 @@ import {
   readCachedModelsDevSnapshot,
   resolveAndSyncModelBenchmarks,
 } from './catalog/index.js';
+import { readExternalCache } from './catalog/cache.js';
 import { MIN_VALID_MODEL_TIMESTAMP_SEC } from './catalog/models-dev.js';
 import {
   decryptSecret,
@@ -84,7 +85,10 @@ import {
 } from './schema.js';
 import {
   SystemUpdateError,
+  type SystemUpdateStatus,
+  UPDATE_CHECK_CACHE_KEY,
   checkSystemUpdate,
+  isCommitUpToDate,
   triggerSystemUpdate,
 } from './update-checker.js';
 import {
@@ -665,13 +669,15 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     }
 
     try {
-      const result = await triggerSystemUpdate({ fetchImpl });
+      const result = await triggerSystemUpdate({ db, fetchImpl });
       writeSystemLog(
         db,
         'info',
         'system',
-        `Triggered Core auto-update (${result.mode})`,
-        { mode: result.mode, triggeredBy: user.username },
+        result.upToDate
+          ? `Core auto-update skipped: already on latest version (${result.mode})`
+          : `Triggered Core auto-update (${result.mode})`,
+        { mode: result.mode, upToDate: Boolean(result.upToDate), triggeredBy: user.username },
         nowSeconds(),
       );
       return c.json(result);
@@ -2305,9 +2311,16 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       }));
   };
 
-  const formatNodeItem = (row: Record<string, unknown>) => {
+  const formatNodeItem = (row: Record<string, unknown>, latestCommit: string | null = null) => {
     const nodeId = String(row.id);
     const assignedKeys = listNodeAssignedKeys(nodeId);
+    const commit =
+      row.last_commit === null || row.last_commit === undefined
+        ? null
+        : String(row.last_commit);
+    const updateAvailable = Boolean(
+      commit && latestCommit && !isCommitUpToDate(commit, latestCommit),
+    );
     return {
       id: nodeId,
       name: String(row.name),
@@ -2317,6 +2330,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         row.tls_fingerprint === null || row.tls_fingerprint === undefined
           ? null
           : String(row.tls_fingerprint),
+      commit,
+      updateAvailable,
       status:
         row.status === 'online' || row.status === 'unresponsive'
           ? (String(row.status) as 'online' | 'unresponsive')
@@ -2342,16 +2357,24 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json({ error: 'Admin privileges required.' }, 403);
     }
 
+    let latestCommit: string | null = null;
+    try {
+      const cached = readExternalCache<SystemUpdateStatus>(db, UPDATE_CHECK_CACHE_KEY);
+      latestCommit = cached?.data?.latestCommit ?? null;
+    } catch {
+      latestCommit = null;
+    }
+
     const rows = db
       .prepare(
-        `SELECT id, name, mode, endpoint, tls_fingerprint,
+        `SELECT id, name, mode, endpoint, tls_fingerprint, last_commit,
                 last_seen_at, last_rotated_at, status, created_at
          FROM nodes
          ORDER BY created_at ASC`,
       )
       .all() as Array<Record<string, unknown>>;
 
-    return c.json({ nodes: rows.map(formatNodeItem) });
+    return c.json({ nodes: rows.map((row) => formatNodeItem(row, latestCommit)) });
   });
 
   app.post('/api/nodes', async (c) => {
@@ -2468,7 +2491,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     const insertedRow = db
       .prepare(
-        `SELECT id, name, mode, endpoint, tls_fingerprint,
+        `SELECT id, name, mode, endpoint, tls_fingerprint, last_commit,
                 last_seen_at, last_rotated_at, status, created_at
          FROM nodes
          WHERE id = ?`,
@@ -2545,12 +2568,15 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         db,
         'info',
         'node',
-        `Triggered auto-update for node "${nodeId}"`,
-        { nodeId, triggeredBy: user.username },
+        result.upToDate
+          ? `Auto-update skipped for node "${nodeId}": already on latest version`
+          : `Triggered auto-update for node "${nodeId}"`,
+        { nodeId, upToDate: Boolean(result.upToDate), triggeredBy: user.username },
         nowSeconds(),
       );
       return c.json({
         ok: result.ok,
+        ...(result.upToDate !== undefined ? { upToDate: result.upToDate } : {}),
         message: result.message,
         restarting: result.restarting,
       });
