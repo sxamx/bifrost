@@ -196,6 +196,8 @@ export interface ManagedUserItem {
   enforceStrictQuota?: boolean;
   allowedModels: string[];
   usedTokensToday?: number;
+  usedTokens?: number;
+  requestsCount?: number;
   createdAt?: number;
 }
 
@@ -409,12 +411,26 @@ export interface RotateNodeTokenResult {
   rawToken?: string;
 }
 
+export interface ExitNodeTestResult {
+  ok: boolean;
+  status: NodeStatus | string;
+  latencyMs: number | null;
+  error?: string;
+}
+
 /* Phase 2 & Phase 7 — Marketplace & Provider Schemas (HU-06, HU-23) */
 
 export type ProviderPackageType = 'official-json' | 'experimental-adapter';
 export type ProviderModelsSource = 'api' | 'static';
 export type ProviderCategory = 'aggregator' | 'official-api' | 'experimental-adapter';
-export type ProviderKeyStatus = 'active' | 'rate_limited' | 'error' | 'no_node';
+export type ProviderKeyStatus = 'active' | 'rate_limited' | 'error' | 'no_node' | 'disabled';
+
+export interface ProviderKeyTestResult {
+  ok: boolean;
+  httpStatus: number | null;
+  latencyMs: number;
+  message: string;
+}
 
 export interface ProviderStaticModelDef {
   id: string;
@@ -509,6 +525,8 @@ export interface ProviderModelItem {
   isFree?: boolean;
   firstSeenAt?: number;
   active?: boolean;
+  disabledByAdmin?: boolean;
+  hasCatalogInfo?: boolean;
 }
 
 export interface ProviderSummary {
@@ -541,6 +559,8 @@ export interface AddProviderKeyInput {
   secret: string;
   dailyQuotaLimit?: number;
   nodeId?: string | null;
+  status?: 'active' | 'disabled';
+  enabled?: boolean;
 }
 
 export interface ModelSyncDiff {
@@ -559,6 +579,9 @@ export interface InternalApiKey {
   keyPrefix: string;
   createdAt: number;
   lastUsedAt: number | null;
+  expiresAt?: number | null;
+  usedTokens?: number;
+  requestsCount?: number;
 }
 
 export interface KeysListResponse {

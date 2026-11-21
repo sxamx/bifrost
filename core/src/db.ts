@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS provider_keys (
   daily_quota_limit INTEGER,
   ratelimit_remaining INTEGER,
   ratelimit_reset_at INTEGER,
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'rate_limited', 'error', 'no_node')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'rate_limited', 'error', 'no_node', 'disabled')),
   last_error TEXT,
   created_at INTEGER NOT NULL
 );
@@ -130,7 +130,8 @@ CREATE TABLE IF NOT EXISTS models (
   is_free INTEGER NOT NULL DEFAULT 1,
   first_seen_at INTEGER NOT NULL,
   upstream_created_at INTEGER,
-  active INTEGER NOT NULL DEFAULT 1
+  active INTEGER NOT NULL DEFAULT 1,
+  disabled_by_admin INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_models_provider_id ON models(provider_id);
@@ -141,6 +142,7 @@ CREATE TABLE IF NOT EXISTS usage_logs (
   user_id TEXT NOT NULL REFERENCES users(id),
   provider_id TEXT NOT NULL,
   provider_key_id TEXT,
+  internal_api_key_id TEXT,
   model_full_id TEXT NOT NULL,
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
@@ -221,6 +223,88 @@ function ensureInvitationsColumns(db: DatabaseSync): void {
   }
 }
 
+function ensureProviderKeysStatusCheck(db: DatabaseSync): void {
+  const row = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'provider_keys'`)
+    .get() as { sql?: string } | undefined;
+  if (!row?.sql || row.sql.includes("'disabled'")) {
+    return;
+  }
+
+  db.exec('PRAGMA foreign_keys = OFF;');
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    db.exec(`
+      CREATE TABLE provider_keys_new (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        encrypted_secret BLOB NOT NULL,
+        last4 TEXT NOT NULL,
+        node_id TEXT REFERENCES nodes(id) ON DELETE SET NULL,
+        forced_node INTEGER NOT NULL DEFAULT 0,
+        daily_quota_limit INTEGER,
+        ratelimit_remaining INTEGER,
+        ratelimit_reset_at INTEGER,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'rate_limited', 'error', 'no_node', 'disabled')),
+        last_error TEXT,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO provider_keys_new (
+        id, provider_id, label, encrypted_secret, last4, node_id, forced_node,
+        daily_quota_limit, ratelimit_remaining, ratelimit_reset_at, status, last_error, created_at
+      )
+      SELECT
+        id, provider_id, label, encrypted_secret, last4, node_id, forced_node,
+        daily_quota_limit, ratelimit_remaining, ratelimit_reset_at, status, last_error, created_at
+      FROM provider_keys;
+      DROP TABLE provider_keys;
+      ALTER TABLE provider_keys_new RENAME TO provider_keys;
+      CREATE INDEX IF NOT EXISTS idx_provider_keys_provider_id ON provider_keys(provider_id);
+    `);
+    db.exec('COMMIT;');
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    throw err;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON;');
+  }
+}
+
+function ensureModelsColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare(`PRAGMA table_info(models)`)
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+
+  if (!colNames.has('disabled_by_admin')) {
+    db.exec(`ALTER TABLE models ADD COLUMN disabled_by_admin INTEGER NOT NULL DEFAULT 0;`);
+  }
+}
+
+function ensureInternalApiKeysColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare(`PRAGMA table_info(internal_api_keys)`)
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+
+  if (!colNames.has('expires_at')) {
+    db.exec(`ALTER TABLE internal_api_keys ADD COLUMN expires_at INTEGER;`);
+  }
+}
+
+function ensureUsageLogsColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare(`PRAGMA table_info(usage_logs)`)
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+
+  if (!colNames.has('internal_api_key_id')) {
+    db.exec(`ALTER TABLE usage_logs ADD COLUMN internal_api_key_id TEXT;`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_usage_internal_key ON usage_logs(internal_api_key_id);`);
+}
+
 export function initDatabase(db: DatabaseSync): DatabaseSync {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
@@ -229,6 +313,10 @@ export function initDatabase(db: DatabaseSync): DatabaseSync {
   ensureNodesColumns(db);
   ensureUsersColumns(db);
   ensureInvitationsColumns(db);
+  ensureProviderKeysStatusCheck(db);
+  ensureModelsColumns(db);
+  ensureInternalApiKeysColumns(db);
+  ensureUsageLogsColumns(db);
   return db;
 }
 

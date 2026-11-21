@@ -229,6 +229,7 @@ function recordUsageLog(
     userId: string;
     providerId: string;
     providerKeyId: string | null;
+    internalApiKeyId?: string | null;
     modelFullId: string;
     promptTokens: number;
     completionTokens: number;
@@ -250,14 +251,15 @@ function recordUsageLog(
 
   db.prepare(
     `INSERT INTO usage_logs (
-       user_id, provider_id, provider_key_id, model_full_id,
+       user_id, provider_id, provider_key_id, internal_api_key_id, model_full_id,
        prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
        ttft_ms, duration_ms, tokens_per_sec, status, error_type, created_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     entry.userId,
     entry.providerId,
     entry.providerKeyId,
+    entry.internalApiKeyId ?? null,
     entry.modelFullId,
     entry.promptTokens,
     entry.completionTokens,
@@ -602,6 +604,7 @@ export async function executeChatCompletions(options: {
   upstreamTls?: UpstreamTlsOptions;
   now: () => number;
   userId: string;
+  internalApiKeyId?: string | null;
   modelFullId: string;
   modelId: string;
   providerRow: Record<string, unknown>;
@@ -615,6 +618,7 @@ export async function executeChatCompletions(options: {
     upstreamTls,
     now,
     userId,
+    internalApiKeyId = null,
     modelFullId,
     modelId,
     providerRow,
@@ -654,6 +658,14 @@ export async function executeChatCompletions(options: {
 
   const candidates = loadCandidateKeys(db, providerId, registry, nowSec);
   if (candidates.length === 0) {
+    writeSystemLog(
+      db,
+      'warn',
+      'system',
+      `Routing failed for "${modelFullId}": provider "${providerId}" has no active API keys with an online exit node available.`,
+      { providerId, modelFullId, userId },
+      nowSec,
+    );
     return openAiErrorJson(
       `Provider "${providerId}" has no active API keys with an online exit node available.`,
       'service_unavailable',
@@ -859,10 +871,19 @@ export async function executeChatCompletions(options: {
           const safeErr = await extractSafeUpstreamErrorMessage(res);
           const endMs = now();
           const endSec = Math.floor(endMs / 1000);
+          writeSystemLog(
+            db,
+            'error',
+            'system',
+            `Upstream HTTP ${res.status} on "${modelFullId}" (${providerId}): ${safeErr}`,
+            { providerId, modelFullId, keyId: key.id, httpStatus: res.status },
+            endSec,
+          );
           recordUsageLog(db, {
             userId,
             providerId,
             providerKeyId: key.id,
+            internalApiKeyId,
             modelFullId,
             promptTokens: 0,
             completionTokens: 0,
@@ -889,10 +910,19 @@ export async function executeChatCompletions(options: {
         } catch {
           const endMs = now();
           const endSec = Math.floor(endMs / 1000);
+          writeSystemLog(
+            db,
+            'error',
+            'system',
+            `Upstream provider "${providerId}" returned malformed JSON on "${modelFullId}"`,
+            { providerId, modelFullId, keyId: key.id },
+            endSec,
+          );
           recordUsageLog(db, {
             userId,
             providerId,
             providerKeyId: key.id,
+            internalApiKeyId,
             modelFullId,
             promptTokens: 0,
             completionTokens: 0,
@@ -944,6 +974,7 @@ export async function executeChatCompletions(options: {
           userId,
           providerId,
           providerKeyId: key.id,
+          internalApiKeyId,
           modelFullId,
           promptTokens,
           completionTokens,
@@ -1001,6 +1032,7 @@ export async function executeChatCompletions(options: {
       userId,
       providerId,
       providerKeyId: lastKeyId,
+      internalApiKeyId,
       modelFullId,
       promptTokens: 0,
       completionTokens: 0,
@@ -1141,10 +1173,19 @@ export async function executeChatCompletions(options: {
     const failSec = Math.floor(failEndMs / 1000);
     if (nonRetryableStreamFailure !== null) {
       const nrf: { status: number; message: string; keyId: string } = nonRetryableStreamFailure;
+      writeSystemLog(
+        db,
+        'error',
+        'system',
+        `Upstream HTTP ${nrf.status} on SSE stream "${modelFullId}" (${providerId}): ${nrf.message}`,
+        { providerId, modelFullId, keyId: nrf.keyId, httpStatus: nrf.status },
+        failSec,
+      );
       recordUsageLog(db, {
         userId,
         providerId,
         providerKeyId: nrf.keyId,
+        internalApiKeyId,
         modelFullId,
         promptTokens: 0,
         completionTokens: 0,
@@ -1177,6 +1218,7 @@ export async function executeChatCompletions(options: {
       userId,
       providerId,
       providerKeyId: lastStreamOpenKeyId,
+      internalApiKeyId,
       modelFullId,
       promptTokens: 0,
       completionTokens: 0,
@@ -1572,6 +1614,7 @@ export async function executeChatCompletions(options: {
             userId,
             providerId,
             providerKeyId: lastKeyUsedId,
+            internalApiKeyId,
             modelFullId,
             promptTokens,
             completionTokens:

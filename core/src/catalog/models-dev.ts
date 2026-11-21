@@ -184,6 +184,8 @@ export function stripFreeAndDateSuffix(rawId: string): string {
     .replace(/-\d{8}$/, '');
 }
 
+export const MIN_VALID_MODEL_TIMESTAMP_SEC = 1577836800; // 2020-01-01T00:00:00Z
+
 export function parseReleaseDateToUtcSeconds(releaseDate: string | null | undefined): number | null {
   if (typeof releaseDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(releaseDate.trim())) {
     return null;
@@ -192,7 +194,11 @@ export function parseReleaseDateToUtcSeconds(releaseDate: string | null | undefi
   if (!Number.isFinite(ms) || ms <= 0) {
     return null;
   }
-  return Math.floor(ms / 1000);
+  const sec = Math.floor(ms / 1000);
+  if (sec < MIN_VALID_MODEL_TIMESTAMP_SEC) {
+    return null;
+  }
+  return sec;
 }
 
 /**
@@ -324,7 +330,10 @@ export function resolveCanonicalAndEnrichModel(
     },
     contextLength,
     maxOutput,
-    releaseDate: providerHit?.release_date ?? canonicalHit?.release_date ?? null,
+    releaseDate: (() => {
+      const rawRel = providerHit?.release_date ?? canonicalHit?.release_date ?? null;
+      return parseReleaseDateToUtcSeconds(rawRel) !== null ? rawRel : null;
+    })(),
     lastUpdated: providerHit?.last_updated ?? canonicalHit?.last_updated ?? null,
     openWeights,
   };

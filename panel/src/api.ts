@@ -17,6 +17,7 @@ import type {
   EpochBenchmarkBlock,
   EpochBenchmarkRun,
   ExitNodeItem,
+  ExitNodeTestResult,
   InvitationItem,
   KeysListResponse,
   LatencyBucketPoint,
@@ -37,6 +38,7 @@ import type {
   PlaygroundChatResponse,
   ProviderCacheEntry,
   ProviderKeyItem,
+  ProviderKeyTestResult,
   ProviderLogoData,
   ProviderManifest,
   ProviderModelItem,
@@ -417,6 +419,18 @@ function normalizeManagedUser(raw: unknown): ManagedUserItem {
         : typeof r.used_tokens_today === 'number'
           ? r.used_tokens_today
           : undefined,
+    usedTokens:
+      typeof r.usedTokens === 'number'
+        ? r.usedTokens
+        : typeof r.used_tokens === 'number'
+          ? r.used_tokens
+          : undefined,
+    requestsCount:
+      typeof r.requestsCount === 'number'
+        ? r.requestsCount
+        : typeof r.requests_count === 'number'
+          ? r.requests_count
+          : undefined,
     createdAt:
       typeof r.createdAt === 'number'
         ? r.createdAt
@@ -521,7 +535,10 @@ function normalizeProviderKey(raw: unknown): ProviderKeyItem {
   const r = asRecord(raw);
   const rawStatus = typeof r.status === 'string' ? r.status : 'active';
   const status: ProviderKeyItem['status'] =
-    rawStatus === 'rate_limited' || rawStatus === 'error' || rawStatus === 'no_node'
+    rawStatus === 'rate_limited' ||
+    rawStatus === 'error' ||
+    rawStatus === 'no_node' ||
+    rawStatus === 'disabled'
       ? rawStatus
       : 'active';
 
@@ -680,6 +697,13 @@ function normalizeProviderModel(raw: unknown): ProviderModelItem {
           ? r.first_seen_at
           : undefined,
     active: r.active !== undefined ? Boolean(r.active) : true,
+    disabledByAdmin: Boolean(r.disabledByAdmin ?? r.disabled_by_admin ?? false),
+    hasCatalogInfo:
+      r.hasCatalogInfo !== undefined
+        ? Boolean(r.hasCatalogInfo)
+        : r.has_catalog_info !== undefined
+          ? Boolean(r.has_catalog_info)
+          : undefined,
   };
 }
 
@@ -1716,6 +1740,12 @@ export const api = {
     });
   },
 
+  testNode(nodeId: string): Promise<ExitNodeTestResult> {
+    return request<ExitNodeTestResult>(`/api/nodes/${encodeURIComponent(nodeId)}/test`, {
+      method: 'POST',
+    });
+  },
+
   async assignKeyNode(
     providerId: string,
     keyId: string,
@@ -1865,6 +1895,7 @@ export const api = {
     const payload: Record<string, unknown> = {
       label: input.label.trim(),
       secret: input.secret,
+      status: input.status ?? (input.enabled === true ? 'active' : 'disabled'),
     };
     if (typeof input.dailyQuotaLimit === 'number' && input.dailyQuotaLimit > 0) {
       payload.dailyQuotaLimit = input.dailyQuotaLimit;
@@ -1881,6 +1912,29 @@ export const api = {
     );
     const r = asRecord(raw);
     return normalizeProviderKey(r.key ?? raw);
+  },
+
+  async toggleProviderKey(
+    providerId: string,
+    keyId: string,
+    enabled: boolean
+  ): Promise<ProviderKeyItem> {
+    const raw = await request<unknown>(
+      `/api/providers/${encodeURIComponent(providerId)}/keys/${encodeURIComponent(keyId)}/toggle`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled }),
+      }
+    );
+    const r = asRecord(raw);
+    return normalizeProviderKey(r.key ?? raw);
+  },
+
+  testProviderKey(providerId: string, keyId: string): Promise<ProviderKeyTestResult> {
+    return request<ProviderKeyTestResult>(
+      `/api/providers/${encodeURIComponent(providerId)}/keys/${encodeURIComponent(keyId)}/test`,
+      { method: 'POST' }
+    );
   },
 
   deleteProviderKey(providerId: string, keyId: string): Promise<{ ok: boolean }> {
@@ -1925,16 +1979,39 @@ export const api = {
     return list.map(normalizeProviderModel);
   },
 
+  setModelVisibility(
+    fullId: string,
+    disabled: boolean
+  ): Promise<{ ok: boolean; fullId: string; disabledByAdmin: boolean }> {
+    return request<{ ok: boolean; fullId: string; disabledByAdmin: boolean }>(
+      '/api/models/visibility',
+      {
+        method: 'POST',
+        body: JSON.stringify({ fullId, disabled }),
+      }
+    );
+  },
+
   /* Internal API Keys (Phase 1: HU-03b) */
 
   getKeys(): Promise<KeysListResponse> {
     return request<KeysListResponse>('/api/keys', { method: 'GET' });
   },
 
-  createKey(name: string): Promise<CreateKeyResponse> {
+  createKey(
+    name: string,
+    options?: { expiresInDays?: number | null; expiresAt?: number | null }
+  ): Promise<CreateKeyResponse> {
+    const body: Record<string, unknown> = { name };
+    if (options?.expiresInDays !== undefined) {
+      body.expiresInDays = options.expiresInDays;
+    }
+    if (options?.expiresAt !== undefined) {
+      body.expiresAt = options.expiresAt;
+    }
     return request<CreateKeyResponse>('/api/keys', {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(body),
     });
   },
 

@@ -24,6 +24,8 @@ export interface ManagedUserSummary {
   enforceStrictQuota: boolean;
   allowedModels: string[];
   usedTokensToday: number;
+  usedTokens: number;
+  requestsCount: number;
   createdAt: number;
 }
 
@@ -146,6 +148,16 @@ function formatManagedUser(
       ? true
       : Number(row.enforce_strict_quota) !== 0;
 
+  const totalsRow = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(prompt_tokens + completion_tokens + reasoning_tokens), 0) AS used_tokens,
+         COUNT(*) AS requests_count
+       FROM usage_logs
+       WHERE user_id = ?`,
+    )
+    .get(id) as { used_tokens?: number; requests_count?: number } | undefined;
+
   return {
     id,
     username: String(row.username),
@@ -155,6 +167,8 @@ function formatManagedUser(
     enforceStrictQuota,
     allowedModels,
     usedTokensToday: computeUsedTokensForUser(db, id, quotaResetMode, nowSec),
+    usedTokens: Number(totalsRow?.used_tokens ?? 0),
+    requestsCount: Number(totalsRow?.requests_count ?? 0),
     createdAt: Number(row.created_at),
   };
 }
@@ -741,4 +755,33 @@ export async function acceptInvitation(
     sessionToken,
     sessionExpiresAt,
   };
+}
+
+export function deleteInvitation(
+  db: DatabaseSync,
+  adminUserId: string,
+  invitationId: string,
+  nowSec: number = Math.floor(Date.now() / 1000),
+): void {
+  const existing = db
+    .prepare(`SELECT id, used_at FROM invitations WHERE id = ?`)
+    .get(invitationId) as { id: string; used_at: number | null } | undefined;
+
+  if (!existing) {
+    throw new UserHttpError(404, `Invitation "${invitationId}" not found.`);
+  }
+  if (existing.used_at !== null) {
+    throw new UserHttpError(409, 'Cannot delete an invitation that has already been used.');
+  }
+
+  db.prepare(`DELETE FROM invitations WHERE id = ? AND used_at IS NULL`).run(invitationId);
+
+  writeSystemLog(
+    db,
+    'info',
+    'auth',
+    `Pending invitation "${invitationId}" deleted`,
+    { adminUserId, invitationId },
+    nowSec,
+  );
 }

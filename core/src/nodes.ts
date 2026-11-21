@@ -847,7 +847,7 @@ export async function runNodesHealthTick(
               `UPDATE provider_keys
                SET status = 'no_node',
                    last_error = 'Assigned exit node is unresponsive (>120s without heartbeat)'
-               WHERE node_id = ? AND status != 'no_node'`,
+               WHERE node_id = ? AND status NOT IN ('no_node', 'disabled')`,
             )
             .run(nodeId);
 
@@ -889,4 +889,121 @@ export async function runNodesHealthTick(
     offlineCount,
     rotatedNodeIds,
   };
+}
+
+export interface NodeConnectivityTestResult {
+  ok: boolean;
+  status: NodeStatus;
+  latencyMs: number | null;
+  error?: string;
+}
+
+export async function testNodeConnectivity(params: {
+  db: DatabaseSync;
+  masterKey: Buffer;
+  nodeId: string;
+  now?: () => number;
+  timeoutMs?: number;
+}): Promise<NodeConnectivityTestResult> {
+  const { db, masterKey, nodeId } = params;
+  const nowFn = params.now ?? (() => Date.now());
+  const timeoutMs = params.timeoutMs ?? 5000;
+
+  const row = db
+    .prepare(
+      `SELECT id, name, mode, endpoint, encrypted_token, tls_fingerprint, status
+       FROM nodes
+       WHERE id = ?`,
+    )
+    .get(nodeId) as Record<string, unknown> | undefined;
+
+  if (!row) {
+    throw new NodeOperationError(`Node "${nodeId}" not found.`, 404);
+  }
+
+  const currentStatus =
+    row.status === 'online' || row.status === 'unresponsive'
+      ? (String(row.status) as NodeStatus)
+      : ('offline' as NodeStatus);
+
+  if (!row.encrypted_token) {
+    return {
+      ok: false,
+      status: currentStatus,
+      latencyMs: null,
+      error: 'Node credentials are missing or unreadable.',
+    };
+  }
+
+  let rawToken: string;
+  try {
+    rawToken = decryptSecret(row.encrypted_token as Uint8Array, masterKey);
+  } catch {
+    return {
+      ok: false,
+      status: currentStatus,
+      latencyMs: null,
+      error: 'Failed to decrypt node credentials.',
+    };
+  }
+
+  const startMs = nowFn();
+  try {
+    const res = await callNodeControlPlane({
+      mode: row.mode === 'public_ip' ? 'public_ip' : 'tailscale',
+      endpoint: String(row.endpoint),
+      rawToken,
+      tlsFingerprint:
+        row.tls_fingerprint === null || row.tls_fingerprint === undefined
+          ? null
+          : String(row.tls_fingerprint),
+      method: 'GET',
+      path: '/_bifrost/health',
+      timeoutMs,
+    });
+
+    const latencyMs = Math.max(0, nowFn() - startMs);
+    const healthy = res.status === 200 && res.data?.ok === true;
+    const nowSec = Math.floor(nowFn() / 1000);
+
+    if (healthy) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare(`UPDATE nodes SET status = 'online', last_seen_at = ? WHERE id = ?`).run(
+          nowSec,
+          nodeId,
+        );
+        db.prepare(
+          `UPDATE provider_keys
+           SET status = 'active', last_error = NULL
+           WHERE node_id = ? AND status = 'no_node'`,
+        ).run(nodeId);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+
+      return {
+        ok: true,
+        status: 'online',
+        latencyMs,
+      };
+    }
+
+    return {
+      ok: false,
+      status: currentStatus,
+      latencyMs,
+      error: `Node health endpoint returned HTTP ${res.status}`,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Node connectivity test failed.';
+    return {
+      ok: false,
+      status: currentStatus,
+      latencyMs: null,
+      error: redactSecretsInText(msg),
+    };
+  }
 }

@@ -18,7 +18,9 @@ import {
   readCachedModelsDevSnapshot,
   resolveAndSyncModelBenchmarks,
 } from './catalog/index.js';
+import { MIN_VALID_MODEL_TIMESTAMP_SEC } from './catalog/models-dev.js';
 import {
+  decryptSecret,
   encryptSecret,
   generateInternalApiKey,
   generateSessionToken,
@@ -62,15 +64,18 @@ import {
   PUBLIC_IP_WARNING_MESSAGE,
   type UpstreamTlsOptions,
   buildNodeInstallCommand,
+  fetchViaExitNode,
   generateNodeToken,
   normalizeHexFingerprint,
   parseNodeEndpoint,
   rotateNodeToken,
   runNodesHealthTick,
+  testNodeConnectivity,
 } from './nodes.js';
 import { DrainingRegistry, checkUserDailyQuotaUtc, executeChatCompletions } from './router.js';
 import {
   type ProviderManifest,
+  buildProviderAuthHeaders,
   isValidHttpUri,
   loadSeedManifests,
   validateProviderManifest,
@@ -79,6 +84,7 @@ import {
   UserHttpError,
   acceptInvitation,
   createInvitation,
+  deleteInvitation,
   deleteManagedUser,
   listInvitations,
   listUsers,
@@ -1369,6 +1375,262 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     return c.json({ key: formatProviderKeyRow(updated) });
   });
 
+  app.patch('/api/providers/:id/keys/:keyId/toggle', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const providerId = c.req.param('id');
+    const keyId = c.req.param('keyId');
+
+    if (registry.isProviderDraining(providerId) || registry.isKeyDraining(keyId)) {
+      return c.json({ error: 'Provider key not found.' }, 404);
+    }
+
+    const existingKey = db
+      .prepare(
+        `SELECT id, provider_id, label, last4, node_id, status
+         FROM provider_keys
+         WHERE id = ? AND provider_id = ?`,
+      )
+      .get(keyId, providerId) as
+      | {
+          id: string;
+          provider_id: string;
+          label: string;
+          last4: string;
+          node_id: string | null;
+          status: string;
+        }
+      | undefined;
+
+    if (!existingKey) {
+      return c.json({ error: 'Provider key not found.' }, 404);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    if (typeof body.enabled !== 'boolean') {
+      return c.json({ error: 'Field "enabled" must be a boolean.' }, 400);
+    }
+
+    const nowSec = nowSeconds();
+    let nextStatus: 'active' | 'disabled' | 'no_node' = body.enabled ? 'active' : 'disabled';
+    let nextLastError: string | null = null;
+
+    if (body.enabled && existingKey.node_id) {
+      const nodeRow = db
+        .prepare(`SELECT name, status FROM nodes WHERE id = ?`)
+        .get(existingKey.node_id) as { name: string; status: string } | undefined;
+      if (!nodeRow || nodeRow.status !== 'online') {
+        nextStatus = 'no_node';
+        nextLastError = nodeRow
+          ? `Assigned exit node "${nodeRow.name}" is ${nodeRow.status}`
+          : 'Assigned exit node not found';
+      }
+    }
+
+    db.prepare(
+      `UPDATE provider_keys
+       SET status = ?, last_error = ?
+       WHERE id = ? AND provider_id = ?`,
+    ).run(nextStatus, nextLastError, keyId, providerId);
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Key "${existingKey.label}" (…${existingKey.last4}) ${body.enabled ? 'enabled' : 'disabled'} (status=${nextStatus})`,
+      { providerId, keyId, enabled: body.enabled, status: nextStatus },
+      nowSec,
+    );
+
+    const updated = db
+      .prepare(
+        `SELECT id, provider_id, label, last4, node_id, forced_node,
+                daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
+                status, last_error, created_at
+         FROM provider_keys
+         WHERE id = ?`,
+      )
+      .get(keyId) as Record<string, unknown>;
+
+    return c.json({ key: formatProviderKeyRow(updated) });
+  });
+
+  app.post('/api/providers/:id/keys/:keyId/test', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const providerId = c.req.param('id');
+    const keyId = c.req.param('keyId');
+
+    if (registry.isProviderDraining(providerId) || registry.isKeyDraining(keyId)) {
+      return c.json({ error: 'Provider key not found.' }, 404);
+    }
+
+    const provRow = db
+      .prepare(`SELECT id, name, package_type, schema_json, adapter_url FROM providers WHERE id = ?`)
+      .get(providerId) as
+      | {
+          id: string;
+          name: string;
+          package_type: string;
+          schema_json: string;
+          adapter_url: string | null;
+        }
+      | undefined;
+
+    if (!provRow) {
+      return c.json({ error: `Provider "${providerId}" not found.` }, 404);
+    }
+
+    const keyRow = db
+      .prepare(
+        `SELECT pk.id, pk.label, pk.encrypted_secret, pk.last4, pk.node_id, pk.status,
+                n.name AS node_name, n.mode AS node_mode, n.endpoint AS node_endpoint,
+                n.encrypted_token AS node_encrypted_token, n.tls_fingerprint AS node_tls_fingerprint,
+                n.status AS node_status
+         FROM provider_keys pk
+         LEFT JOIN nodes n ON n.id = pk.node_id
+         WHERE pk.id = ? AND pk.provider_id = ?`,
+      )
+      .get(keyId, providerId) as Record<string, unknown> | undefined;
+
+    if (!keyRow) {
+      return c.json({ error: 'Provider key not found.' }, 404);
+    }
+
+    if (keyRow.status === 'no_node' && !keyRow.node_id) {
+      return c.json({
+        ok: false,
+        httpStatus: null,
+        latencyMs: 0,
+        message: 'Key has no assigned exit node (status: no_node) and will not route directly.',
+      });
+    }
+
+    let manifest: ProviderManifest;
+    try {
+      manifest = JSON.parse(provRow.schema_json) as ProviderManifest;
+    } catch {
+      return c.json({
+        ok: false,
+        httpStatus: null,
+        latencyMs: 0,
+        message: 'Provider manifest schema is invalid.',
+      });
+    }
+
+    const effectiveBaseUrl =
+      provRow.package_type === 'experimental-adapter' &&
+      typeof provRow.adapter_url === 'string' &&
+      provRow.adapter_url.length > 0
+        ? provRow.adapter_url
+        : manifest.baseUrl;
+    const modelsPath =
+      typeof manifest.modelsEndpoint === 'string' && manifest.modelsEndpoint.trim().length > 0
+        ? manifest.modelsEndpoint.trim()
+        : '/models';
+    const targetUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}${modelsPath.startsWith('/') ? modelsPath : `/${modelsPath}`}`;
+
+    let rawSecret: string;
+    try {
+      rawSecret = decryptSecret(keyRow.encrypted_secret as Uint8Array, masterKey);
+    } catch {
+      return c.json({
+        ok: false,
+        httpStatus: null,
+        latencyMs: 0,
+        message: 'Failed to decrypt provider key.',
+      });
+    }
+
+    const headers = buildProviderAuthHeaders(manifest.auth, rawSecret);
+    const startMs = now();
+
+    try {
+      let res: Response;
+      if (keyRow.node_id) {
+        if (!keyRow.node_encrypted_token || !keyRow.node_endpoint) {
+          return c.json({
+            ok: false,
+            httpStatus: null,
+            latencyMs: 0,
+            message: `Assigned exit node "${String(keyRow.node_id)}" is missing tunnel credentials.`,
+          });
+        }
+        const nodeRawToken = decryptSecret(keyRow.node_encrypted_token as Uint8Array, masterKey);
+        res = await fetchViaExitNode(
+          targetUrl,
+          {
+            method: 'GET',
+            headers,
+            signal: AbortSignal.timeout(8000),
+          },
+          {
+            id: String(keyRow.node_id),
+            name: String(keyRow.node_name ?? keyRow.node_id),
+            mode: keyRow.node_mode === 'public_ip' ? 'public_ip' : 'tailscale',
+            endpoint: String(keyRow.node_endpoint),
+            rawToken: nodeRawToken,
+            tlsFingerprint:
+              keyRow.node_tls_fingerprint === null || keyRow.node_tls_fingerprint === undefined
+                ? null
+                : String(keyRow.node_tls_fingerprint),
+          },
+          options.upstreamTls,
+        );
+      } else {
+        res = await fetchImpl(targetUrl, {
+          method: 'GET',
+          headers,
+          redirect: 'error',
+          signal: AbortSignal.timeout(8000),
+        });
+      }
+
+      const latencyMs = Math.max(0, now() - startMs);
+      if (res.ok) {
+        return c.json({
+          ok: true,
+          httpStatus: res.status,
+          latencyMs,
+          message: 'Provider key verified successfully.',
+        });
+      }
+
+      const rawText = await res.text().catch(() => '');
+      const safeSnippet = redactSecretsInText(rawText.slice(0, 160)).replace(rawSecret, '[REDACTED]');
+      return c.json({
+        ok: false,
+        httpStatus: res.status,
+        latencyMs,
+        message: safeSnippet
+          ? `Upstream returned HTTP ${res.status}: ${safeSnippet}`
+          : `Upstream returned HTTP ${res.status}.`,
+      });
+    } catch (err) {
+      const latencyMs = Math.max(0, now() - startMs);
+      const rawErr = err instanceof Error ? err.message : 'Upstream key test failed.';
+      const safeMsg = redactSecretsInText(rawErr).replace(rawSecret, '[REDACTED]');
+      return c.json({
+        ok: false,
+        httpStatus: null,
+        latencyMs,
+        message: safeMsg,
+      });
+    }
+  });
+
   app.delete('/api/providers/:id/keys/:keyId', (c) => {
     const user = c.get('user');
     if (user.role !== 'admin') {
@@ -1542,7 +1804,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
                JOIN user_model_access uma
                  ON uma.user_id = ?
                 AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*' OR uma.model_full_id = m.provider_id || '/*')
-               WHERE m.active = 1 AND p.enabled = 1
+               WHERE m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1
                ORDER BY m.full_id ASC`,
             )
             .all(user.id) as Array<Record<string, unknown>>);
@@ -1716,10 +1978,14 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     const user = c.get('user');
     const rows = db
       .prepare(
-        `SELECT id, name, key_prefix, created_at, last_used_at
-         FROM internal_api_keys
-         WHERE user_id = ? AND revoked_at IS NULL
-         ORDER BY created_at DESC`,
+        `SELECT k.id, k.name, k.key_prefix, k.created_at, k.last_used_at, k.expires_at,
+                COALESCE(SUM(u.prompt_tokens + u.completion_tokens + u.reasoning_tokens), 0) AS used_tokens,
+                COUNT(u.id) AS requests_count
+         FROM internal_api_keys k
+         LEFT JOIN usage_logs u ON u.internal_api_key_id = k.id
+         WHERE k.user_id = ? AND k.revoked_at IS NULL
+         GROUP BY k.id
+         ORDER BY k.created_at DESC`,
       )
       .all(user.id) as Array<Record<string, unknown>>;
 
@@ -1729,6 +1995,9 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       keyPrefix: String(r.key_prefix),
       createdAt: Number(r.created_at),
       lastUsedAt: r.last_used_at === null ? null : Number(r.last_used_at),
+      expiresAt: r.expires_at === null || r.expires_at === undefined ? null : Number(r.expires_at),
+      usedTokens: Number(r.used_tokens ?? 0),
+      requestsCount: Number(r.requests_count ?? 0),
     }));
 
     return c.json({ keys });
@@ -1751,19 +2020,35 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     const id = randomUUID();
     const createdAt = nowSeconds();
+    let expiresAt: number | null = null;
+
+    if (body.expiresAt !== undefined && body.expiresAt !== null) {
+      const parsed = Number(body.expiresAt);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= createdAt) {
+        return c.json({ error: 'expiresAt must be a future Unix timestamp in seconds.' }, 400);
+      }
+      expiresAt = parsed;
+    } else if (body.expiresInDays !== undefined && body.expiresInDays !== null) {
+      const days = Number(body.expiresInDays);
+      if (!Number.isFinite(days) || days <= 0 || days > 3650) {
+        return c.json({ error: 'expiresInDays must be a positive number <= 3650.' }, 400);
+      }
+      expiresAt = createdAt + Math.round(days * 86400);
+    }
+
     const { rawKey, keyPrefix, keyHash } = generateInternalApiKey();
 
     db.prepare(
-      `INSERT INTO internal_api_keys (id, user_id, name, key_prefix, key_hash, last_used_at, revoked_at, created_at)
-       VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)`,
-    ).run(id, user.id, name, keyPrefix, keyHash, createdAt);
+      `INSERT INTO internal_api_keys (id, user_id, name, key_prefix, key_hash, last_used_at, expires_at, revoked_at, created_at)
+       VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)`,
+    ).run(id, user.id, name, keyPrefix, keyHash, expiresAt, createdAt);
 
     writeSystemLog(
       db,
       'info',
       'auth',
       `Internal API key "${name}" (${keyPrefix}...) created`,
-      { userId: user.id, keyId: id, keyPrefix },
+      { userId: user.id, keyId: id, keyPrefix, expiresAt },
       createdAt,
     );
 
@@ -1775,6 +2060,9 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           keyPrefix,
           createdAt,
           lastUsedAt: null,
+          expiresAt,
+          usedTokens: 0,
+          requestsCount: 0,
         },
         rawKey,
       },
@@ -2033,6 +2321,29 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         masterKey,
         nodeId,
         nowSec: nowSeconds(),
+      });
+      return c.json(result);
+    } catch (err) {
+      if (err instanceof NodeOperationError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/nodes/:id/test', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const nodeId = c.req.param('id');
+    try {
+      const result = await testNodeConnectivity({
+        db,
+        masterKey,
+        nodeId,
+        now,
       });
       return c.json(result);
     } catch (err) {
@@ -2653,7 +2964,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     const row = db
       .prepare(
-        `SELECT k.id AS key_id,
+        `SELECT k.id AS key_id, k.expires_at,
                 u.id, u.username, u.role, u.daily_token_limit, u.quota_reset_mode, u.created_at
          FROM internal_api_keys k
          JOIN users u ON u.id = k.user_id
@@ -2674,6 +2985,21 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     const nowMs = now();
     const nowSec = Math.floor(nowMs / 1000);
+    if (
+      row.expires_at !== null &&
+      row.expires_at !== undefined &&
+      Number(row.expires_at) <= nowSec
+    ) {
+      return c.json(
+        openAiError(
+          'API key has expired.',
+          'invalid_request_error',
+          'expired_api_key',
+        ),
+        401,
+      );
+    }
+
     const keyId = String(row.key_id);
     const user = mapUserRow(row);
 
@@ -2700,7 +3026,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
               `SELECT m.full_id, m.provider_id, m.first_seen_at, m.upstream_created_at
                FROM models m
                JOIN providers p ON p.id = m.provider_id
-               WHERE m.active = 1 AND p.enabled = 1
+               WHERE m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1
                ORDER BY m.full_id ASC`,
             )
             .all() as Array<Record<string, unknown>>)
@@ -2712,22 +3038,28 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
                JOIN user_model_access uma
                  ON uma.user_id = ?
                 AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*' OR uma.model_full_id = m.provider_id || '/*')
-               WHERE m.active = 1 AND p.enabled = 1
+               WHERE m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1
                ORDER BY m.full_id ASC`,
             )
             .all(user.id) as Array<Record<string, unknown>>);
 
     const data = rows
       .filter((m) => !isProviderOrAllKeysDraining(String(m.provider_id)))
-      .map((m) => ({
-        id: String(m.full_id),
-        object: 'model' as const,
-        created:
+      .map((m) => {
+        const upTs =
           m.upstream_created_at !== null && m.upstream_created_at !== undefined
             ? Number(m.upstream_created_at)
-            : Number(m.first_seen_at),
-        owned_by: String(m.provider_id),
-      }));
+            : null;
+        return {
+          id: String(m.full_id),
+          object: 'model' as const,
+          created:
+            upTs !== null && Number.isFinite(upTs) && upTs >= MIN_VALID_MODEL_TIMESTAMP_SEC
+              ? upTs
+              : Number(m.first_seen_at),
+          owned_by: String(m.provider_id),
+        };
+      });
 
     return c.json({
       object: 'list',
@@ -2794,7 +3126,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         `SELECT m.full_id, m.model_id, m.provider_id
          FROM models m
          JOIN providers p ON p.id = m.provider_id
-         WHERE m.full_id = ? AND m.active = 1 AND p.enabled = 1`,
+         WHERE m.full_id = ? AND m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1`,
       )
       .get(requestedModel) as
       | { full_id: string; model_id: string; provider_id: string }
@@ -2835,6 +3167,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       upstreamTls: options.upstreamTls,
       now,
       userId: user.id,
+      internalApiKeyId: c.get('apiKeyId') ?? null,
       modelFullId: modelRow.full_id,
       modelId: modelRow.model_id,
       providerRow,

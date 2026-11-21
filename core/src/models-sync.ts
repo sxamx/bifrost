@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { normalizeLogoSlug } from './catalog/logos.js';
 import {
+  MIN_VALID_MODEL_TIMESTAMP_SEC,
   type ModelsDevSnapshot,
   loadModelsDevSnapshot,
   parseReleaseDateToUtcSeconds,
@@ -51,6 +52,8 @@ export interface FormattedModelItem {
   firstSeenAt: number;
   upstreamCreatedAt: number | null;
   active: boolean;
+  disabledByAdmin: boolean;
+  hasCatalogInfo: boolean;
 }
 
 interface NormalizedCandidateModel {
@@ -406,27 +409,48 @@ export function formatModelRow(
       ? null
       : String(row.canonical_model_id);
 
+  const rawUpstreamCreated =
+    row.upstream_created_at === null || row.upstream_created_at === undefined
+      ? null
+      : Number(row.upstream_created_at);
+  const validUpstreamCreated =
+    rawUpstreamCreated !== null &&
+    Number.isFinite(rawUpstreamCreated) &&
+    rawUpstreamCreated >= MIN_VALID_MODEL_TIMESTAMP_SEC
+      ? rawUpstreamCreated
+      : null;
+
+  const contextLength =
+    row.context_length === null || row.context_length === undefined
+      ? null
+      : Number(row.context_length);
+  const maxOutput =
+    row.max_output === null || row.max_output === undefined ? null : Number(row.max_output);
+  const disabledByAdmin = Number(row.disabled_by_admin ?? 0) === 1;
+  const hasBaseCatalogInfo = Boolean(
+    contextLength !== null ||
+      maxOutput !== null ||
+      capabilities.tools ||
+      capabilities.reasoning ||
+      capabilities.structuredOutput,
+  );
+
   const base: FormattedModelItem = {
     fullId: String(row.full_id),
     providerId,
     modelId,
     canonicalModelId,
     name: String(row.name),
-    contextLength:
-      row.context_length === null || row.context_length === undefined
-        ? null
-        : Number(row.context_length),
-    maxOutput:
-      row.max_output === null || row.max_output === undefined ? null : Number(row.max_output),
+    contextLength,
+    maxOutput,
     modalities,
     capabilities,
     isFree: Number(row.is_free ?? 1) === 1,
     firstSeenAt: Number(row.first_seen_at),
-    upstreamCreatedAt:
-      row.upstream_created_at === null || row.upstream_created_at === undefined
-        ? null
-        : Number(row.upstream_created_at),
+    upstreamCreatedAt: validUpstreamCreated,
     active: Number(row.active ?? 1) === 1,
+    disabledByAdmin,
+    hasCatalogInfo: hasBaseCatalogInfo,
   };
 
   if (!enrichmentContext) {
@@ -445,15 +469,25 @@ export function formatModelRow(
       enrichmentContext.modelsDevSnapshot,
       { canonicalSlug: canonicalModelId },
     );
+    const enrichedContextLength = base.contextLength ?? md.contextLength;
+    const enrichedMaxOutput = base.maxOutput ?? md.maxOutput;
+    const hasCatalogInfo = Boolean(
+      md.capabilities !== null ||
+        enrichedContextLength !== null ||
+        enrichedMaxOutput !== null ||
+        md.family !== null ||
+        hasBaseCatalogInfo,
+    );
     return {
       ...base,
       providerName,
       logoSlug,
       canonicalModelId: base.canonicalModelId ?? md.canonicalModelId,
-      contextLength: base.contextLength ?? md.contextLength,
-      maxOutput: base.maxOutput ?? md.maxOutput,
+      contextLength: enrichedContextLength,
+      maxOutput: enrichedMaxOutput,
       family: md.family,
       releaseDate: md.releaseDate,
+      hasCatalogInfo,
       pricing:
         md.priceUsdPerMillion.input !== null || md.priceUsdPerMillion.output !== null
           ? {

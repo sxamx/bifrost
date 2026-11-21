@@ -1,4 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { redactSecretsInText, writeSystemLog } from './db.js';
 import type { UpstreamTlsOptions } from './nodes.js';
 import {
   executeChatCompletions,
@@ -198,14 +199,20 @@ export async function handlePlaygroundChat(
 
   const modelRow = db
     .prepare(
-      `SELECT m.full_id, m.model_id, m.provider_id
+      `SELECT m.full_id, m.model_id, m.provider_id, m.disabled_by_admin
        FROM models m
        JOIN providers p ON p.id = m.provider_id
        WHERE m.full_id = ? AND m.active = 1 AND p.enabled = 1`,
     )
-    .get(model) as { full_id: string; model_id: string; provider_id: string } | undefined;
+    .get(model) as
+    | { full_id: string; model_id: string; provider_id: string; disabled_by_admin: number }
+    | undefined;
 
-  if (!modelRow || isProviderOrAllKeysDraining(modelRow.provider_id)) {
+  if (
+    !modelRow ||
+    (user.role !== 'admin' && Number(modelRow.disabled_by_admin ?? 0) === 1) ||
+    isProviderOrAllKeysDraining(modelRow.provider_id)
+  ) {
     return jsonResponse(
       {
         error: `No active provider or model is configured for "${model}" yet.`,
@@ -271,22 +278,62 @@ export async function handlePlaygroundChat(
   }
 
   const startedAtMs = nowFn();
-  const routerRes = await executeChatCompletions({
-    db,
-    masterKey,
-    registry,
-    fetchImpl: opts.fetchImpl ?? globalThis.fetch,
-    upstreamTls: opts.upstreamTls,
-    now: nowFn,
-    userId: user.id,
-    modelFullId: modelRow.full_id,
-    modelId: modelRow.model_id,
-    providerRow,
-    requestBody: upstreamPayload,
-  });
+  let routerRes: Response;
+  try {
+    routerRes = await executeChatCompletions({
+      db,
+      masterKey,
+      registry,
+      fetchImpl: opts.fetchImpl ?? globalThis.fetch,
+      upstreamTls: opts.upstreamTls,
+      now: nowFn,
+      userId: user.id,
+      modelFullId: modelRow.full_id,
+      modelId: modelRow.model_id,
+      providerRow,
+      requestBody: upstreamPayload,
+    });
+  } catch (err) {
+    const errMsg = redactSecretsInText(
+      err instanceof Error ? err.message : 'Playground upstream request failed.',
+    );
+    writeSystemLog(
+      db,
+      'error',
+      'system',
+      `Playground request failed for "${modelRow.full_id}": ${errMsg}`,
+      { userId: user.id, modelFullId: modelRow.full_id, providerId: modelRow.provider_id },
+      Math.floor(nowFn() / 1000),
+    );
+    return jsonResponse({ error: errMsg, code: 'upstream_error' }, 502);
+  }
 
   if (!routerRes.ok) {
-    return normalizeRouterErrorResponse(routerRes);
+    const normalized = await normalizeRouterErrorResponse(routerRes);
+    const cloned = normalized.clone();
+    let errDetail = `HTTP ${routerRes.status}`;
+    try {
+      const errJson = (await cloned.json()) as Record<string, unknown>;
+      if (typeof errJson.error === 'string' && errJson.error.length > 0) {
+        errDetail = redactSecretsInText(errJson.error.slice(0, 240));
+      }
+    } catch {
+      // Ignore parse error
+    }
+    writeSystemLog(
+      db,
+      'error',
+      'system',
+      `Playground error (HTTP ${routerRes.status}) on "${modelRow.full_id}": ${errDetail}`,
+      {
+        userId: user.id,
+        modelFullId: modelRow.full_id,
+        providerId: modelRow.provider_id,
+        httpStatus: routerRes.status,
+      },
+      Math.floor(nowFn() / 1000),
+    );
+    return normalized;
   }
 
   // Streaming SSE response: pipe upstream SSE frames directly and inject telemetry summary before [DONE]
