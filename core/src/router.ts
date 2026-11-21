@@ -200,7 +200,12 @@ function markKeyFailure(
   nowSec: number,
 ): void {
   const safeReason = redactSecretsInText(reason).slice(0, 300);
-  if (httpStatus === 429) {
+  const isTransientFailure =
+    httpStatus === 429 ||
+    httpStatus === null ||
+    (httpStatus >= 500 && httpStatus <= 599);
+
+  if (isTransientFailure) {
     const parsed = headers
       ? parseRateLimitHeaders(headers, nowSec)
       : { remaining: 0, resetAt: null };
@@ -1240,8 +1245,30 @@ export async function executeChatCompletions(options: {
 
   const encoder = new TextEncoder();
 
+  let clientAborted = false;
   const stream = new ReadableStream<Uint8Array>({
+    cancel() {
+      clientAborted = true;
+    },
     async start(controller) {
+      const safeEnqueue = (chunk: Uint8Array): boolean => {
+        if (clientAborted) return false;
+        try {
+          controller.enqueue(chunk);
+          return true;
+        } catch {
+          clientAborted = true;
+          return false;
+        }
+      };
+      const safeClose = (): void => {
+        if (clientAborted) return;
+        try {
+          controller.close();
+        } catch {
+          // Ignore already closed controller
+        }
+      };
       let activeConn: {
         key: ProviderKeyRecord;
         response: Response;
@@ -1262,7 +1289,7 @@ export async function executeChatCompletions(options: {
       let lastKeyUsedId = initialConnection.key.id;
 
       try {
-        while (activeConn !== null) {
+        while (activeConn !== null && !clientAborted) {
           const currentKey = activeConn.key;
           const currentRes = activeConn.response;
           const releaseCurrent = activeConn.releaseLease;
@@ -1647,7 +1674,7 @@ export async function executeChatCompletions(options: {
         if (activeConn !== null) {
           activeConn.releaseLease();
         }
-        controller.close();
+        safeClose();
       }
     },
   });
