@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
-import { copyTextToClipboard } from '../clipboard';
 import type { InternalApiKey } from '../types';
 import { InfoTip } from './InfoTip';
 
@@ -50,6 +49,7 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
   onKeysChanged,
 }) => {
   const [name, setName] = useState('');
+  const [expiresInDays, setExpiresInDays] = useState<string>('never');
   const [creating, setCreating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -88,13 +88,20 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
 
     setCreating(true);
     try {
-      const result = await api.createKey(cleanName);
+      const daysNum = expiresInDays === 'never' ? null : Number(expiresInDays);
+      const result = await api.createKey(
+        cleanName,
+        daysNum !== null && Number.isFinite(daysNum) && daysNum > 0
+          ? { expiresInDays: daysNum }
+          : undefined
+      );
       setRevealedKey({
         name: result.key.name || cleanName,
         rawKey: result.rawKey,
       });
       setCopiedRawKey(false);
       setName('');
+      setExpiresInDays('never');
       await onKeysChanged();
     } catch (err) {
       if (err instanceof ApiError) {
@@ -128,11 +135,11 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
   }
 
   async function copyText(value: string, setter: (v: boolean) => void) {
-    const ok = await copyTextToClipboard(value);
-    if (ok) {
+    try {
+      await navigator.clipboard.writeText(value);
       setter(true);
       window.setTimeout(() => setter(false), 2400);
-    } else {
+    } catch {
       setter(false);
     }
   }
@@ -217,13 +224,27 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
                 id="key-name-input"
                 type="text"
                 className="input"
-                style={{ flex: '1 1 280px' }}
+                style={{ flex: '1 1 260px' }}
                 placeholder='ej. "Zed Editor" o "Cursor"'
                 maxLength={80}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 disabled={creating}
               />
+              <select
+                aria-label="Expiración de la clave"
+                className="input"
+                style={{ flex: '0 0 auto', width: 'auto', minWidth: 168 }}
+                value={expiresInDays}
+                onChange={(e) => setExpiresInDays(e.target.value)}
+                disabled={creating}
+              >
+                <option value="never">Sin vencimiento</option>
+                <option value="7">Expira en 7 días</option>
+                <option value="30">Expira en 30 días</option>
+                <option value="90">Expira en 90 días</option>
+                <option value="365">Expira en 1 año</option>
+              </select>
               <button type="submit" className="btn btn-primary" disabled={creating}>
                 {creating ? 'Generando…' : 'Generar API key'}
               </button>
@@ -289,32 +310,56 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
                   <th>Nombre</th>
                   <th>Prefijo</th>
                   <th>Creada</th>
+                  <th>Vencimiento</th>
                   <th>Último uso</th>
                   <th style={{ textAlign: 'right' }}>Acción</th>
                 </tr>
               </thead>
               <tbody>
-                {keys.map((item) => (
-                  <tr key={item.id}>
-                    <td style={{ fontWeight: 700 }}>{item.name}</td>
-                    <td>
-                      <code className="key-prefix-pill">{formatKeyPrefix(item.keyPrefix)}</code>
-                    </td>
-                    <td style={{ color: 'var(--sub)' }}>{formatCreatedDate(item.createdAt)}</td>
-                    <td style={{ color: item.lastUsedAt ? 'var(--fg)' : 'var(--sub)' }}>
-                      {formatTimestamp(item.lastUsedAt)}
-                    </td>
-                    <td style={{ textAlign: 'right' }}>
-                      <button
-                        type="button"
-                        className="btn btn-danger btn-sm"
-                        onClick={() => setConfirmRevokeTarget(item)}
-                      >
-                        Revocar
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {keys.map((item) => {
+                  const expMs =
+                    typeof item.expiresAt === 'number' && item.expiresAt > 0
+                      ? item.expiresAt < 1_000_000_000_000
+                        ? item.expiresAt * 1000
+                        : item.expiresAt
+                      : null;
+                  const isExpired = expMs !== null && expMs <= Date.now();
+
+                  return (
+                    <tr key={item.id}>
+                      <td style={{ fontWeight: 700 }}>{item.name}</td>
+                      <td>
+                        <code className="key-prefix-pill">{formatKeyPrefix(item.keyPrefix)}</code>
+                      </td>
+                      <td style={{ color: 'var(--sub)' }}>{formatCreatedDate(item.createdAt)}</td>
+                      <td>
+                        {expMs === null ? (
+                          <span className="field-hint">Sin vencimiento</span>
+                        ) : isExpired ? (
+                          <span className="status-badge error">
+                            Expirada · {formatCreatedDate(expMs)}
+                          </span>
+                        ) : (
+                          <span className="mono" style={{ fontSize: '0.8rem', color: 'var(--sub)' }}>
+                            {formatCreatedDate(expMs)}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ color: item.lastUsedAt ? 'var(--fg)' : 'var(--sub)' }}>
+                        {formatTimestamp(item.lastUsedAt)}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          onClick={() => setConfirmRevokeTarget(item)}
+                        >
+                          Revocar
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

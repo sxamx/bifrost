@@ -889,8 +889,10 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                                     marginRight: 5,
                                   }}
                                 />
-                                <strong>{s.label}</strong>
-                                {m.tokensPerSec[s.key].toFixed(1)}
+                                <strong style={{ marginRight: 5 }}>{s.label}</strong>
+                                <span className="mono">
+                                  {m.tokensPerSec[s.key].toFixed(1)} tok/s
+                                </span>
                               </span>
                             ))}
                           </div>
@@ -911,8 +913,8 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                                     marginRight: 5,
                                   }}
                                 />
-                                <strong>{s.label}</strong>
-                                {Math.round(m.ttftMs[s.key])}ms
+                                <strong style={{ marginRight: 5 }}>{s.label}</strong>
+                                <span className="mono">{Math.round(m.ttftMs[s.key])} ms</span>
                               </span>
                             ))}
                           </div>
@@ -1075,6 +1077,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
             >
               <option value="model">Agrupar por modelo</option>
               <option value="provider">Agrupar por proveedor</option>
+              <option value="apiKey">Agrupar por API key</option>
               {isAdmin ? <option value="user">Agrupar por usuario</option> : null}
             </select>
 

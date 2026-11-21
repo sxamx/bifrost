@@ -7,6 +7,9 @@ import type {
   ProviderKeyItem,
   ProviderManifest,
   ProviderModelItem,
+  ProviderPrivacyConfig,
+  ProviderRateLimitKind,
+  ProviderRateLimitWindow,
   ProviderSummary,
 } from '../types';
 import { InfoTip } from './InfoTip';
@@ -21,6 +24,59 @@ function formatProviderCategoryLabel(cat?: ProviderCategory): string {
   if (cat === 'official-api') return 'API Oficial';
   if (cat === 'experimental-adapter') return 'Adaptador Experimental';
   return 'Catálogo';
+}
+
+function formatRetentionLabel(privacy: ProviderPrivacyConfig): {
+  label: string;
+  tone: 'verified' | 'partial' | 'err' | 'neutral';
+} {
+  switch (privacy.retention) {
+    case 'zero':
+      return { label: 'ZDR estricto', tone: 'verified' };
+    case 'transient':
+      return {
+        label: privacy.retentionDays
+          ? `Retención temporal (${privacy.retentionDays}d)`
+          : 'Retención temporal',
+        tone: 'neutral',
+      };
+    case 'retained':
+      return { label: 'Sin ZDR / Retiene prompts', tone: 'err' };
+    case 'variable':
+    default:
+      return { label: 'ZDR variable', tone: 'partial' };
+  }
+}
+
+function formatTrainingLabel(training: ProviderPrivacyConfig['training']): string {
+  switch (training) {
+    case 'never':
+      return 'No entrena';
+    case 'opt_out':
+      return 'Entrena (opt-out)';
+    case 'allowed':
+      return 'Puede entrenar';
+    default:
+      return 'Entrenamiento: N/D';
+  }
+}
+
+function formatRateLimitBadge(
+  kind?: ProviderRateLimitKind | null,
+  windows?: ProviderRateLimitWindow[]
+): string | null {
+  if (!kind) return null;
+  const base =
+    kind === 'requests'
+      ? 'Límite: peticiones'
+      : kind === 'tokens'
+        ? 'Límite: tokens'
+        : 'Sin límite fijo';
+  if (!windows || windows.length === 0) return base;
+  const winTxt = windows
+    .map((w) => (w === 'hour' ? 'hora' : w === 'day' ? 'día' : 'semana'))
+    .join('/');
+  return `${base} (${winTxt})`;
 }
 
 interface ProvidersTabProps {
@@ -715,6 +771,64 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                           Endpoint base: <code className="mono">{manifest.baseUrl}</code>
                         </p>
                       )}
+
+                      {/* HU-40 Privacy ZDR & HU-38 Rate Limit Badges */}
+                      {manifest.privacy || manifest.rateLimitKind ? (
+                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                          {manifest.privacy ? (() => {
+                            const ret = formatRetentionLabel(manifest.privacy);
+                            const badgeCls =
+                              ret.tone === 'verified'
+                                ? 'meta-tag verified'
+                                : ret.tone === 'err'
+                                  ? 'status-badge error'
+                                  : ret.tone === 'partial'
+                                    ? 'status-badge rate_limited'
+                                    : 'meta-tag';
+                            return (
+                              <>
+                                <span
+                                  className={badgeCls}
+                                  style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                                >
+                                  {ret.label}
+                                  {manifest.privacy.retention === 'variable' ||
+                                  manifest.privacy.note ? (
+                                    <InfoTip
+                                      text={
+                                        manifest.privacy.note ||
+                                        'La retención depende del proveedor upstream enrutado por este agregador.'
+                                      }
+                                    />
+                                  ) : null}
+                                </span>
+                                <span className="meta-tag">
+                                  {formatTrainingLabel(manifest.privacy.training)}
+                                </span>
+                                {manifest.privacy.policyUrl ? (
+                                  <a
+                                    href={manifest.privacy.policyUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="meta-tag accent"
+                                    style={{ textDecoration: 'none' }}
+                                  >
+                                    Política ↗
+                                  </a>
+                                ) : null}
+                              </>
+                            );
+                          })() : null}
+                          {formatRateLimitBadge(manifest.rateLimitKind, manifest.rateLimitWindows) ? (
+                            <span className="meta-tag">
+                              {formatRateLimitBadge(
+                                manifest.rateLimitKind,
+                                manifest.rateLimitWindows
+                              )}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : null}
 
                       <div
                         style={{
