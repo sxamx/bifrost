@@ -132,7 +132,7 @@ export function callNodeControlPlane(params: {
   path: string;
   body?: Record<string, unknown>;
   timeoutMs?: number;
-}): Promise<{ status: number; data: Record<string, unknown> }> {
+}): Promise<{ status: number; data: Record<string, unknown>; peerFingerprint?: string | null }> {
   const parsedEp = parseNodeEndpoint(params.endpoint);
   if (!parsedEp) {
     return Promise.reject(new Error(`Invalid node endpoint: "${params.endpoint}"`));
@@ -153,6 +153,7 @@ export function callNodeControlPlane(params: {
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    let observedPeerFingerprint: string | null = null;
     const finishReject = (err: Error) => {
       if (settled) return;
       settled = true;
@@ -172,7 +173,7 @@ export function callNodeControlPlane(params: {
         } catch {
           data = { raw: text };
         }
-        resolve({ status: res.statusCode ?? 0, data });
+        resolve({ status: res.statusCode ?? 0, data, peerFingerprint: observedPeerFingerprint });
       });
       res.on('error', finishReject);
     };
@@ -188,19 +189,20 @@ export function callNodeControlPlane(params: {
           host: parsedEp.host,
           port: parsedEp.port,
           servername: net.isIP(parsedEp.host) ? undefined : parsedEp.host,
-          rejectUnauthorized: pinnedNorm === null,
+          rejectUnauthorized: false,
         });
-        if (pinnedNorm !== null) {
-          sock.once('secureConnect', () => {
-            const peerCert = sock.getPeerCertificate();
-            const actualNorm = peerCert?.fingerprint256
-              ? normalizeHexFingerprint(peerCert.fingerprint256)
-              : '';
-            if (!actualNorm || actualNorm !== pinnedNorm) {
-              sock.destroy(new Error('Node TLS certificate SHA-256 fingerprint mismatch'));
-            }
-          });
-        }
+        sock.once('secureConnect', () => {
+          const peerCert = sock.getPeerCertificate();
+          const actualNorm = peerCert?.fingerprint256
+            ? normalizeHexFingerprint(peerCert.fingerprint256)
+            : '';
+          if (actualNorm) {
+            observedPeerFingerprint = peerCert.fingerprint256;
+          }
+          if (pinnedNorm !== null && (!actualNorm || actualNorm !== pinnedNorm)) {
+            sock.destroy(new Error('Node TLS certificate SHA-256 fingerprint mismatch'));
+          }
+        });
         return sock;
       };
 
@@ -212,7 +214,7 @@ export function callNodeControlPlane(params: {
           method: params.method,
           headers,
           agent,
-          rejectUnauthorized: pinnedNorm === null,
+          rejectUnauthorized: false,
         },
         onResponse,
       );
@@ -264,7 +266,7 @@ function openConnectSocketToNode(
             host: parsedEp.host,
             port: parsedEp.port,
             servername: net.isIP(parsedEp.host) ? undefined : parsedEp.host,
-            rejectUnauthorized: pinnedNorm === null,
+            rejectUnauthorized: false,
           })
         : net.connect({
             host: parsedEp.host,
@@ -969,10 +971,16 @@ export async function testNodeConnectivity(params: {
     if (healthy) {
       db.exec('BEGIN IMMEDIATE');
       try {
-        db.prepare(`UPDATE nodes SET status = 'online', last_seen_at = ? WHERE id = ?`).run(
-          nowSec,
-          nodeId,
-        );
+        if (res.peerFingerprint && !row.tls_fingerprint && row.mode === 'public_ip') {
+          db.prepare(
+            `UPDATE nodes SET status = 'online', last_seen_at = ?, tls_fingerprint = ? WHERE id = ?`,
+          ).run(nowSec, res.peerFingerprint, nodeId);
+        } else {
+          db.prepare(`UPDATE nodes SET status = 'online', last_seen_at = ? WHERE id = ?`).run(
+            nowSec,
+            nodeId,
+          );
+        }
         db.prepare(
           `UPDATE provider_keys
            SET status = 'active', last_error = NULL
