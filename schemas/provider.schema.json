@@ -129,6 +129,32 @@
         "healthPath": { "type": "string", "default": "/health" },
         "accountLabel": { "type": "string", "default": "Token / Sesión" }
       }
+    },
+    "privacy": {
+      "type": "object",
+      "description": "Política declarativa de retención de datos y entrenamiento del proveedor.",
+      "required": ["retention", "training"],
+      "additionalProperties": false,
+      "properties": {
+        "retention": {
+          "type": "string",
+          "enum": ["zero", "transient", "retained", "variable"]
+        },
+        "training": {
+          "type": "string",
+          "enum": ["never", "opt_out", "allowed", "unknown"]
+        },
+        "retentionDays": {
+          "type": "integer"
+        },
+        "policyUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "note": {
+          "type": "string"
+        }
+      }
     }
   }
 }

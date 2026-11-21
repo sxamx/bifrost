@@ -27,6 +27,17 @@ export interface ProviderStaticModelDef {
   maxOutput?: number;
 }
 
+export type DataRetentionKind = 'zero' | 'transient' | 'retained' | 'variable';
+export type ProviderTrainingPolicy = 'never' | 'opt_out' | 'allowed' | 'unknown';
+
+export interface ProviderPrivacyConfig {
+  retention: DataRetentionKind;
+  training: ProviderTrainingPolicy;
+  retentionDays?: number;
+  policyUrl?: string;
+  note?: string;
+}
+
 export interface ProviderAdapterConfig {
   defaultPort: number;
   healthPath: string;
@@ -49,6 +60,7 @@ export interface ProviderManifest {
   staticModels?: ProviderStaticModelDef[];
   reviewedAt?: string;
   adapter?: ProviderAdapterConfig;
+  privacy?: ProviderPrivacyConfig;
 }
 
 interface JsonSchemaNode {
@@ -249,6 +261,34 @@ function validateProviderSemantics(manifest: Record<string, unknown>): string[] 
   }
   if (manifest.packageType === 'experimental-adapter' && !manifest.adapter) {
     errors.push('$.adapter: required when packageType is "experimental-adapter"');
+  }
+  if (manifest.privacy !== undefined) {
+    if (!manifest.privacy || typeof manifest.privacy !== 'object' || Array.isArray(manifest.privacy)) {
+      errors.push('$.privacy: must be an object');
+    } else {
+      const priv = manifest.privacy as Record<string, unknown>;
+      const validRetention: DataRetentionKind[] = ['zero', 'transient', 'retained', 'variable'];
+      const validTraining: ProviderTrainingPolicy[] = ['never', 'opt_out', 'allowed', 'unknown'];
+      if (typeof priv.retention !== 'string' || !validRetention.includes(priv.retention as DataRetentionKind)) {
+        errors.push(`$.privacy.retention: must be one of ${validRetention.join(', ')}`);
+      }
+      if (typeof priv.training !== 'string' || !validTraining.includes(priv.training as ProviderTrainingPolicy)) {
+        errors.push(`$.privacy.training: must be one of ${validTraining.join(', ')}`);
+      }
+      if (priv.retentionDays !== undefined) {
+        if (typeof priv.retentionDays !== 'number' || !Number.isInteger(priv.retentionDays) || priv.retentionDays < 0) {
+          errors.push('$.privacy.retentionDays: must be a non-negative integer');
+        }
+      }
+      if (priv.policyUrl !== undefined) {
+        if (typeof priv.policyUrl !== 'string' || !isValidHttpUri(priv.policyUrl)) {
+          errors.push('$.privacy.policyUrl: must be an http:// or https:// URI');
+        }
+      }
+      if (priv.note !== undefined && typeof priv.note !== 'string') {
+        errors.push('$.privacy.note: must be a string');
+      }
+    }
   }
   return errors;
 }

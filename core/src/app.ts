@@ -235,6 +235,7 @@ function formatProviderSummaryRow(
       packageType: String(row.package_type),
       modelsSource: String(row.models_source),
       enabled: Number(row.enabled) === 1,
+      privacy: manifest?.privacy ?? null,
       modelsCount,
     };
   }
@@ -251,6 +252,7 @@ function formatProviderSummaryRow(
       row.adapter_url === null || row.adapter_url === undefined ? null : String(row.adapter_url),
     enabled: Number(row.enabled) === 1,
     reviewedAt: manifest?.reviewedAt ?? null,
+    privacy: manifest?.privacy ?? null,
     lastModelsSyncAt:
       row.last_models_sync_at === null || row.last_models_sync_at === undefined
         ? null
@@ -644,14 +646,22 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         nowSec,
       });
 
+      const normalizedManifests = validManifests.map((m) => ({
+        ...m,
+        privacy: m.privacy ?? null,
+      }));
+
       return c.json({
         online: true,
         offline: false,
-        providers: validManifests,
-        manifests: validManifests,
+        providers: normalizedManifests,
+        manifests: normalizedManifests,
       });
     } catch (err) {
-      const fallback = loadCachedOrSeedCatalog();
+      const fallback = loadCachedOrSeedCatalog().map((m) => ({
+        ...m,
+        privacy: m.privacy ?? null,
+      }));
       const errMsg = redactSecretsInText(
         err instanceof Error ? err.message : 'Unable to reach remote marketplace catalog.',
       );
@@ -1789,7 +1799,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       user.role === 'admin'
         ? (db
             .prepare(
-              `SELECT m.*, p.name AS provider_name
+              `SELECT m.*, p.name AS provider_name, p.schema_json AS provider_schema_json
                FROM models m
                JOIN providers p ON p.id = m.provider_id
                WHERE m.active = 1 AND p.enabled = 1
@@ -1798,7 +1808,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
             .all() as Array<Record<string, unknown>>)
         : (db
             .prepare(
-              `SELECT DISTINCT m.*, p.name AS provider_name
+              `SELECT DISTINCT m.*, p.name AS provider_name, p.schema_json AS provider_schema_json
                FROM models m
                JOIN providers p ON p.id = m.provider_id
                JOIN user_model_access uma
@@ -1910,7 +1920,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     const modelRow = db
       .prepare(
-        `SELECT m.*, p.name AS provider_name
+        `SELECT m.*, p.name AS provider_name, p.schema_json AS provider_schema_json
          FROM models m
          JOIN providers p ON p.id = m.provider_id
          WHERE m.full_id = ? AND m.active = 1 AND p.enabled = 1`,

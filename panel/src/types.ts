@@ -425,6 +425,17 @@ export type ProviderModelsSource = 'api' | 'static';
 export type ProviderCategory = 'aggregator' | 'official-api' | 'experimental-adapter';
 export type ProviderKeyStatus = 'active' | 'rate_limited' | 'error' | 'no_node' | 'disabled';
 
+export type DataRetentionKind = 'zero' | 'transient' | 'retained' | 'variable';
+export type ProviderTrainingPolicy = 'never' | 'opt_out' | 'allowed' | 'unknown';
+
+export interface ProviderPrivacyConfig {
+  retention: DataRetentionKind;
+  training: ProviderTrainingPolicy;
+  retentionDays?: number;
+  policyUrl?: string;
+  note?: string;
+}
+
 export interface ProviderKeyTestResult {
   ok: boolean;
   httpStatus: number | null;
@@ -471,6 +482,7 @@ export interface ProviderManifest {
     healthPath?: string;
     accountLabel?: string;
   };
+  privacy?: ProviderPrivacyConfig | null;
 }
 
 export interface MarketplaceCatalogState {
@@ -498,6 +510,7 @@ export interface ProviderModelItem {
   fullId: string;
   providerId: string;
   providerName?: string;
+  providerPrivacy?: ProviderPrivacyConfig | null;
   logoSlug?: string;
   modelId: string;
   canonicalModelId?: string | null;
@@ -541,6 +554,7 @@ export interface ProviderSummary {
   adapterUrl?: string | null;
   enabled?: boolean;
   reviewedAt?: string | null;
+  privacy?: ProviderPrivacyConfig | null;
   lastModelsSyncAt?: number | null;
   createdAt?: number;
   manifest?: ProviderManifest;

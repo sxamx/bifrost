@@ -17,6 +17,7 @@ import {
 import {
   type ProviderFreeRule,
   type ProviderManifest,
+  type ProviderPrivacyConfig,
   buildProviderAuthHeaders,
 } from './schema.js';
 
@@ -27,6 +28,7 @@ export interface FormattedModelItem {
   fullId: string;
   providerId: string;
   providerName?: string;
+  providerPrivacy?: ProviderPrivacyConfig | null;
   logoSlug?: string;
   modelId: string;
   canonicalModelId: string | null;
@@ -371,6 +373,7 @@ export function formatModelRow(
   row: Record<string, unknown>,
   enrichmentContext?: {
     providerName?: string;
+    providerPrivacy?: ProviderPrivacyConfig | null;
     modelsDevSnapshot?: ModelsDevSnapshot;
   },
 ): FormattedModelItem {
@@ -435,9 +438,20 @@ export function formatModelRow(
       capabilities.structuredOutput,
   );
 
+  let providerPrivacy: ProviderPrivacyConfig | null = enrichmentContext?.providerPrivacy ?? null;
+  if (providerPrivacy === null && typeof row.provider_schema_json === 'string') {
+    try {
+      const parsedManifest = JSON.parse(row.provider_schema_json) as ProviderManifest;
+      providerPrivacy = parsedManifest.privacy ?? null;
+    } catch {
+      providerPrivacy = null;
+    }
+  }
+
   const base: FormattedModelItem = {
     fullId: String(row.full_id),
     providerId,
+    providerPrivacy,
     modelId,
     canonicalModelId,
     name: String(row.name),

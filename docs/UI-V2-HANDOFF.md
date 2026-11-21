@@ -1,7 +1,7 @@
 # Guía de Handoff UI — Bifrost V2
 
 Documento técnico para implementar los cambios de interfaz de la V2 en el panel (`panel/src/`).  
-Refleja las historias `HU-27` a `HU-37` descritas en [`HISTORIAS-V2.md`](HISTORIAS-V2.md).
+Refleja las historias `HU-27` a `HU-37` + `HU-40` (P2) descritas en [`HISTORIAS-V2.md`](HISTORIAS-V2.md).
 
 ---
 
@@ -14,6 +14,7 @@ Refleja las historias `HU-27` a `HU-37` descritas en [`HISTORIAS-V2.md`](HISTORI
 4. `UsersTab.tsx`
 5. `ApiKeysTab.tsx`
 6. `MetricsTab.tsx`
+7. `MarketplaceTab.tsx` *(o la vista de catálogo del Marketplace dentro de `ProvidersTab.tsx`)*
 
 ### Archivos que NO debes tocar
 - `panel/src/api.ts` (el cliente HTTP y normalizadores se proveen desde backend/API)
@@ -29,63 +30,69 @@ Refleja las historias `HU-27` a `HU-37` descritas en [`HISTORIAS-V2.md`](HISTORI
 
 ## 2. Contrato disponible por componente (`api.ts` y `types.ts`)
 
-> Nota: Algunos campos ya existen en `types.ts`/`api.ts` (ej. `enforceStrictQuota`, `status: 'no_node'`, `active`) y los nuevos métodos/propiedades estarán disponibles en `api.ts` y `types.ts` al momento de compilar el panel V2.
+> Nota: Algunos campos ya existen en `types.ts`/`api.ts` (ej. `enforceStrictQuota`, `status: 'no_node'`, `active`, `setModelVisibility`) y las nuevas propiedades de `HU-37` / `HU-40` serán provistas en `api.ts` y `types.ts` por backend antes de compilar el panel V2.
 
-### 2.1 `ProviderVaultCard.tsx` (`HU-27`, `HU-29`)
+### 2.1 `ProviderVaultCard.tsx` (`HU-27`, `HU-29`, `HU-40`)
 
 **Propiedades en `ProviderKeyItem` (`types.ts`):**
-- `enabled: boolean` — Indica si la clave está activa para enrutamiento (`false` por defecto al crearse).
-- `status: ProviderKeyStatus` — `'active' | 'rate_limited' | 'error' | 'no_node'`.
+- `status: ProviderKeyStatus` — `'active' | 'rate_limited' | 'error' | 'no_node' | 'disabled'` (las claves creadas desactivadas llegan con `status === 'disabled'`).
 - `lastError?: string | null` — Último error reportado por el upstream o por una prueba manual.
 - `nodeId: string | null` — Nodo asignado (si es `null` y `status === 'no_node'`, la clave está fuera de servicio).
 
+**Propiedades en `ProviderSummary` (`types.ts`):**
+- `privacy?: ProviderPrivacyConfig | null` — Metadatos de retención y entrenamiento del proveedor (`HU-40`, ver sección 2.7).
+
 **Métodos en `api` (`api.ts`):**
 - `api.toggleProviderKey(providerId: string, keyId: string, enabled: boolean): Promise<ProviderKeyItem>`  
-  Conectar al interruptor **Activar / Desactivar** de cada clave.
-- `api.testProviderKey(providerId: string, keyId: string): Promise<{ ok: boolean; latencyMs?: number; status: ProviderKeyStatus; error?: string | null }>`  
-  Conectar al botón **Probar clave** (deshabilitar si `k.status === 'no_node'`).
+  Conectar al interruptor **Activar / Desactivar** de cada clave (`enabled = k.status !== 'disabled'`).
+- `api.testProviderKey(providerId: string, keyId: string): Promise<ProviderKeyTestResult>`  
+  Donde `ProviderKeyTestResult` es `{ ok: boolean; httpStatus: number | null; latencyMs: number; message: string }`. Conectar al botón **Probar clave** (deshabilitar si `k.status === 'no_node'`).
 
 **Requisitos UI:**
-- Indicar visualmente cuando una clave recién creada está **Desactivada** (`enabled === false`) y permitir activarla con el switch.
+- Indicar visualmente cuando una clave recién creada está **Desactivada** (`k.status === 'disabled'`) y permitir activarla con el switch.
 - Mostrar badge específico para `status === 'no_node'` («Sin nodo / Fuera de servicio») y deshabilitar **Probar clave** mientras no tenga nodo asignado.
-- Mostrar el resultado inline de **Probar clave** (latencia en `ms` si `ok: true`, o mensaje de error si `ok: false`).
+- Mostrar el resultado inline de **Probar clave** (latencia `latencyMs` en `ms` si `ok: true`, o `message` / `httpStatus` si `ok: false`).
+- **Privacidad/ZDR (`HU-40`):** si `provider.privacy` indica que el proveedor retiene prompts (`retention === 'retained'`) o permite entrenamiento (`training === 'allowed'` u `'opt_out'`, como NVIDIA NIM free-tier), mostrar un badge/tooltip (`InfoTip`) de advertencia visible en la tarjeta del proveedor.
 
 ---
 
 ### 2.2 `NodesTab.tsx` (`HU-27`, `HU-28`)
 
 **Propiedades en `ExitNodeItem` (`types.ts`):**
-- `id: string`, `name: string`, `mode: 'tailscale' | 'public_ip'`, `endpoint: string`, `status: 'online' | 'unresponsive' | 'offline'`, `assignedKeysCount?: number`.
+- `id: string`, `name: string`, `mode: NodeMode` (`'tailscale' | 'public_ip'`), `endpoint: string`, `status: NodeStatus` (`'online' | 'unresponsive' | 'offline'`), `assignedKeysCount?: number`.
 
 **Métodos en `api` (`api.ts`):**
-- `api.testNode(nodeId: string): Promise<{ ok: boolean; status: NodeStatus; latencyMs?: number; error?: string | null }>`  
-  Conectar al botón **Probar nodo** en cada nodo.
+- `api.testNode(nodeId: string): Promise<ExitNodeTestResult>`  
+  Donde `ExitNodeTestResult` es `{ ok: boolean; status: NodeStatus | string; latencyMs: number | null; error?: string }`. Conectar al botón **Probar nodo** en cada nodo.
 - `api.deleteNode(nodeId: string): Promise<{ ok: boolean }>` *(ya existente)*
 
 **Requisitos UI:**
-- Añadir botón **Probar nodo** con estado `testing` por fila/tarjeta y feedback inline (`En línea · X ms` o error descriptivo).
+- Añadir botón **Probar nodo** con estado `testing` por fila/tarjeta y feedback inline (`En línea · X ms` o `error` descriptivo).
 - En el flujo/confirmación de **Eliminar nodo**, advertir explícitamente si `assignedKeysCount > 0` que esas claves pasarán a estado `no_node` (fuera de servicio) hasta que se les asigne otro nodo.
 
 ---
 
-### 2.3 `ModelsTab.tsx` (`HU-30`)
+### 2.3 `ModelsTab.tsx` (`HU-30`, `HU-40`)
 
 **Propiedades en `ProviderModelItem` (`types.ts`):**
 - `active?: boolean` — Estado global del modelo (`true` activo, `false` deshabilitado).
+- `disabledByAdmin?: boolean` — Indica si fue deshabilitado explícitamente por un administrador.
 - `hasCatalogInfo?: boolean` — `true` si el modelo tiene ficha de catálogo/precios de referencia (`models.dev` / `LiteLLM`).
 - `modalities?: { input: string[]; output: string[] }` — Incluye modelos no-texto (ej. `embeddings`).
 - `releaseDate?: string | null` y `upstreamCreatedAt?: number | null`.
+- `providerPrivacy?: ProviderPrivacyConfig | null` — Política de privacidad/ZDR heredada del proveedor (`HU-40`, ver sección 2.7).
 
 **Métodos en `api` (`api.ts`):**
-- `api.toggleModel(fullId: string, active: boolean): Promise<ProviderModelItem>`  
-  Conectar al interruptor **Habilitar / Deshabilitar modelo** (solo visible/operable para `admin`, pasando o leyendo el rol desde `App`/props si aplica).
+- `api.setModelVisibility(fullId: string, disabled: boolean): Promise<{ ok: boolean; fullId: string; disabledByAdmin: boolean }>`  
+  Conectar al interruptor **Habilitar / Deshabilitar modelo** (solo visible/operable para `admin`; pasar `disabled = true` para desactivar y `disabled = false` para reactivar).
 - `api.getModels(): Promise<ProviderModelItem[]>` *(ya existente)*
 
 **Requisitos UI:**
-- **No** descartar silenciosamente los modelos con `active === false` cuando el admin los esté gestionando (o añadir filtro/vista «Todos / Activos / Deshabilitados» para que el admin pueda reactivarlos).
+- **No** descartar silenciosamente los modelos con `active === false` o `disabledByAdmin === true` cuando el admin los esté gestionando (o añadir filtro/vista «Todos / Activos / Deshabilitados» para que el admin pueda reactivarlos).
 - Permitir ver y alternar modelos no-texto (como `embeddings`) en el catálogo sin ocultarlos.
 - Mostrar un distintivo o indicador visual cuando `model.hasCatalogInfo` sea `true` (y diferenciarlo cuando sea `false`).
 - Corregir `formatReleaseDate`: validar que el timestamp convertido sea razonable (p. ej. año `>= 2018`) para evitar fechas corruptas como `1993-04-26`, mostrando `'No reportada'` en su lugar.
+- **Privacidad/ZDR (`HU-40`):** mostrar en cada modelo el indicador de privacidad/ZDR de `model.providerPrivacy` para que el usuario sepa antes de enrutar prompts si el proveedor aplica ZDR, retención temporal, retiene prompts o es variable (agregadores).
 
 ---
 
@@ -98,10 +105,10 @@ Refleja las historias `HU-27` a `HU-37` descritas en [`HISTORIAS-V2.md`](HISTORI
 - `ManagedUserItem.allowedModels: string[]` / `InvitationItem.allowedModels: string[]`
 
 **Métodos en `api` (`api.ts`):**
-- `api.deleteInvitation(invitationId: string): Promise<{ ok: boolean }>`  
+- `api.deleteInvitation(invitationId: string): Promise<{ ok: boolean }>` *(endpoint `DELETE /api/invitations/:id`)*  
   Conectar al botón **Eliminar** en la lista de invitaciones pendientes.
-- `api.createInvitation(input: CreateInvitationInput)` *(ya existente; incluir `enforceStrictQuota` en el payload)*.
-- `api.updateUserQuotaAndModels(userId, { dailyTokenLimit, quotaResetMode, enforceStrictQuota, allowedModels })` *(ya existente; incluir `enforceStrictQuota` en el payload)*.
+- `api.createInvitation(input: CreateInvitationInput): Promise<CreateInvitationResult>` *(ya existente; incluir `enforceStrictQuota` en el payload)*.
+- `api.updateUserQuotaAndModels(userId, { dailyTokenLimit, quotaResetMode, enforceStrictQuota, allowedModels }): Promise<ManagedUserItem>` *(ya existente; incluir `enforceStrictQuota` en el payload)*.
 
 **Requisitos UI:**
 - **Eliminar invitaciones:** botón de borrado/revocación en cada invitación pendiente (`usedAt === null`) que llame a `api.deleteInvitation(inv.id)` y actualice la lista.
@@ -117,10 +124,10 @@ Refleja las historias `HU-27` a `HU-37` descritas en [`HISTORIAS-V2.md`](HISTORI
 - `usedTokens?: number` / `requestsCount?: number` *(opcionales si el backend los expone en el listado de claves)*.
 
 **Métodos en `api` (`api.ts`):**
-- `api.createKey(name: string, expiresAt?: number | null): Promise<CreateKeyResponse>` *(o parámetro equivalente de expiración)*
+- `api.createKey(name: string, options?: { expiresInDays?: number | null; expiresAt?: number | null }): Promise<CreateKeyResponse>`
 
 **Requisitos UI:**
-- Añadir selector opcional de vencimiento en el formulario de creación de API key (ej. *Sin vencimiento*, *7 días*, *30 días*, *90 días* o *Fecha personalizada*).
+- Añadir selector opcional de vencimiento en el formulario de creación de API key (ej. *Sin vencimiento*, *7 días*, *30 días*, *90 días* o *Fecha personalizada*) enviando `expiresInDays` o `expiresAt` en `options`.
 - Mostrar la fecha de expiración en cada fila/tarjeta de clave y un estado visual claro de **Expirada** cuando `expiresAt` sea menor o igual al tiempo actual.
 - Si están disponibles `usedTokens` / `requestsCount` (o enlace directo a `MetricsTab` filtrado por API key), mostrarlos de forma compacta con `tabular-nums`.
 
@@ -129,7 +136,7 @@ Refleja las historias `HU-27` a `HU-37` descritas en [`HISTORIAS-V2.md`](HISTORI
 ### 2.6 `MetricsTab.tsx` (`HU-34`, `HU-37`)
 
 **Tipos en `types.ts`:**
-- `ActivityGroupBy = 'model' | 'provider' | 'user' | 'apiKey'`
+- `ActivityGroupBy = 'model' | 'provider' | 'user' | 'apiKey'` *(nota: `'apiKey'` se añade para `HU-37`)*
 - `SpeedMetricsData` (`ModelSpeedEntry`: `ttftMs: PercentileTuple`, `tokensPerSec: PercentileTuple`)
 
 **Métodos en `api` (`api.ts`):**
@@ -138,3 +145,56 @@ Refleja las historias `HU-27` a `HU-37` descritas en [`HISTORIAS-V2.md`](HISTORI
 **Requisitos UI:**
 - **Corrección de tabla/chips de percentiles (`HU-34`):** separar visualmente la etiqueta (`P50`, `P75`, `P90`, `P95`, `P99`) del valor numérico en `tokensPerSec` y `ttftMs` (ej. gap/espaciado entre `<strong>{s.label}</strong>` y el valor, usar `tabular-nums` / `.mono`, formato `toLocaleString('es-ES', { maximumFractionDigits: 1 })` y unidad explícita `tok/s` o `ms`).
 - **Agrupación por API key y por usuario (`HU-37`):** añadir la opción **Por API key** en el selector de agrupación de actividad (junto a **Por modelo**, **Por proveedor** y **Por usuario**).
+
+---
+
+### 2.7 `MarketplaceTab.tsx` / `ProvidersTab.tsx` / Privacidad y ZDR (`HU-40`)
+
+**Contrato TypeScript en `panel/src/types.ts` (añadido por Backend):**
+```ts
+export type DataRetentionKind = 'zero' | 'transient' | 'retained' | 'variable';
+export type ProviderTrainingPolicy = 'never' | 'opt_out' | 'allowed' | 'unknown';
+
+export interface ProviderPrivacyConfig {
+  retention: DataRetentionKind;
+  training: ProviderTrainingPolicy;
+  retentionDays?: number;
+  policyUrl?: string;
+  note?: string;
+}
+```
+
+**Campos añadidos a las interfaces existentes en `panel/src/types.ts` y normalizados en `panel/src/api.ts`:**
+- En `ProviderManifest` *(ítems del Marketplace devueltos por `api.getMarketplace()` dentro de `MarketplaceCatalogState.manifests`)*:
+  - `privacy?: ProviderPrivacyConfig | null`
+- En `ProviderSummary` *(proveedores instalados devueltos por `api.getProviders()`)*:
+  - `privacy?: ProviderPrivacyConfig | null`
+- En `ProviderModelItem` *(modelos devueltos por `api.getModels()`, `api.getModelDetail()` y `ProviderSummary.models`)*:
+  - `providerPrivacy?: ProviderPrivacyConfig | null`
+
+**Requisitos UI (`MarketplaceTab.tsx` / `ProvidersTab.tsx`, `ProviderVaultCard.tsx`, `ModelsTab.tsx`):**
+1. **Badge de privacidad/ZDR en Marketplace (`MarketplaceTab.tsx` / `ProvidersTab.tsx`):**
+   - `retention === 'zero'` → Badge positivo (ej. **ZDR estricto** / *Sin retención*).
+   - `retention === 'transient'` → Badge informativo (ej. **Retención temporal** + `${retentionDays}d` si está definido).
+   - `retention === 'retained'` → Badge de advertencia (ej. **Sin ZDR / Retiene prompts**).
+   - `retention === 'variable'` → Badge neutro/informativo para agregadores como OpenRouter (ej. **Variable**).
+   - Mostrar indicador de entrenamiento cuando `training === 'allowed'` u `'opt_out'`, y enlace externo seguro (`target="_blank" rel="noopener noreferrer"`) a `policyUrl` cuando exista.
+2. **Advertencia en `ProviderVaultCard.tsx`:**
+   - Si el proveedor instalado tiene `privacy?.retention === 'retained'` o `privacy?.training === 'allowed'` / `'opt_out'` (ej. NVIDIA NIM free-tier), mostrar un badge de advertencia visible y un `InfoTip` con `privacy.note` o resumen de la política.
+3. **Indicador en `ModelsTab.tsx`:**
+   - Mostrar el distintivo de `model.providerPrivacy` en la fila/ficha del modelo para que el usuario conozca la retención antes de usarlo o enrutar prompts.
+4. **Manejo especial para agregadores (`retention === 'variable'`):**
+   - En OpenRouter y otros routers/agregadores con `retention: 'variable'`, explicar claramente mediante `InfoTip` o nota contextual que la retención de datos y el entrenamiento dependen del proveedor/modelo upstream subyacente que atienda la petición.
+
+---
+
+## 3. Checklist final de implementación UI
+
+- [ ] **`ProviderVaultCard.tsx`**: switch **Activar / Desactivar** (`status === 'disabled'`), badge `no_node`, botón **Probar clave** (`ProviderKeyTestResult`) y badge/tooltip de advertencia de privacidad (`HU-40`).
+- [ ] **`NodesTab.tsx`**: botón **Probar nodo** (`ExitNodeTestResult`) con estado de carga/latencia y advertencia de claves afectadas al eliminar nodo.
+- [ ] **`ModelsTab.tsx`**: interruptor de visibilidad admin (`api.setModelVisibility`), soporte y filtro para modelos deshabilitados y no-texto (`embeddings`), badge `hasCatalogInfo`, saneamiento de `formatReleaseDate` (`>= 2018` o `'No reportada'`) e indicador `providerPrivacy` (`HU-40`).
+- [ ] **`UsersTab.tsx`**: botón **Eliminar** en invitaciones pendientes (`api.deleteInvitation`), buscador de modelos en modales sin perder selección e interruptor/badge `enforceStrictQuota`.
+- [ ] **`ApiKeysTab.tsx`**: selector de expiración (`expiresInDays` / `expiresAt`), columna/badge de expiración y estado **Expirada**, y métricas compactas por clave (`usedTokens` / `requestsCount`).
+- [ ] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`) y opción **Por API key** en `ActivityGroupBy`.
+- [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx`**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter) y detalle de `training`.
+

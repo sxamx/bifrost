@@ -42,6 +42,7 @@ import type {
   ProviderLogoData,
   ProviderManifest,
   ProviderModelItem,
+  ProviderPrivacyConfig,
   ProviderReliabilityEntry,
   ProviderSummary,
   ProvidersResponse,
@@ -591,6 +592,40 @@ function normalizeProviderKey(raw: unknown): ProviderKeyItem {
   };
 }
 
+function normalizeProviderPrivacy(raw: unknown): ProviderPrivacyConfig | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const retention = r.retention;
+  const training = r.training;
+  if (
+    (retention !== 'zero' &&
+      retention !== 'transient' &&
+      retention !== 'retained' &&
+      retention !== 'variable') ||
+    (training !== 'never' &&
+      training !== 'opt_out' &&
+      training !== 'allowed' &&
+      training !== 'unknown')
+  ) {
+    return null;
+  }
+  const result: ProviderPrivacyConfig = { retention, training };
+  if (
+    typeof r.retentionDays === 'number' &&
+    Number.isInteger(r.retentionDays) &&
+    r.retentionDays >= 0
+  ) {
+    result.retentionDays = r.retentionDays;
+  }
+  if (typeof r.policyUrl === 'string' && r.policyUrl.trim().length > 0) {
+    result.policyUrl = r.policyUrl;
+  }
+  if (typeof r.note === 'string' && r.note.length > 0) {
+    result.note = r.note;
+  }
+  return result;
+}
+
 function normalizeProviderModel(raw: unknown): ProviderModelItem {
   const r = asRecord(raw);
   const providerId = String(r.providerId ?? r.provider_id ?? '');
@@ -630,6 +665,7 @@ function normalizeProviderModel(raw: unknown): ProviderModelItem {
         : typeof r.provider_name === 'string'
           ? r.provider_name
           : undefined,
+    providerPrivacy: normalizeProviderPrivacy(r.providerPrivacy ?? r.provider_privacy),
     logoSlug:
       typeof r.logoSlug === 'string'
         ? r.logoSlug
@@ -1794,9 +1830,12 @@ export const api = {
               : undefined;
 
       // HU-23: Only expose approved packages from marketplace catalog
-      const approvedManifests = (list as ProviderManifest[]).filter(
-        (m) => m.approved !== false
-      );
+      const approvedManifests = (list as ProviderManifest[])
+        .filter((m) => m.approved !== false)
+        .map((m) => ({
+          ...m,
+          privacy: normalizeProviderPrivacy(m.privacy),
+        }));
 
       return {
         manifests: approvedManifests,
