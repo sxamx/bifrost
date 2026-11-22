@@ -29,7 +29,7 @@ export interface ProviderStaticModelDef {
 
 export type DataRetentionKind = 'zero' | 'transient' | 'retained' | 'variable';
 export type ProviderTrainingPolicy = 'never' | 'opt_out' | 'allowed' | 'unknown';
-export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens';
+export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens' | 'concurrency';
 export type ProviderRateLimitWindow = 'hour' | 'day' | 'week';
 
 export interface ProviderPrivacyConfig {
@@ -295,7 +295,7 @@ function validateProviderSemantics(manifest: Record<string, unknown>): string[] 
     }
   }
   if (manifest.rateLimitKind !== undefined) {
-    const validKinds: ProviderRateLimitKind[] = ['none', 'requests', 'tokens'];
+    const validKinds: ProviderRateLimitKind[] = ['none', 'requests', 'tokens', 'concurrency'];
     if (
       typeof manifest.rateLimitKind !== 'string' ||
       !validKinds.includes(manifest.rateLimitKind as ProviderRateLimitKind)

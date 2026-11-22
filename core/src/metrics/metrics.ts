@@ -132,6 +132,8 @@ export function getSummaryMetrics(
         nextResetAt,
         earliestProviderResetAt: null,
         activeWindow: 'day',
+        windowSeconds: 86400,
+        windowLabel: '24h',
         confidence: 'configured',
         effectiveLimit: configuredDailyLimit,
         adaptiveAdjusted: false,
@@ -152,7 +154,7 @@ export function getSummaryMetrics(
               MIN(CASE WHEN pk.ratelimit_reset_at IS NOT NULL AND pk.ratelimit_reset_at > ? THEN pk.ratelimit_reset_at END) AS earliest_rl_reset
        FROM provider_keys pk
        JOIN providers p ON p.id = pk.provider_id
-       WHERE p.enabled = 1 AND pk.status != 'error'`,
+       WHERE p.enabled = 1 AND pk.status IN ('active', 'rate_limited')`,
     )
     .get(nowSec, nowSec, nowSec) as {
     keys_with_limit: number;
@@ -238,6 +240,8 @@ export function getSummaryMetrics(
       nextResetAt: formatIsoUtc(utcNextMidnightSec(nowSec)),
       earliestProviderResetAt,
       activeWindow: adaptive.activeWindow,
+      windowSeconds: adaptive.windowSeconds,
+      windowLabel: adaptive.windowLabel,
       confidence: adaptive.confidence,
       effectiveLimit,
       adaptiveAdjusted: adaptive.adaptiveAdjusted,

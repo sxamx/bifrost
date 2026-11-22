@@ -196,7 +196,7 @@ export interface ProviderPrivacyConfig {
 
 **Contrato TypeScript en `panel/src/types.ts` (añadido por Backend):**
 ```ts
-export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens';
+export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens' | 'concurrency';
 export type ProviderRateLimitWindow = 'hour' | 'day' | 'week';
 export type QuotaConfidence = 'header_exact' | 'configured' | 'inferred';
 
@@ -204,9 +204,13 @@ export interface ProviderAdaptiveQuota {
   providerId: string;
   providerName: string;
   rateLimitKind: ProviderRateLimitKind | null;
+  unit: 'tokens' | 'requests' | 'none';
   supportedWindows: ProviderRateLimitWindow[];
   activeWindow: ProviderRateLimitWindow;
+  windowSeconds: number;
+  windowLabel: string;
   confidence: QuotaConfidence;
+  usableKeysCount: number;
   configuredLimit: number | null;
   inferredLimit: number | null;
   effectiveLimit: number | null;
@@ -220,6 +224,8 @@ export interface ProviderAdaptiveQuota {
 
 export interface FreeQuotaStatus {
   activeWindow: ProviderRateLimitWindow;
+  windowSeconds?: number;
+  windowLabel?: string;
   confidence: QuotaConfidence;
   configuredLimit: number | null;
   effectiveLimit: number | null;
@@ -232,10 +238,10 @@ export interface FreeQuotaStatus {
 ```
 
 1. **Marketplace & Proveedores (`ProviderManifest` / `ProviderSummary`):**
-   - `rateLimitKind?: ProviderRateLimitKind | null` (`'none' | 'requests' | 'tokens' | null`)
+   - `rateLimitKind?: ProviderRateLimitKind | null` (`'none' | 'requests' | 'tokens' | 'concurrency' | null`)
    - `rateLimitWindows?: ProviderRateLimitWindow[]` (`Array<'hour' | 'day' | 'week'>`)
    - Normalizados en `api.getMarketplace()` (`MarketplaceCatalogState.manifests`) y disponibles en `ProviderManifest` / `ProviderSummary`.
-   - **Requisito UI (`MarketplaceTab.tsx` / `ProvidersTab.tsx` / `ProviderVaultCard.tsx`):** mostrar un badge de clasificación del límite de tasa en las tarjetas de proveedor (p. ej. *Sin límite*, *Por peticiones* o *Por tokens*, junto con las ventanas `hora` / `día` / `semana` cuando apliquen).
+   - **Requisito UI (`MarketplaceTab.tsx` / `ProvidersTab.tsx` / `ProviderVaultCard.tsx`):** mostrar un badge de clasificación del límite de tasa en las tarjetas de proveedor (*Sin límite* para `'none'`, *Por peticiones* para `'requests'`, *Por tokens* para `'tokens'` y **«Concurrencia»** para `'concurrency'`, junto con las ventanas `hora` / `día` / `semana` cuando apliquen).
 
 2. **Cuota gratuita adaptativa (`MetricsSummary` vía `api.getMetricsSummary()` y `FreeQuotaStatus` vía `api.getFreeQuota()`):**
    - En `MetricsSummary` (`/api/metrics/summary`, con respaldo en `quotaToday` del servidor):
@@ -246,13 +252,15 @@ export interface FreeQuotaStatus {
      - `providerQuotas?: ProviderAdaptiveQuota[]`
    - En `FreeQuotaStatus` (`/api/metrics/free-quota`):
      - `activeWindow: ProviderRateLimitWindow` (`'hour' | 'day' | 'week'`)
+     - `windowSeconds?: number` y `windowLabel?: string` *(ej. `'30m'`, `'4h'`, `'5h'`, `'24h'`, `'7d'`)*
      - `confidence: QuotaConfidence` (`'header_exact' | 'configured' | 'inferred'`)
      - `configuredLimit: number | null`, `effectiveLimit: number | null`, `usedInWindow: number`, `remainingInWindow: number | null`, `quotaPercentageRemaining: number | null`
      - `adaptiveAdjusted: boolean`
-     - `providers: ProviderAdaptiveQuota[]`
+     - `providers: ProviderAdaptiveQuota[]` *(cada proveedor incluye `unit: 'tokens' | 'requests' | 'none'`, `windowSeconds`, `windowLabel` junto a `activeWindow` retrocompatible, y `usableKeysCount` contando solo claves `active` + `rate_limited`)*
    - **Requisito UI (`OverviewTab.tsx` / `MetricsTab.tsx` — bloque «Cuota gratuita»):**
-     - Mostrar la ventana activa traducida (`hora` / `día` / `semana` para `'hour' | 'day' | 'week'`).
+     - Mostrar la ventana activa usando `windowLabel` cuando esté disponible (ej. `30m`, `4h`, `5h`, `24h`, `7d`) o la traducción de `activeWindow` (`hora` / `día` / `semana`) como respaldo.
      - Mostrar el indicador de confianza de la cuota (`Exacto por cabecera` para `'header_exact'`, `Configurado` para `'configured'`, `Inferido por 429` para `'inferred'`).
+     - En el desglose por proveedor (`providerQuotas` / `providers`), renderizar cada cuota en su unidad real según `unit` (`tokens`, `peticiones` para `'requests'`, o `'none'`), **sin mezclar nunca peticiones y tokens**, mostrando además `windowLabel`, `usableKeysCount` (solo claves `active` + `rate_limited`) y `confidence`.
      - Usar `effectiveLimit` / cifras en `tabular-nums` (`.mono`) e indicar mediante badge/nota (`InfoTip`) cuando `adaptiveAdjusted === true` o cuando exista desglose en `providerQuotas` / `providers`.
 
 ---
@@ -324,8 +332,8 @@ Lista viva de ajustes, añadidos y correcciones que debe implementar la IA de di
    - En `MetricsTab.tsx`: renderizar **`requestsCount`** en la sección de actividad (junto a los tokens).
    - En `ApiKeysTab.tsx`: mostrar columnas/indicadores compactos de **`usedTokens`** y **`requestsCount`** por clave (ya devueltos por `GET /api/keys`).
 5. **`OverviewTab.tsx` y `MetricsTab.tsx` (`HU-39`)** — *Añadir*:
-   - Renderizar el desglose por proveedor de cuota adaptativa (**`providerQuotas` / `freeQuota.providers`**).
-   - Añadir el bloque/indicador de ventana activa (`hora`/`día`/`semana`) y confianza (`Exacto por cabecera`/`Configurado`/`Inferido por 429`) también en **`MetricsTab.tsx`**.
+   - Renderizar el desglose por proveedor de cuota adaptativa (**`providerQuotas` / `freeQuota.providers`**) mostrando para cada proveedor su **`windowLabel`** (ej. `4h`, `24h`, `30m`), su **`unit`** real (`tokens` / `peticiones` sin mezclar unidades), **`usableKeysCount`** (claves `active` + `rate_limited`) y **`confidence`**.
+   - Añadir el bloque/indicador de ventana activa (`windowLabel` o `hora`/`día`/`semana` como respaldo) y confianza (`Exacto por cabecera`/`Configurado`/`Inferido por 429`) también en **`MetricsTab.tsx`**.
 6. **`MetricsTab.tsx` (`HU-34`)** — *Corregir*:
    - Formatear los valores de velocidad por modelo (`tok/s`) con `toLocaleString('es-ES', { maximumFractionDigits: 1 })` en lugar de `.toFixed(1)` / `Math.round(...)` crudos, y pulir cualquier fallo restante de alineación o espaciado visual en la tabla y tarjetas de percentiles (separación etiqueta/valor, `tabular-nums` y unidades).
 7. **`CompareTab.tsx` (`HU-30` y NVIDIA NIM `thinking`)** — *Corregir + Añadir*:

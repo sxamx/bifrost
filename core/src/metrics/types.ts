@@ -32,6 +32,8 @@ export interface SummaryMetricsResult {
     nextResetAt: string;
     earliestProviderResetAt: string | null;
     activeWindow?: 'hour' | 'day' | 'week';
+    windowSeconds?: number;
+    windowLabel?: string;
     confidence?: 'header_exact' | 'configured' | 'inferred';
     effectiveLimit?: number | null;
     adaptiveAdjusted?: boolean;

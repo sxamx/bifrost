@@ -158,8 +158,8 @@
     },
     "rateLimitKind": {
       "type": "string",
-      "enum": ["none", "requests", "tokens"],
-      "description": "Tipo de límite de cuota gratuita del proveedor (HU-38)."
+      "enum": ["none", "requests", "tokens", "concurrency"],
+      "description": "Tipo de límite de cuota gratuita del proveedor (HU-38 / HU-39 v2)."
     },
     "rateLimitWindows": {
       "type": "array",

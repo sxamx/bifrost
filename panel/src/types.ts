@@ -248,16 +248,21 @@ export interface BackupImportResult {
 
 /* Phase 5 — Quota Hero, Percentile Telemetry, 60d Uptime, Activity & System Logs */
 
-export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens';
+export type ProviderRateLimitKind = 'none' | 'requests' | 'tokens' | 'concurrency';
 export type ProviderRateLimitWindow = 'hour' | 'day' | 'week';
 export type QuotaConfidence = 'header_exact' | 'configured' | 'inferred';
+export type QuotaUnit = 'tokens' | 'requests' | 'none';
 
 export interface ProviderAdaptiveQuota {
   providerId: string;
   providerName: string;
   rateLimitKind: ProviderRateLimitKind | null;
+  unit: QuotaUnit;
+  usableKeysCount: number;
   supportedWindows: ProviderRateLimitWindow[];
   activeWindow: ProviderRateLimitWindow;
+  windowSeconds: number;
+  windowLabel: string;
   confidence: QuotaConfidence;
   configuredLimit: number | null;
   inferredLimit: number | null;
@@ -272,6 +277,8 @@ export interface ProviderAdaptiveQuota {
 
 export interface FreeQuotaStatus {
   activeWindow: ProviderRateLimitWindow;
+  windowSeconds: number;
+  windowLabel: string;
   confidence: QuotaConfidence;
   configuredLimit: number | null;
   effectiveLimit: number | null;
@@ -292,6 +299,8 @@ export interface MetricsSummary {
   activeModelsCount: number;
   onlineNodesCount: number;
   activeWindow?: ProviderRateLimitWindow;
+  windowSeconds?: number;
+  windowLabel?: string;
   quotaConfidence?: QuotaConfidence;
   effectiveLimit?: number | null;
   adaptiveAdjusted?: boolean;

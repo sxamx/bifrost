@@ -52,6 +52,7 @@ import type {
   ProvidersResponse,
   QuotaConfidence,
   QuotaResetMode,
+  QuotaUnit,
   RotateNodeTokenResult,
   SpeedMetricsData,
   StatusResponse,
@@ -647,11 +648,37 @@ function normalizeProviderPrivacy(raw: unknown): ProviderPrivacyConfig | null {
 }
 
 function normalizeRateLimitKind(raw: unknown): ProviderRateLimitKind | null {
-  return raw === 'none' || raw === 'requests' || raw === 'tokens' ? raw : null;
+  return raw === 'none' || raw === 'requests' || raw === 'tokens' || raw === 'concurrency'
+    ? raw
+    : null;
 }
 
 function normalizeRateLimitWindow(raw: unknown): ProviderRateLimitWindow {
   return raw === 'hour' || raw === 'week' ? raw : 'day';
+}
+
+function defaultWindowSeconds(win: ProviderRateLimitWindow): number {
+  if (win === 'hour') return 3600;
+  if (win === 'week') return 604800;
+  return 86400;
+}
+
+function defaultWindowLabel(win: ProviderRateLimitWindow): string {
+  if (win === 'hour') return '1h';
+  if (win === 'week') return '7d';
+  return '24h';
+}
+
+function normalizeQuotaUnit(
+  raw: unknown,
+  rateLimitKind: ProviderRateLimitKind | null
+): QuotaUnit {
+  if (raw === 'tokens' || raw === 'requests' || raw === 'none') {
+    return raw;
+  }
+  if (rateLimitKind === 'none' || rateLimitKind === 'concurrency') return 'none';
+  if (rateLimitKind === 'requests') return 'requests';
+  return 'tokens';
 }
 
 function normalizeRateLimitWindows(raw: unknown): ProviderRateLimitWindow[] {
@@ -677,12 +704,28 @@ function normalizeQuotaConfidence(raw: unknown): QuotaConfidence {
 
 function normalizeProviderAdaptiveQuota(raw: unknown): ProviderAdaptiveQuota {
   const r = asRecord(raw);
+  const rateLimitKind = normalizeRateLimitKind(r.rateLimitKind ?? r.rate_limit_kind);
+  const activeWindow = normalizeRateLimitWindow(r.activeWindow ?? r.active_window);
+  const windowSeconds = asNum(
+    r.windowSeconds ?? r.window_seconds,
+    defaultWindowSeconds(activeWindow)
+  );
+  const rawWindowLabel = r.windowLabel ?? r.window_label;
+  const windowLabel =
+    typeof rawWindowLabel === 'string' && rawWindowLabel.trim().length > 0
+      ? rawWindowLabel
+      : defaultWindowLabel(activeWindow);
+
   return {
     providerId: String(r.providerId ?? r.provider_id ?? ''),
     providerName: String(r.providerName ?? r.provider_name ?? r.providerId ?? ''),
-    rateLimitKind: normalizeRateLimitKind(r.rateLimitKind ?? r.rate_limit_kind),
+    rateLimitKind,
+    unit: normalizeQuotaUnit(r.unit, rateLimitKind),
+    usableKeysCount: asNum(r.usableKeysCount ?? r.usable_keys_count, 0),
     supportedWindows: normalizeRateLimitWindows(r.supportedWindows ?? r.supported_windows),
-    activeWindow: normalizeRateLimitWindow(r.activeWindow ?? r.active_window),
+    activeWindow,
+    windowSeconds,
+    windowLabel,
     confidence: normalizeQuotaConfidence(r.confidence),
     configuredLimit: asNullableNum(r.configuredLimit ?? r.configured_limit),
     inferredLimit: asNullableNum(r.inferredLimit ?? r.inferred_limit),
@@ -1456,6 +1499,16 @@ export const api = {
     const activeWindow = normalizeRateLimitWindow(
       r.activeWindow ?? quotaToday.activeWindow
     );
+    const windowSeconds = asNum(
+      r.windowSeconds ?? r.window_seconds ?? quotaToday.windowSeconds,
+      defaultWindowSeconds(activeWindow)
+    );
+    const rawSummaryWindowLabel =
+      r.windowLabel ?? r.window_label ?? quotaToday.windowLabel;
+    const windowLabel =
+      typeof rawSummaryWindowLabel === 'string' && rawSummaryWindowLabel.trim().length > 0
+        ? rawSummaryWindowLabel
+        : defaultWindowLabel(activeWindow);
     const quotaConfidence = normalizeQuotaConfidence(
       r.quotaConfidence ?? quotaToday.confidence
     );
@@ -1482,6 +1535,8 @@ export const api = {
       activeModelsCount: asNum(r.activeModelsCount ?? r.active_models_count ?? r.modelsCount),
       onlineNodesCount: asNum(r.onlineNodesCount ?? r.online_nodes_count),
       activeWindow,
+      windowSeconds,
+      windowLabel,
       quotaConfidence,
       effectiveLimit,
       adaptiveAdjusted,
@@ -1495,8 +1550,21 @@ export const api = {
     const providers = Array.isArray(r.providers)
       ? r.providers.map(normalizeProviderAdaptiveQuota)
       : [];
+    const activeWindow = normalizeRateLimitWindow(r.activeWindow ?? r.active_window);
+    const windowSeconds = asNum(
+      r.windowSeconds ?? r.window_seconds,
+      defaultWindowSeconds(activeWindow)
+    );
+    const rawWindowLabel = r.windowLabel ?? r.window_label;
+    const windowLabel =
+      typeof rawWindowLabel === 'string' && rawWindowLabel.trim().length > 0
+        ? rawWindowLabel
+        : defaultWindowLabel(activeWindow);
+
     return {
-      activeWindow: normalizeRateLimitWindow(r.activeWindow ?? r.active_window),
+      activeWindow,
+      windowSeconds,
+      windowLabel,
       confidence: normalizeQuotaConfidence(r.confidence),
       configuredLimit: asNullableNum(r.configuredLimit ?? r.configured_limit),
       effectiveLimit: asNullableNum(r.effectiveLimit ?? r.effective_limit),

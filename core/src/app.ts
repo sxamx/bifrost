@@ -2767,6 +2767,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       nextResetAt: summary.quotaToday.nextResetAt,
       resetMode: summary.quotaToday.quotaResetMode,
       activeWindow: summary.quotaToday.activeWindow ?? 'day',
+      windowSeconds: summary.quotaToday.windowSeconds ?? 86400,
+      windowLabel: summary.quotaToday.windowLabel ?? '24h',
       quotaConfidence: summary.quotaToday.confidence ?? 'inferred',
       effectiveLimit: summary.quotaToday.effectiveLimit ?? totalDailyLimit,
       adaptiveAdjusted: Boolean(summary.quotaToday.adaptiveAdjusted),
@@ -2791,6 +2793,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           : null;
       return c.json({
         activeWindow: 'day',
+        windowSeconds: 86400,
+        windowLabel: '24h',
         confidence: 'configured',
         configuredLimit: limit,
         effectiveLimit: limit,

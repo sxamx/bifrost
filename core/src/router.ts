@@ -204,6 +204,37 @@ function windowDurationSec(window: 'hour' | 'day' | 'week'): number {
   return 86400;
 }
 
+function formatAdaptiveWindowLabel(windowSeconds: number): string {
+  if (windowSeconds >= 172800) {
+    return `${Math.round(windowSeconds / 86400)}d`;
+  }
+  if (windowSeconds >= 3600) {
+    if (windowSeconds % 3600 === 0) {
+      return `${windowSeconds / 3600}h`;
+    }
+    if (windowSeconds < 7200 && windowSeconds % 60 === 0) {
+      return `${windowSeconds / 60}m`;
+    }
+    return `${Math.round(windowSeconds / 3600)}h`;
+  }
+  if (windowSeconds >= 60) {
+    return `${Math.round(windowSeconds / 60)}m`;
+  }
+  return `${Math.max(1, Math.round(windowSeconds))}s`;
+}
+
+interface StoredAdaptiveRlEvent {
+  keyId: string;
+  providerKeyId?: string;
+  kind: 'burst' | 'quota';
+  windowSeconds: number;
+  windowHint?: 'hour' | 'day' | 'week';
+  observedTokens: number;
+  observedRequests: number;
+  resetDeltaSec: number | null;
+  createdAt: number;
+}
+
 function recordRateLimitEvent(
   db: DatabaseSync,
   keyId: string,
@@ -234,67 +265,143 @@ function recordRateLimitEvent(
     parsed.resetAt !== null ? Math.max(0, parsed.resetAt - nowSec) : null;
 
   let manifestWindow: 'hour' | 'day' | 'week' | null = null;
+  let manifestRateLimitKind: ProviderManifest['rateLimitKind'] | null = null;
   try {
     const manifest = JSON.parse(keyRow.schema_json) as ProviderManifest;
     const firstWin = manifest.rateLimitWindows?.[0];
     if (firstWin === 'hour' || firstWin === 'day' || firstWin === 'week') {
       manifestWindow = firstWin;
     }
+    if (
+      manifest.rateLimitKind === 'none' ||
+      manifest.rateLimitKind === 'requests' ||
+      manifest.rateLimitKind === 'tokens' ||
+      manifest.rateLimitKind === 'concurrency'
+    ) {
+      manifestRateLimitKind = manifest.rateLimitKind;
+    }
   } catch {
     // Ignore malformed manifest JSON
   }
-
-  const windowHint: 'hour' | 'day' | 'week' =
-    inferWindowFromResetDelta(resetDeltaSec) ?? manifestWindow ?? 'day';
-  const lookbackSec = windowDurationSec(windowHint);
-
-  const usageRow = db
-    .prepare(
-      `SELECT COALESCE(SUM(prompt_tokens + completion_tokens + reasoning_tokens), 0) AS observed_tokens,
-              COUNT(*) AS observed_requests
-       FROM usage_logs
-       WHERE provider_id = ?
-         AND status IN ('ok', 'resumed')
-         AND created_at >= ?
-         AND created_at <= ?`,
-    )
-    .get(keyRow.provider_id, nowSec - lookbackSec, nowSec) as
-    | { observed_tokens: number | bigint; observed_requests: number | bigint }
-    | undefined;
-
-  const observedTokens = Number(usageRow?.observed_tokens ?? 0);
-  const observedRequests = Number(usageRow?.observed_requests ?? 0);
 
   const cacheKey = `adaptive_rl:${keyRow.provider_id}`;
   const existingRow = db
     .prepare(`SELECT payload_json FROM external_cache WHERE cache_key = ?`)
     .get(cacheKey) as { payload_json: string } | undefined;
 
-  let events: Array<{
-    providerKeyId: string;
-    windowHint: 'hour' | 'day' | 'week';
-    observedTokens: number;
-    observedRequests: number;
-    resetDeltaSec: number | null;
-    createdAt: number;
-  }> = [];
+  let events: StoredAdaptiveRlEvent[] = [];
 
   if (existingRow?.payload_json) {
     try {
-      const parsed = JSON.parse(existingRow.payload_json) as unknown;
-      if (Array.isArray(parsed)) {
-        events = parsed.filter(
-          (e): e is (typeof events)[number] =>
-            Boolean(e && typeof e === 'object' && typeof (e as { createdAt?: unknown }).createdAt === 'number'),
-        );
+      const parsedCache = JSON.parse(existingRow.payload_json) as unknown;
+      if (Array.isArray(parsedCache)) {
+        events = parsedCache
+          .filter(
+            (e): e is Record<string, unknown> =>
+              Boolean(
+                e &&
+                  typeof e === 'object' &&
+                  typeof (e as { createdAt?: unknown }).createdAt === 'number',
+              ),
+          )
+          .map((e) => {
+            const evKeyId =
+              typeof e.keyId === 'string'
+                ? e.keyId
+                : typeof e.providerKeyId === 'string'
+                  ? e.providerKeyId
+                  : '';
+            const evResetDelta =
+              typeof e.resetDeltaSec === 'number' && Number.isFinite(e.resetDeltaSec)
+                ? e.resetDeltaSec
+                : null;
+            const evKind: 'burst' | 'quota' =
+              e.kind === 'burst'
+                ? 'burst'
+                : e.kind === 'quota'
+                  ? 'quota'
+                  : evResetDelta !== null && evResetDelta <= 120
+                    ? 'burst'
+                    : 'quota';
+            const evWinHint =
+              e.windowHint === 'hour' || e.windowHint === 'day' || e.windowHint === 'week'
+                ? (e.windowHint as 'hour' | 'day' | 'week')
+                : undefined;
+            const evWindowSec =
+              typeof e.windowSeconds === 'number' &&
+              Number.isFinite(e.windowSeconds) &&
+              e.windowSeconds > 0
+                ? e.windowSeconds
+                : evResetDelta !== null && evResetDelta > 120
+                  ? evResetDelta
+                  : windowDurationSec(evWinHint ?? 'day');
+            return {
+              keyId: evKeyId,
+              providerKeyId: evKeyId,
+              kind: evKind,
+              windowSeconds: evWindowSec,
+              windowHint: evWinHint,
+              observedTokens: Number(e.observedTokens ?? 0),
+              observedRequests: Number(e.observedRequests ?? 0),
+              resetDeltaSec: evResetDelta,
+              createdAt: Number(e.createdAt ?? 0),
+            };
+          });
       }
     } catch {
       events = [];
     }
   }
 
+  const defaultWindowSec = windowDurationSec(manifestWindow ?? 'day');
+  let kind: 'burst' | 'quota';
+  let windowSeconds: number;
+
+  if (resetDeltaSec !== null && resetDeltaSec <= 120) {
+    kind = 'burst';
+    windowSeconds = Math.max(1, resetDeltaSec);
+  } else if (resetDeltaSec !== null && resetDeltaSec > 120) {
+    kind = 'quota';
+    windowSeconds = resetDeltaSec;
+  } else {
+    // No reset header: classify isolated first 429 as 'burst'; repeated 429 for same keyId
+    // within last 10 minutes (> 30s ago) as sustained 'quota' exhaustion.
+    const hasRecentRepeat = events.some(
+      (e) =>
+        e.keyId === keyId &&
+        nowSec - e.createdAt > 30 &&
+        nowSec - e.createdAt <= 600,
+    );
+    kind = hasRecentRepeat ? 'quota' : 'burst';
+    windowSeconds = defaultWindowSec;
+  }
+
+  const windowHint: 'hour' | 'day' | 'week' =
+    inferWindowFromResetDelta(windowSeconds) ?? manifestWindow ?? 'day';
+  const lookbackSec = windowSeconds > 120 ? windowSeconds : defaultWindowSec;
+
+  const usageRow = db
+    .prepare(
+      `SELECT COALESCE(SUM(prompt_tokens + completion_tokens + reasoning_tokens), 0) AS observed_tokens,
+              COUNT(*) AS observed_requests
+       FROM usage_logs
+       WHERE provider_key_id = ?
+         AND status IN ('ok', 'resumed')
+         AND created_at >= ?
+         AND created_at <= ?`,
+    )
+    .get(keyId, nowSec - lookbackSec, nowSec) as
+    | { observed_tokens: number | bigint; observed_requests: number | bigint }
+    | undefined;
+
+  const observedTokens = Number(usageRow?.observed_tokens ?? 0);
+  const observedRequests = Number(usageRow?.observed_requests ?? 0);
+
   events.unshift({
+    keyId,
     providerKeyId: keyId,
+    kind,
+    windowSeconds,
     windowHint,
     observedTokens,
     observedRequests,
@@ -317,22 +424,34 @@ function recordRateLimitEvent(
       ? Number(keyRow.daily_quota_limit)
       : null;
 
-  if (configuredLimit !== null && observedTokens > 0 && observedTokens < configuredLimit) {
-    writeSystemLog(
-      db,
-      'warn',
-      'system',
-      `Adaptive quota ceiling adjusted for "${keyRow.provider_id}": HTTP 429 observed at ${observedTokens} tokens (${windowHint} window), below configured limit ${configuredLimit}.`,
-      {
-        providerId: keyRow.provider_id,
-        keyId,
-        windowHint,
-        observedTokens,
-        observedRequests,
-        configuredLimit,
-      },
-      nowSec,
-    );
+  if (
+    kind === 'quota' &&
+    manifestRateLimitKind !== 'none' &&
+    manifestRateLimitKind !== 'concurrency' &&
+    configuredLimit !== null
+  ) {
+    const observedVal =
+      manifestRateLimitKind === 'requests' ? observedRequests : observedTokens;
+    const unitLabel = manifestRateLimitKind === 'requests' ? 'requests' : 'tokens';
+    if (observedVal > 0 && observedVal < configuredLimit) {
+      writeSystemLog(
+        db,
+        'warn',
+        'system',
+        `Adaptive quota ceiling adjusted for "${keyRow.provider_id}": HTTP 429 observed at ${observedVal} ${unitLabel} (${formatAdaptiveWindowLabel(windowSeconds)} window), below configured limit ${configuredLimit}.`,
+        {
+          providerId: keyRow.provider_id,
+          keyId,
+          kind,
+          windowSeconds,
+          windowHint,
+          observedTokens,
+          observedRequests,
+          configuredLimit,
+        },
+        nowSec,
+      );
+    }
   }
 }
 
