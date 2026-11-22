@@ -71,7 +71,9 @@ function formatRateLimitBadge(
       ? 'Límite: peticiones'
       : kind === 'tokens'
         ? 'Límite: tokens'
-        : 'Sin límite fijo';
+        : kind === 'concurrency'
+          ? 'Límite: concurrencia'
+          : 'Sin límite fijo';
   if (!windows || windows.length === 0) return base;
   const winTxt = windows
     .map((w) => (w === 'hour' ? 'hora' : w === 'day' ? 'día' : 'semana'))

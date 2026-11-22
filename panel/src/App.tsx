@@ -293,6 +293,7 @@ export const App: React.FC = () => {
       } else if (e.key === 'Escape') {
         setCmdOpen(false);
         setMobileMenuOpen(false);
+        setGuestInfoModalOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);

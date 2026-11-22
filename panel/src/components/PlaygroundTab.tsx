@@ -410,7 +410,7 @@ export const PlaygroundTab: React.FC = () => {
               placeholder={
                 models.length === 0
                   ? 'Instala y detecta al menos un modelo para enviar mensajes…'
-                  : 'Escribe tu prompt aquí (Enter + botón Enviar)…'
+                  : 'Escribe tu prompt aquí (Ctrl+Enter o botón Enviar)…'
               }
               value={promptInput}
               disabled={sending || models.length === 0}

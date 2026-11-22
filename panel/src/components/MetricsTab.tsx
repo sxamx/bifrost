@@ -493,8 +493,19 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                       </div>
                       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
                         <span style={{ color: 'var(--tooltip-sub)' }}>Peticiones reales</span>
-                        <strong className="mono">{hoveredHere.day.totalRequests}</strong>
+                        <strong className="mono">
+                          {hoveredHere.day.totalRequests.toLocaleString('es-ES')}
+                        </strong>
                       </div>
+                      {typeof hoveredHere.day.errorRequests === 'number' &&
+                      hoveredHere.day.errorRequests > 0 ? (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+                          <span style={{ color: 'var(--tooltip-sub)' }}>Errores</span>
+                          <strong className="mono" style={{ color: 'var(--err)' }}>
+                            {hoveredHere.day.errorRequests.toLocaleString('es-ES')}
+                          </strong>
+                        </div>
+                      ) : null}
                     </div>
                   ) : null}
 
@@ -919,7 +930,8 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                           {m.modelFullId}
                         </code>
                         <span className="field-hint">
-                          {m.sampleCount} {m.sampleCount === 1 ? 'petición' : 'peticiones'}
+                          {m.sampleCount.toLocaleString('es-ES')}{' '}
+                          {m.sampleCount === 1 ? 'petición' : 'peticiones'}
                         </span>
                       </div>
 
@@ -947,7 +959,11 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                                 />
                                 <strong style={{ marginRight: 5 }}>{s.label}</strong>
                                 <span className="mono">
-                                  {m.tokensPerSec[s.key].toFixed(1)} tok/s
+                                  {m.tokensPerSec[s.key].toLocaleString('es-ES', {
+                                    minimumFractionDigits: 1,
+                                    maximumFractionDigits: 1,
+                                  })}{' '}
+                                  tok/s
                                 </span>
                               </span>
                             ))}
@@ -970,7 +986,9 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                                   }}
                                 />
                                 <strong style={{ marginRight: 5 }}>{s.label}</strong>
-                                <span className="mono">{Math.round(m.ttftMs[s.key])} ms</span>
+                                <span className="mono">
+                                  {Math.round(m.ttftMs[s.key]).toLocaleString('es-ES')} ms
+                                </span>
                               </span>
                             ))}
                           </div>
@@ -1472,6 +1490,21 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                     {activeActivityItem.totalTokens.toLocaleString('es-ES')}
                   </strong>
                 </div>
+                {typeof activeActivityItem.requestsCount === 'number' ? (
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      gap: 16,
+                      marginTop: 2,
+                    }}
+                  >
+                    <span style={{ color: 'var(--tooltip-sub)' }}>Peticiones</span>
+                    <strong className="mono">
+                      {activeActivityItem.requestsCount.toLocaleString('es-ES')}
+                    </strong>
+                  </div>
+                ) : null}
                 {(activityGroupBy === 'model' && onOpenModel) ||
                 (activityGroupBy === 'provider' && onOpenProvider) ? (
                   <div

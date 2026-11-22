@@ -69,6 +69,7 @@ function formatRateLimitKind(kind?: ProviderRateLimitKind | null): string | null
   if (!kind) return null;
   if (kind === 'requests') return 'Límite por peticiones';
   if (kind === 'tokens') return 'Límite por tokens';
+  if (kind === 'concurrency') return 'Límite por concurrencia';
   if (kind === 'none') return 'Sin límite fijo';
   return null;
 }
@@ -662,7 +663,7 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
                                     : k.status === 'rate_limited'
                                       ? 'partial'
                                       : k.status === 'disabled'
-                                        ? 'muted'
+                                        ? 'offline'
                                         : 'err'
                                 }`}
                               />

@@ -300,7 +300,10 @@ export const BackupsTab: React.FC<BackupsTabProps> = ({ onBackupRestored }) => {
                 accept=".enc,.bifrost.enc,application/octet-stream"
                 className="input"
                 disabled={importing}
-                onChange={(e) => setImportFile(e.target.files?.[0] ?? null)}
+                onChange={(e) => {
+                  setImportFile(e.target.files?.[0] ?? null);
+                  e.target.value = '';
+                }}
               />
               {importFile ? (
                 <span className="field-hint">
