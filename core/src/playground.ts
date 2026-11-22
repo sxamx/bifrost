@@ -360,6 +360,21 @@ export async function handlePlaygroundChat(
     let cachedTokens = 0;
     let generatedChars = 0;
 
+    const estimatedPromptTokens = Math.max(
+      1,
+      Math.ceil(
+        messages.reduce((acc, m) => {
+          const content =
+            typeof m.content === 'string'
+              ? m.content
+              : Array.isArray(m.content)
+                ? JSON.stringify(m.content)
+                : '';
+          return acc + content.length + 12;
+        }, 0) / 4,
+      ),
+    );
+
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         let buffer = '';
@@ -370,6 +385,7 @@ export async function handlePlaygroundChat(
           emittedDone = true;
           const durationMs = Math.max(1, nowFn() - startedAtMs);
           const ttftMs = firstTokenMs ?? durationMs;
+          const effectivePrompt = promptTokens > 0 ? promptTokens : estimatedPromptTokens;
           const effectiveCompletion =
             completionTokens > 0
               ? completionTokens
@@ -381,7 +397,7 @@ export async function handlePlaygroundChat(
             totalOutTokens > 0 && durationMs > 0
               ? round2((totalOutTokens / durationMs) * 1000)
               : null;
-          const totalTokens = promptTokens + effectiveCompletion + reasoningTokens;
+          const totalTokens = effectivePrompt + effectiveCompletion + reasoningTokens;
 
           const summaryEvt = {
             object: 'bifrost.playground.metrics',
@@ -393,12 +409,12 @@ export async function handlePlaygroundChat(
             tokens_per_sec: tokensPerSec,
             durationMs,
             usage: {
-              promptTokens,
+              promptTokens: effectivePrompt,
               completionTokens: effectiveCompletion,
               reasoningTokens,
               cachedTokens,
               totalTokens,
-              prompt_tokens: promptTokens,
+              prompt_tokens: effectivePrompt,
               completion_tokens: effectiveCompletion,
               reasoning_tokens: reasoningTokens,
               cached_tokens: cachedTokens,
@@ -527,8 +543,25 @@ export async function handlePlaygroundChat(
   const compDetails = asRecord(u.completion_tokens_details);
   const promptDetails = asRecord(u.prompt_tokens_details);
 
-  const promptTokens = toSafeNonNegInt(u.prompt_tokens ?? u.promptTokens);
-  const completionTokens = toSafeNonNegInt(u.completion_tokens ?? u.completionTokens);
+  const estimatedNonStreamPrompt = Math.max(
+    1,
+    Math.ceil(
+      messages.reduce((acc, m) => {
+        const msgContent =
+          typeof m.content === 'string'
+            ? m.content
+            : Array.isArray(m.content)
+              ? JSON.stringify(m.content)
+              : '';
+        return acc + msgContent.length + 12;
+      }, 0) / 4,
+    ),
+  );
+  const promptTokens =
+    toSafeNonNegInt(u.prompt_tokens ?? u.promptTokens) || estimatedNonStreamPrompt;
+  const completionTokens =
+    toSafeNonNegInt(u.completion_tokens ?? u.completionTokens) ||
+    (content.length > 0 ? Math.max(1, Math.ceil(content.length / 4)) : 0);
   const reasoningTokens = toSafeNonNegInt(
     u.reasoning_tokens ?? u.reasoningTokens ?? compDetails.reasoning_tokens,
   );
