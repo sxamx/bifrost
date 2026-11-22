@@ -193,7 +193,24 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
     isError?: boolean;
   } | null>(null);
   const [copiedUpdateCmd, setCopiedUpdateCmd] = useState(false);
+  const isMountedRef = useRef(true);
   const updatePollTimerRef = useRef<number | null>(null);
+  const reloadTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (updatePollTimerRef.current !== null) {
+        window.clearInterval(updatePollTimerRef.current);
+        updatePollTimerRef.current = null;
+      }
+      if (reloadTimerRef.current !== null) {
+        window.clearTimeout(reloadTimerRef.current);
+        reloadTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const isAdmin = user.role === 'admin';
   const effectiveProvidersCount = providersLoaded
@@ -243,10 +260,6 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
     }
     return () => {
       cancelled = true;
-      if (updatePollTimerRef.current !== null) {
-        window.clearInterval(updatePollTimerRef.current);
-        updatePollTimerRef.current = null;
-      }
     };
   }, [isAdmin]);
 
@@ -256,14 +269,16 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
     setUpdateFeedback(null);
     try {
       const st = await api.getUpdateStatus(true);
+      if (!isMountedRef.current) return;
       setUpdateStatus(st);
       if (!st.updateAvailable) {
         setUpdateFeedback('Bifrost ya está en la última versión disponible.');
       }
     } catch {
+      if (!isMountedRef.current) return;
       setUpdateFeedback('No se pudo comprobar actualizaciones en este momento.');
     } finally {
-      setCheckingUpdate(false);
+      if (isMountedRef.current) setCheckingUpdate(false);
     }
   }
 
@@ -272,6 +287,10 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
     if (updatePollTimerRef.current !== null) {
       window.clearInterval(updatePollTimerRef.current);
       updatePollTimerRef.current = null;
+    }
+    if (reloadTimerRef.current !== null) {
+      window.clearTimeout(reloadTimerRef.current);
+      reloadTimerRef.current = null;
     }
 
     const previousCommit = updateStatus?.currentCommit ?? healthInfo?.buildCommit ?? null;
@@ -287,6 +306,7 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
 
     try {
       const res = await api.triggerSystemUpdate();
+      if (!isMountedRef.current) return;
       if (res.upToDate) {
         setUpdateProgress(null);
         setTriggeringUpdate(false);
@@ -302,28 +322,34 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
 
       const startedAt = Date.now();
       let sawDisconnect = false;
+      let polling = false;
 
       const pollOnce = async () => {
-        if (Date.now() - startedAt > 90_000) {
-          if (updatePollTimerRef.current !== null) {
-            window.clearInterval(updatePollTimerRef.current);
-            updatePollTimerRef.current = null;
-          }
-          setTriggeringUpdate(false);
-          setUpdateProgress({
-            active: false,
-            pct: 100,
-            label: 'Tiempo de espera agotado (90s). Recarga manualmente o revisa los logs del servidor.',
-            isError: true,
-          });
-          return;
-        }
-
+        if (!isMountedRef.current || polling) return;
+        polling = true;
         try {
+          if (Date.now() - startedAt > 90_000) {
+            if (updatePollTimerRef.current !== null) {
+              window.clearInterval(updatePollTimerRef.current);
+              updatePollTimerRef.current = null;
+            }
+            if (!isMountedRef.current) return;
+            setTriggeringUpdate(false);
+            setUpdateProgress({
+              active: false,
+              pct: 100,
+              label:
+                'Tiempo de espera agotado (90s). Recarga manualmente o revisa los logs del servidor.',
+              isError: true,
+            });
+            return;
+          }
+
           const [hRes, stRes] = await Promise.allSettled([
             api.getHealth(),
             api.getUpdateStatus(false),
           ]);
+          if (!isMountedRef.current) return;
 
           if (hRes.status === 'rejected') {
             sawDisconnect = true;
@@ -354,7 +380,9 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
               pct: 100,
               label: '¡Actualizado correctamente! Recargando…',
             });
-            window.setTimeout(() => window.location.reload(), 1200);
+            reloadTimerRef.current = window.setTimeout(() => {
+              if (isMountedRef.current) window.location.reload();
+            }, 1200);
             return;
           }
 
@@ -398,19 +426,24 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             }));
           }
         } catch {
+          if (!isMountedRef.current) return;
           sawDisconnect = true;
           setUpdateProgress({
             active: true,
             pct: 75,
             label: 'Reiniciando servidor…',
           });
+        } finally {
+          polling = false;
         }
       };
 
+      if (!isMountedRef.current) return;
       updatePollTimerRef.current = window.setInterval(() => {
         void pollOnce();
       }, 2000);
     } catch (err) {
+      if (!isMountedRef.current) return;
       setTriggeringUpdate(false);
       setUpdateProgress({
         active: false,
