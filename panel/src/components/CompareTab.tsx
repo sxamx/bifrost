@@ -4,13 +4,44 @@ import { copyTextToClipboard } from '../clipboard';
 import type { ModelSpeedEntry, ProviderModelItem } from '../types';
 import { InfoTip } from './InfoTip';
 
-export const CompareTab: React.FC = () => {
+interface CompareTabProps {
+  onOpenModel?: (fullId: string) => void;
+}
+
+const COMPARE_SESSION_KEY = 'bf_compare_selected_ids';
+
+function readStoredCompareIds(): string[] {
+  try {
+    const raw = sessionStorage.getItem(COMPARE_SESSION_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((x): x is string => typeof x === 'string' && x.length > 0).slice(0, 3)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
   const [models, setModels] = useState<ProviderModelItem[]>([]);
   const [speedByModel, setSpeedByModel] = useState<Record<string, ModelSpeedEntry>>({});
   const [loading, setLoading] = useState(true);
 
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [selectedIds, setSelectedIds] = useState<string[]>(() => readStoredCompareIds());
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    try {
+      if (selectedIds.length > 0) {
+        sessionStorage.setItem(COMPARE_SESSION_KEY, JSON.stringify(selectedIds));
+      } else {
+        sessionStorage.removeItem(COMPARE_SESSION_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }, [selectedIds]);
 
   useEffect(() => {
     let cancelled = false;
@@ -312,6 +343,17 @@ export const CompareTab: React.FC = () => {
                     </strong>
                   </div>
                 </div>
+
+                {onOpenModel ? (
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    style={{ width: '100%', justifyContent: 'center', marginTop: 4 }}
+                    onClick={() => onOpenModel(model.fullId)}
+                  >
+                    Ver ficha y benchmarks →
+                  </button>
+                ) : null}
               </article>
             );
           })}

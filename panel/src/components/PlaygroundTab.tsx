@@ -218,7 +218,10 @@ export const PlaygroundTab: React.FC = () => {
               )}
             </div>
 
-            <div className="field">
+            <div
+              className="field"
+              style={!supportsReasoning ? { opacity: 0.56 } : undefined}
+            >
               <label htmlFor="pg-reasoning-select" className="field-label">
                 Esfuerzo de razonamiento
                 <InfoTip
@@ -232,15 +235,27 @@ export const PlaygroundTab: React.FC = () => {
               <select
                 id="pg-reasoning-select"
                 className="input"
+                style={!supportsReasoning ? { cursor: 'not-allowed' } : undefined}
                 value={supportsReasoning ? reasoningEffort : 'none'}
                 disabled={sending || !supportsReasoning}
                 onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
               >
-                <option value="none">Desactivado / Estándar</option>
-                <option value="low">Bajo (low)</option>
-                <option value="medium">Medio (medium)</option>
-                <option value="high">Alto (high)</option>
+                {!supportsReasoning ? (
+                  <option value="none">No soportado por este modelo</option>
+                ) : (
+                  <>
+                    <option value="none">Desactivado / Estándar</option>
+                    <option value="low">Bajo (low)</option>
+                    <option value="medium">Medio (medium)</option>
+                    <option value="high">Alto (high)</option>
+                  </>
+                )}
               </select>
+              {!supportsReasoning ? (
+                <span className="field-hint" style={{ fontSize: '0.75rem' }}>
+                  Este modelo no admite ajuste de razonamiento.
+                </span>
+              ) : null}
             </div>
 
             <div className="field">

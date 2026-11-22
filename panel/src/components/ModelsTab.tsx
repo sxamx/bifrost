@@ -517,7 +517,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
         (m.providerName ?? '').toLowerCase().includes(q) ||
         (m.family ?? '').toLowerCase().includes(q)
       );
-    });
+    }).sort((a, b) => Number(Boolean(a.disabledByAdmin)) - Number(Boolean(b.disabledByAdmin)));
   }, [models, providerFilter, capFilter, visibilityFilter, isAdmin, searchQuery]);
 
   /* DETAIL VIEW (HU-14, HU-14b, HU-14c, HU-15, HU-16) */
@@ -740,21 +740,13 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
         </div>
       ) : null}
 
-      <section className="card" style={{ padding: '18px 22px', marginBottom: 20 }}>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 14,
-            flexWrap: 'wrap',
-          }}
-        >
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', flex: 1 }}>
+      <section className="card" style={{ padding: '16px 20px', marginBottom: 20 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
             <input
               type="search"
               className="input"
-              style={{ maxWidth: 340 }}
+              style={{ flex: '1 1 240px', minWidth: 0, maxWidth: 420 }}
               placeholder="Buscar por nombre, provider/model o familia…"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -762,7 +754,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
 
             <select
               className="input"
-              style={{ maxWidth: 230 }}
+              style={{ flex: '0 1 240px', minWidth: 190 }}
               aria-label="Filtrar por proveedor"
               value={providerFilter}
               onChange={(e) => setProviderFilter(e.target.value)}
@@ -776,7 +768,15 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
             </select>
           </div>
 
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+          <div
+            style={{
+              display: 'flex',
+              gap: 10,
+              flexWrap: 'wrap',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+            }}
+          >
             {isAdmin ? (
               <div className="subnav-bar" role="group" aria-label="Filtro por estado de visibilidad">
                 {(

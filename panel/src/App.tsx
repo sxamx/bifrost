@@ -591,6 +591,24 @@ export const App: React.FC = () => {
         <div className="topbar-left">
           <button
             type="button"
+            className="btn btn-secondary btn-sm mobile-menu-trigger"
+            aria-expanded={mobileMenuOpen}
+            aria-controls="bifrost-mobile-nav-drawer"
+            onClick={() => setMobileMenuOpen(true)}
+            aria-label="Abrir menú de navegación"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path
+                d="M4 7h16M4 12h16M4 17h16"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+              />
+            </svg>
+            <span>Menú</span>
+          </button>
+          <button
+            type="button"
             className="brand-home-btn"
             onClick={() => selectSection('overview')}
             title="Ir a Resumen"
@@ -701,24 +719,6 @@ export const App: React.FC = () => {
             >
               <span>{loggingOut ? 'Saliendo…' : 'Salir'}</span>
             </button>
-
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm mobile-menu-trigger"
-              aria-expanded={mobileMenuOpen}
-              aria-controls="bifrost-mobile-nav-drawer"
-              onClick={() => setMobileMenuOpen(true)}
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path
-                  d="M4 7h16M4 12h16M4 17h16"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                />
-              </svg>
-              <span>Menú</span>
-            </button>
           </div>
         </div>
       </header>
@@ -818,7 +818,15 @@ export const App: React.FC = () => {
           />
         ) : null}
 
-        {activeTab === 'compare' ? <CompareTab /> : null}
+        {activeTab === 'compare' ? (
+          <CompareTab
+            onOpenModel={(fullId) => {
+              setTargetModelFullId(fullId);
+              setActiveTab('models');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+          />
+        ) : null}
 
         {activeTab === 'playground' ? <PlaygroundTab /> : null}
 
