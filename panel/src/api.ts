@@ -2256,6 +2256,13 @@ export const api = {
 
   /* System Update Status (HU-41 Capa 1) */
 
+  getHealth(): Promise<{ ok: boolean; version?: string; buildCommit?: string | null }> {
+    return request<{ ok: boolean; version?: string; buildCommit?: string | null }>(
+      '/api/health',
+      { method: 'GET' }
+    );
+  },
+
   getUpdateStatus(refresh?: boolean): Promise<SystemUpdateStatus> {
     const query = refresh ? '?refresh=1' : '';
     return request<SystemUpdateStatus>(`/api/system/update-status${query}`, {

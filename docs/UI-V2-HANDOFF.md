@@ -269,6 +269,8 @@ export interface FreeQuotaStatus {
 
 **Contrato TypeScript en `panel/src/types.ts` (añadido por Backend):**
 ```ts
+export type SystemUpdatePhase = 'idle' | 'pulling' | 'building' | 'restarting' | 'error';
+
 export interface SystemUpdateStatus {
   currentVersion: string;
   currentCommit: string | null;
@@ -281,12 +283,16 @@ export interface SystemUpdateStatus {
   canAutoUpdate: boolean;
   checkedAt: number;
   error?: string | null;
+  updatePhase?: SystemUpdatePhase;
+  updatePhaseMessage?: string | null;
 }
 ```
 
 **Métodos en `api` (`api.ts`):**
+- `api.getHealth(): Promise<{ ok: boolean; version?: string; buildCommit?: string | null }>`  
+  Llama a `GET /api/health` (devuelve estado del servidor, versión actual y `buildCommit` corto del despliegue activo).
 - `api.getUpdateStatus(refresh?: boolean): Promise<SystemUpdateStatus>`  
-  Llama a `GET /api/system/update-status` (o `GET /api/system/update-status?refresh=1` cuando `refresh === true`, saltando la caché de 6 horas del backend).
+  Llama a `GET /api/system/update-status` (o `GET /api/system/update-status?refresh=1` cuando `refresh === true`, saltando la caché de 15 minutos del backend).
 - `api.triggerSystemUpdate(): Promise<{ ok: boolean; mode: 'watchtower' | 'native'; upToDate?: boolean; message: string; restarting: boolean }>`  
   Llama a `POST /api/system/update` (solo `admin`, ejecuta Watchtower en Docker o `git pull` + recompilación y reinicio en `systemd`).
 
@@ -324,8 +330,14 @@ Lista viva de ajustes, añadidos y correcciones que debe implementar la IA de di
    - Cambiar el estado inicial de `inviteEnforceStrict` de `false` a **`true`** (activado por defecto al crear invitaciones).
    - Mostrar etiqueta visual **«Flexible»** cuando `enforceStrictQuota === false` en las tablas de usuarios e invitaciones (actualmente solo muestra «Estricta» si es `true`).
    - *(Menor, `HU-31`)*: En invitaciones no usadas pero ya expiradas, mostrar **«Expirada»** en vez de «Pendiente».
-2. **`OverviewTab.tsx` (`HU-41`)** — *Corregir*:
+2. **`OverviewTab.tsx` y `App.tsx` (`HU-41`)** — *Corregir + Añadir*:
    - Dejar el botón **«Comprobar ahora»** (`api.getUpdateStatus(true)`) siempre accesible para `admin` (actualmente está escondido dentro de `updateStatus?.updateAvailable`, impidiendo forzar la comprobación cuando aún no hay actualización detectada).
+   - **Versión visible del panel:** Mostrar de forma discreta la versión y commit corto actual (ej. `v1.0.0 · 7d26e84`, obtenido de `api.getHealth()` o `updateStatus`) en el footer del sidebar (`App.tsx`) o en `OverviewTab.tsx`.
+   - **Progreso real con fases y auto-recarga al actualizar (`HU-41`):** Al pulsar **«Actualizar ahora»**, guardar `previousCommit` y mostrar una barra/indicador de progreso con fases claras haciendo polling cada 2s a `api.getHealth()` (complementado por `updatePhase` / `updatePhaseMessage` cuando aplique):
+     - `15%`: Enviando orden de actualización…
+     - `45%`: Descargando nueva versión… (o según `updatePhase`: `'pulling'` / `'building'` en entorno nativo)
+     - `75%`: Reiniciando servidor… (cuando `/api/health` se desconecta brevemente durante el reemplazo o `updatePhase === 'restarting'`)
+     - `100%`: Cuando `/api/health` responde `200 OK` con `buildCommit !== previousCommit`, mostrar «¡Actualizado correctamente!» y recargar la página automáticamente (`window.location.reload()`). Si pasan 90s sin cambio de commit (o `updatePhase === 'error'`), mostrar error claro de timeout o fallo.
 3. **`NodesTab.tsx` (`HU-41`)** — *Corregir*:
    - Manejar `node.updateAvailable === null` (cuando el nodo es antiguo y no reporta `commit` o aún no hubo check remoto): mostrar estado neutro o botón **«Actualizar nodo»** en vez de mostrar falsamente «Al día».
 4. **`MetricsTab.tsx` y `ApiKeysTab.tsx` (`HU-37`)** — *Añadir*:

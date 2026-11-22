@@ -93,6 +93,8 @@ import {
   type SystemUpdateStatus,
   UPDATE_CHECK_CACHE_KEY,
   checkSystemUpdate,
+  detectCurrentCommit,
+  detectCurrentVersion,
   isCommitUpToDate,
   triggerSystemUpdate,
 } from './update-checker.js';
@@ -314,7 +316,11 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   // --- Public health & setup status routes ---
 
   app.get('/api/health', (c) => {
-    return c.json({ ok: true });
+    return c.json({
+      ok: true,
+      version: detectCurrentVersion(),
+      buildCommit: detectCurrentCommit(),
+    });
   });
 
   app.get('/api/status', (c) => {

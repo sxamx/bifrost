@@ -89,7 +89,14 @@ describe('Phase 1 Backend Acceptance Tests', () => {
         // Public health check
         const healthRes = await app.request('/api/health');
         assert.equal(healthRes.status, 200);
-        assert.deepEqual(await healthRes.json(), { ok: true });
+        const healthJson = (await healthRes.json()) as {
+          ok: boolean;
+          version?: string;
+          buildCommit?: string | null;
+        };
+        assert.equal(healthJson.ok, true);
+        assert.equal(typeof healthJson.version, 'string');
+        assert.ok('buildCommit' in healthJson);
 
         // Setup initial admin to inspect HU-02 empty-state endpoints
         const setupRes = await app.request('/api/setup', {

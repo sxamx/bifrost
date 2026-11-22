@@ -676,6 +676,8 @@ export type ActiveTab =
 
 /* System Update Status (HU-41 Capa 1) */
 
+export type SystemUpdatePhase = 'idle' | 'pulling' | 'building' | 'restarting' | 'error';
+
 export interface SystemUpdateStatus {
   currentVersion: string;
   currentCommit: string | null;
@@ -687,5 +689,7 @@ export interface SystemUpdateStatus {
   canAutoUpdate: boolean;
   runtimeMode: 'docker' | 'native';
   checkedAt: number;
+  updatePhase?: SystemUpdatePhase;
+  updatePhaseMessage?: string | null;
   error?: string | null;
 }

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, it } from 'node:test';
+import { beforeEach, describe, it } from 'node:test';
 
 import { createApp } from '../core/src/app.js';
 import { openDatabase } from '../core/src/db.js';
@@ -13,8 +13,11 @@ import {
   SystemUpdateError,
   UPDATE_CHECK_TTL_SEC,
   checkSystemUpdate,
+  getCurrentUpdatePhase,
   isCommitUpToDate,
+  resetUpdatePhaseForTests,
   triggerSystemUpdate,
+  type SystemUpdatePhase,
   type SystemUpdateStatus,
 } from '../core/src/update-checker.js';
 
@@ -41,6 +44,10 @@ function makeGitHubCommitResponse(sha: string, message = 'feat: update bifrost',
 }
 
 describe('HU-41: System Update Checker & /api/system/update-status', () => {
+  beforeEach(() => {
+    resetUpdatePhaseForTests();
+  });
+
   it('detects a new commit when latestCommit differs from currentCommit', async () => {
     const db = openDatabase(':memory:');
     let fetchCalls = 0;
@@ -105,7 +112,8 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
     assert.equal(unknownCommit.updateAvailable, false);
   });
 
-  it('caches results in external_cache for 6 hours and bypasses cache when forceRefresh is true', async () => {
+  it('caches results in external_cache for 15 minutes (900s) and bypasses cache when forceRefresh is true', async () => {
+    assert.equal(UPDATE_CHECK_TTL_SEC, 900);
     const db = openDatabase(':memory:');
     let fetchCalls = 0;
     const baseMs = 1_700_000_000_000;
@@ -124,7 +132,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
     assert.equal(fetchCalls, 1);
     assert.equal(first.latestCommit, 'sha1000000000000000000000000000000000000');
 
-    // Within 6 hours -> cache hit
+    // Within 15 minutes -> cache hit
     const cached = await checkSystemUpdate({
       db,
       currentCommit: '0000000',
@@ -145,7 +153,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
     assert.equal(fetchCalls, 2);
     assert.equal(refreshed.latestCommit, 'sha2000000000000000000000000000000000000');
 
-    // After 6 hours -> cache expired, fetches again
+    // After 15 minutes -> cache expired, fetches again
     const expired = await checkSystemUpdate({
       db,
       currentCommit: '0000000',
@@ -790,4 +798,131 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
     assert.equal(listAfterJson.nodes[0]!.commit, null);
     assert.equal(listAfterJson.nodes[0]!.updateAvailable, null);
   });
+
+  it('exposes version and buildCommit on GET /api/health while preserving ok: true', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+    const app = createApp({ db, masterKey });
+
+    const prevCommit = process.env.BIFROST_BUILD_COMMIT;
+    try {
+      process.env.BIFROST_BUILD_COMMIT = 'deadbeef1234';
+      const res = await app.request('http://localhost/api/health');
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as {
+        ok: boolean;
+        version: string;
+        buildCommit: string | null;
+      };
+      assert.equal(body.ok, true);
+      assert.equal(typeof body.version, 'string');
+      assert.ok(body.version.length > 0);
+      assert.equal(body.buildCommit, 'deadbeef1234');
+    } finally {
+      if (prevCommit === undefined) delete process.env.BIFROST_BUILD_COMMIT;
+      else process.env.BIFROST_BUILD_COMMIT = prevCommit;
+    }
+  });
+
+  it('tracks live updatePhase transitions in triggerSystemUpdate (native + watchtower) and exposes them in checkSystemUpdate', async () => {
+    const db = openDatabase(':memory:');
+
+    // Starts idle
+    assert.deepEqual(getCurrentUpdatePhase(), { phase: 'idle', message: null });
+
+    const initialStatus = await checkSystemUpdate({
+      db,
+      currentCommit: '1111111',
+      nowMs: 1_700_000_000_000,
+      fetchImpl: async () => makeGitHubCommitResponse('2222222222222222222222222222222222222222'),
+    });
+    assert.equal(initialStatus.updatePhase, 'idle');
+    assert.equal(initialStatus.updatePhaseMessage, null);
+
+    // Native mode transitions: pulling -> building -> restarting
+    const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-phase-native-'));
+    fs.mkdirSync(path.join(tmpRepo, '.git'));
+    const observedPhases: SystemUpdatePhase[] = [];
+
+    try {
+      await triggerSystemUpdate({
+        runtimeMode: 'native',
+        watchtowerUrl: '',
+        repoDir: tmpRepo,
+        runCommand: async (cmd) => {
+          observedPhases.push(getCurrentUpdatePhase().phase);
+          if (cmd === 'git') {
+            // Even a cached checkSystemUpdate reflects the live phase
+            const cachedDuringPull = await checkSystemUpdate({
+              db,
+              currentCommit: '1111111',
+              nowMs: 1_700_000_010_000,
+              fetchImpl: async () => {
+                throw new Error('should not hit network while cached');
+              },
+            });
+            assert.equal(cachedDuringPull.updatePhase, 'pulling');
+            assert.ok(cachedDuringPull.updatePhaseMessage);
+          }
+        },
+        onRestart: () => {
+          observedPhases.push(getCurrentUpdatePhase().phase);
+        },
+      });
+      assert.deepEqual(observedPhases, ['pulling', 'building', 'restarting']);
+      assert.equal(getCurrentUpdatePhase().phase, 'restarting');
+
+      // Native failure -> error phase
+      resetUpdatePhaseForTests();
+      await assert.rejects(
+        () =>
+          triggerSystemUpdate({
+            runtimeMode: 'native',
+            watchtowerUrl: '',
+            repoDir: tmpRepo,
+            runCommand: async () => {
+              throw new Error('merge conflict');
+            },
+          }),
+        (err: unknown) => err instanceof SystemUpdateError && err.status === 500,
+      );
+      assert.equal(getCurrentUpdatePhase().phase, 'error');
+      assert.match(getCurrentUpdatePhase().message ?? '', /merge conflict/);
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+
+    // Watchtower mode: sets restarting while triggering
+    resetUpdatePhaseForTests();
+    let phaseDuringWtFetch: SystemUpdatePhase | null = null;
+    let messageDuringWtFetch: string | null = null;
+    await triggerSystemUpdate({
+      runtimeMode: 'docker',
+      watchtowerUrl: 'http://watchtower:8080',
+      fetchImpl: async () => {
+        const snap = getCurrentUpdatePhase();
+        phaseDuringWtFetch = snap.phase;
+        messageDuringWtFetch = snap.message;
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+    assert.equal(phaseDuringWtFetch, 'restarting');
+    assert.equal(messageDuringWtFetch, 'Watchtower update triggered. Container is restarting…');
+    assert.equal(getCurrentUpdatePhase().phase, 'restarting');
+
+    // Watchtower unexpected error -> error phase
+    resetUpdatePhaseForTests();
+    await assert.rejects(
+      () =>
+        triggerSystemUpdate({
+          runtimeMode: 'docker',
+          watchtowerUrl: 'http://watchtower:8080',
+          fetchImpl: async () => new Response('bad gateway', { status: 502 }),
+        }),
+      (err: unknown) => err instanceof SystemUpdateError && err.status === 502,
+    );
+    assert.equal(getCurrentUpdatePhase().phase, 'error');
+    assert.match(getCurrentUpdatePhase().message ?? '', /502/);
+  });
 });
+

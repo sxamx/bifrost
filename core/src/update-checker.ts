@@ -9,8 +9,35 @@ import { readExternalCache, writeExternalCache, type FetchLike } from './catalog
 const execFileAsync = promisify(execFile);
 
 export const UPDATE_CHECK_CACHE_KEY = 'system_update_status';
-export const UPDATE_CHECK_TTL_SEC = 21600; // 6 hours
+export const UPDATE_CHECK_TTL_SEC = 900; // 15 minutes
 export const GITHUB_COMMITS_MAIN_URL = 'https://api.github.com/repos/sxamx/bifrost/commits/main';
+
+export type SystemUpdatePhase = 'idle' | 'pulling' | 'building' | 'restarting' | 'error';
+
+export interface SystemUpdatePhaseState {
+  phase: SystemUpdatePhase;
+  message: string | null;
+}
+
+let currentUpdatePhase: SystemUpdatePhase = 'idle';
+let currentUpdatePhaseMessage: string | null = null;
+
+function setUpdatePhase(phase: SystemUpdatePhase, message: string | null = null): void {
+  currentUpdatePhase = phase;
+  currentUpdatePhaseMessage = message;
+}
+
+export function getCurrentUpdatePhase(): SystemUpdatePhaseState {
+  return {
+    phase: currentUpdatePhase,
+    message: currentUpdatePhaseMessage,
+  };
+}
+
+export function resetUpdatePhaseForTests(): void {
+  currentUpdatePhase = 'idle';
+  currentUpdatePhaseMessage = null;
+}
 
 export interface SystemUpdateStatus {
   currentVersion: string;
@@ -23,6 +50,8 @@ export interface SystemUpdateStatus {
   canAutoUpdate: boolean;
   runtimeMode: 'docker' | 'native';
   checkedAt: number;
+  updatePhase: SystemUpdatePhase;
+  updatePhaseMessage: string | null;
   error?: string | null;
 }
 
@@ -156,6 +185,8 @@ export async function checkSystemUpdate(
             currentCommit && cached.data.latestCommit
               ? !isCommitUpToDate(currentCommit, cached.data.latestCommit)
               : false,
+          updatePhase: currentUpdatePhase,
+          updatePhaseMessage: currentUpdatePhaseMessage,
         };
       }
     } catch {
@@ -185,6 +216,8 @@ export async function checkSystemUpdate(
         canAutoUpdate,
         runtimeMode,
         checkedAt: nowMs,
+        updatePhase: currentUpdatePhase,
+        updatePhaseMessage: currentUpdatePhaseMessage,
         error: `GitHub API returned HTTP ${response.status}`,
       };
     }
@@ -228,6 +261,8 @@ export async function checkSystemUpdate(
       canAutoUpdate,
       runtimeMode,
       checkedAt: nowMs,
+      updatePhase: currentUpdatePhase,
+      updatePhaseMessage: currentUpdatePhaseMessage,
       error: null,
     };
 
@@ -251,6 +286,8 @@ export async function checkSystemUpdate(
       canAutoUpdate,
       runtimeMode,
       checkedAt: nowMs,
+      updatePhase: currentUpdatePhase,
+      updatePhaseMessage: currentUpdatePhaseMessage,
       error: message || 'Failed to check for updates',
     };
   }
@@ -354,6 +391,8 @@ export async function triggerSystemUpdate(
       headers.Authorization = `Bearer ${watchtowerToken}`;
     }
 
+    setUpdatePhase('restarting', 'Watchtower update triggered. Container is restarting…');
+
     let response: Response;
     try {
       response = await fetchImpl(endpoint, {
@@ -377,11 +416,15 @@ export async function triggerSystemUpdate(
           restarting: true,
         };
       }
-      throw new SystemUpdateError(`Failed to reach Watchtower at ${endpoint}: ${msg}`, 502);
+      const errMsg = `Failed to reach Watchtower at ${endpoint}: ${msg}`;
+      setUpdatePhase('error', errMsg);
+      throw new SystemUpdateError(errMsg, 502);
     }
 
     if (!response.ok) {
-      throw new SystemUpdateError(`Watchtower returned HTTP ${response.status}`, 502);
+      const errMsg = `Watchtower returned HTTP ${response.status}`;
+      setUpdatePhase('error', errMsg);
+      throw new SystemUpdateError(errMsg, 502);
     }
 
     return {
@@ -396,12 +439,18 @@ export async function triggerSystemUpdate(
   // Native mode: git pull --ff-only && npm run build + systemd restart
   const runCmd = options.runCommand ?? defaultRunCommand;
   try {
+    setUpdatePhase('pulling', 'Pulling latest changes from GitHub…');
     await runCmd('git', ['pull', '--ff-only'], repoDir);
+    setUpdatePhase('building', 'Building Core and Panel…');
     await runCmd('npm', ['run', 'build'], repoDir);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    throw new SystemUpdateError(`Native update failed: ${msg}`, 500);
+    const errMsg = `Native update failed: ${msg}`;
+    setUpdatePhase('error', errMsg);
+    throw new SystemUpdateError(errMsg, 500);
   }
+
+  setUpdatePhase('restarting', 'Updated repository and rebuilt Core. Restarting service…');
 
   if (options.onRestart) {
     options.onRestart();
