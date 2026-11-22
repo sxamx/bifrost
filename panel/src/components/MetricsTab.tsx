@@ -36,16 +36,36 @@ const THROUGHPUT_SERIES = [
 ];
 
 function formatBucketTimeLabel(ts: string | number, label?: string): string {
-  if (label) return label;
+  const raw = label && label.trim().length > 0 ? label.trim() : null;
+  if (raw) {
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(raw)) {
+      return `${raw.slice(5, 10)} ${raw.slice(11, 16)} UTC`;
+    }
+    return raw;
+  }
   if (typeof ts === 'number' && Number.isFinite(ts)) {
     const ms = ts < 1_000_000_000_000 ? ts * 1000 : ts;
     return new Date(ms).toISOString().replace('T', ' ').slice(5, 16) + ' UTC';
   }
   const str = String(ts);
-  if (str.includes('T')) {
-    return str.replace('T', ' ').slice(5, 16) + ' UTC';
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(str)) {
+    return `${str.slice(5, 10)} ${str.slice(11, 16)} UTC`;
   }
   return str || '—';
+}
+
+function formatLatencyAxis(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0ms';
+  if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)}m`;
+  if (ms >= 1_000) return `${(ms / 1_000).toFixed(ms >= 10_000 ? 0 : 1)}s`;
+  return `${Math.round(ms)}ms`;
+}
+
+function formatLatencyValue(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0 ms';
+  if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)} min`;
+  if (ms >= 10_000) return `${(ms / 1_000).toFixed(1)} s`;
+  return `${Math.round(ms).toLocaleString('es-ES')} ms`;
 }
 
 function classifyUptimeBar(uptimePct: number | null): 'notraffic' | 'ok' | 'partial' | 'err' {
@@ -97,6 +117,9 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
   const [activityRange, setActivityRange] = useState<ActivityRange>('7d');
   const [activityGroupBy, setActivityGroupBy] = useState<ActivityGroupBy>('model');
   const [selectedEntityFilter, setSelectedEntityFilter] = useState<string>('ALL');
+  const [speedSort, setSpeedSort] = useState<
+    'samples_desc' | 'tps_desc' | 'ttft_asc' | 'ttft_desc'
+  >('samples_desc');
   const [activityData, setActivityData] = useState<ActivityMetricsData>({
     range: '7d',
     groupBy: 'model',
@@ -170,10 +193,26 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
     void loadActivity();
   }, [loadActivity]);
 
+  const sortedUsedSpeedModels = useMemo(() => {
+    const used = speedData.models.filter((m) => m.sampleCount > 0);
+    return [...used].sort((a, b) => {
+      if (speedSort === 'tps_desc') return b.tokensPerSec.p50 - a.tokensPerSec.p50;
+      if (speedSort === 'ttft_asc') return a.ttftMs.p50 - b.ttftMs.p50;
+      if (speedSort === 'ttft_desc') return b.ttftMs.p50 - a.ttftMs.p50;
+      return b.sampleCount - a.sampleCount;
+    });
+  }, [speedData.models, speedSort]);
+
+  const nonEmptyActivityItems = useMemo(() => {
+    return [...activityData.items]
+      .filter((it) => it.totalTokens > 0)
+      .sort((a, b) => b.totalTokens - a.totalTokens);
+  }, [activityData.items]);
+
   const visibleActivityItems = useMemo(() => {
-    if (selectedEntityFilter === 'ALL') return activityData.items;
-    return activityData.items.filter((it) => it.key === selectedEntityFilter);
-  }, [activityData.items, selectedEntityFilter]);
+    if (selectedEntityFilter === 'ALL') return nonEmptyActivityItems;
+    return nonEmptyActivityItems.filter((it) => it.key === selectedEntityFilter);
+  }, [nonEmptyActivityItems, selectedEntityFilter]);
 
   const displayedTotals = useMemo(() => {
     if (selectedEntityFilter === 'ALL') return activityData.totals;
@@ -594,7 +633,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                         fill="var(--fg-3)"
                         fontFamily="var(--font-mono)"
                       >
-                        {val}ms
+                        {formatLatencyAxis(val)}
                       </text>
                     </g>
                   );
@@ -749,7 +788,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                         {serie.label}
                       </span>
                       <span className="mono" style={{ fontWeight: 600 }}>
-                        {Math.round(activeLatencyBucket[serie.key]).toLocaleString('es-ES')} ms
+                        {formatLatencyValue(activeLatencyBucket[serie.key])}
                       </span>
                     </div>
                   ))}
@@ -795,7 +834,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                     </span>
                     <span className="p-right">
                       <span>{modeLabel}</span>{' '}
-                      <strong>{liveVal.toLocaleString('es-ES')} ms</strong>
+                      <strong>{formatLatencyValue(liveVal)}</strong>
                     </span>
                   </div>
                 );
@@ -810,11 +849,28 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
         <div className="card-header">
           <h2 id="speed-section-title" className="card-title">
             Velocidad por modelo (Throughput tok/s y Latencia TTFT P50–P99) y Caché
-            <InfoTip text="Pasa el cursor sobre cualquier tarjeta de modelo para inspeccionar simultáneamente los 5 percentiles (P50, P75, P90, P95, P99) de Time to First Token y velocidad de generación." />
+            <InfoTip text="Muestra únicamente modelos con tráfico registrado. Pasa el cursor sobre cualquier tarjeta para ver todos los percentiles o haz clic para abrir su ficha." />
           </h2>
+          {sortedUsedSpeedModels.length > 1 ? (
+            <select
+              aria-label="Ordenar modelos por métrica"
+              className="select-compact"
+              value={speedSort}
+              onChange={(e) =>
+                setSpeedSort(
+                  e.target.value as 'samples_desc' | 'tps_desc' | 'ttft_asc' | 'ttft_desc'
+                )
+              }
+            >
+              <option value="samples_desc">Más peticiones (mayor a menor)</option>
+              <option value="tps_desc">Mayor velocidad (P50 tok/s)</option>
+              <option value="ttft_asc">Menor latencia TTFT (P50)</option>
+              <option value="ttft_desc">Mayor latencia TTFT (P50)</option>
+            </select>
+          ) : null}
         </div>
 
-        {speedData.models.length === 0 && speedData.cacheByProvider.length === 0 ? (
+        {sortedUsedSpeedModels.length === 0 && speedData.cacheByProvider.length === 0 ? (
           <div className="empty-state" style={{ padding: '24px 16px' }}>
             <p className="field-hint">
               Aún no hay mediciones de TTFT, tokens/s ni caché registradas.
@@ -822,12 +878,12 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-            {speedData.models.length > 0 ? (
+            {sortedUsedSpeedModels.length > 0 ? (
               <div
                 style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
                 onMouseLeave={() => setHoveredSpeedModel(null)}
               >
-                {speedData.models.map((m) => {
+                {sortedUsedSpeedModels.map((m) => {
                   const isHovered = hoveredSpeedModel?.id === m.id;
                   return (
                     <div
@@ -1081,15 +1137,15 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
               {isAdmin ? <option value="user">Agrupar por usuario</option> : null}
             </select>
 
-            {activityData.items.length > 1 ? (
+            {nonEmptyActivityItems.length > 1 ? (
               <select
                 aria-label="Filtrar elemento específico"
                 className="select-compact"
                 value={selectedEntityFilter}
                 onChange={(e) => setSelectedEntityFilter(e.target.value)}
               >
-                <option value="ALL">Todos ({activityData.items.length})</option>
-                {activityData.items.map((it) => (
+                <option value="ALL">Todos ({nonEmptyActivityItems.length})</option>
+                {nonEmptyActivityItems.map((it) => (
                   <option key={it.key} value={it.key}>
                     {it.label}
                   </option>
@@ -1211,8 +1267,11 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                 const yComp = yPrompt - hComp;
                 const yReas = yComp - hReas;
 
+                const maxLabelChars = Math.max(4, Math.min(14, Math.floor((slotW - 10) / 6.4)));
                 const shortLabel =
-                  item.label.length > 14 ? `${item.label.slice(0, 13)}…` : item.label;
+                  item.label.length > maxLabelChars
+                    ? `${item.label.slice(0, Math.max(3, maxLabelChars - 1))}…`
+                    : item.label;
                 const isColHovered = hoveredActivityIndex === idx;
 
                 const canNavigateBar =
