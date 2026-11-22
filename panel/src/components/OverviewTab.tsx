@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { copyTextToClipboard } from '../clipboard';
 import type {
@@ -178,11 +178,22 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   const [copiedEndpoint, setCopiedEndpoint] = useState(false);
 
   // HU-41 System Update State (admin only)
+  const [healthInfo, setHealthInfo] = useState<{
+    version?: string;
+    buildCommit?: string | null;
+  } | null>(null);
   const [updateStatus, setUpdateStatus] = useState<SystemUpdateStatus | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [triggeringUpdate, setTriggeringUpdate] = useState(false);
   const [updateFeedback, setUpdateFeedback] = useState<string | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<{
+    active: boolean;
+    pct: number;
+    label: string;
+    isError?: boolean;
+  } | null>(null);
   const [copiedUpdateCmd, setCopiedUpdateCmd] = useState(false);
+  const updatePollTimerRef = useRef<number | null>(null);
 
   const isAdmin = user.role === 'admin';
   const effectiveProvidersCount = providersLoaded
@@ -211,18 +222,31 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   }, [providers.length, keysCount]);
 
   useEffect(() => {
-    if (!isAdmin) return;
     let cancelled = false;
     api
-      .getUpdateStatus(false)
-      .then((st) => {
-        if (!cancelled) setUpdateStatus(st);
+      .getHealth()
+      .then((h) => {
+        if (!cancelled) setHealthInfo({ version: h.version, buildCommit: h.buildCommit });
       })
       .catch(() => {
-        // Silent if backend does not expose or offline
+        // ignore
       });
+    if (isAdmin) {
+      api
+        .getUpdateStatus(false)
+        .then((st) => {
+          if (!cancelled) setUpdateStatus(st);
+        })
+        .catch(() => {
+          // Silent if backend does not expose or offline
+        });
+    }
     return () => {
       cancelled = true;
+      if (updatePollTimerRef.current !== null) {
+        window.clearInterval(updatePollTimerRef.current);
+        updatePollTimerRef.current = null;
+      }
     };
   }, [isAdmin]);
 
@@ -245,19 +269,156 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
 
   async function handleTriggerUpdateNow() {
     if (!isAdmin) return;
+    if (updatePollTimerRef.current !== null) {
+      window.clearInterval(updatePollTimerRef.current);
+      updatePollTimerRef.current = null;
+    }
+
+    const previousCommit = updateStatus?.currentCommit ?? healthInfo?.buildCommit ?? null;
+    const expectedLatest = updateStatus?.latestCommit ?? null;
+
     setTriggeringUpdate(true);
     setUpdateFeedback(null);
+    setUpdateProgress({
+      active: true,
+      pct: 15,
+      label: 'Enviando orden de actualización…',
+    });
+
     try {
       const res = await api.triggerSystemUpdate();
-      setUpdateFeedback(
-        res.message || 'Actualización iniciada. El servicio se reiniciará en unos instantes.'
-      );
+      if (res.upToDate) {
+        setUpdateProgress(null);
+        setTriggeringUpdate(false);
+        setUpdateFeedback(res.message || 'Bifrost ya está al día.');
+        return;
+      }
+
+      setUpdateProgress({
+        active: true,
+        pct: 35,
+        label: res.message || 'Descargando nueva versión…',
+      });
+
+      const startedAt = Date.now();
+      let sawDisconnect = false;
+
+      const pollOnce = async () => {
+        if (Date.now() - startedAt > 90_000) {
+          if (updatePollTimerRef.current !== null) {
+            window.clearInterval(updatePollTimerRef.current);
+            updatePollTimerRef.current = null;
+          }
+          setTriggeringUpdate(false);
+          setUpdateProgress({
+            active: false,
+            pct: 100,
+            label: 'Tiempo de espera agotado (90s). Recarga manualmente o revisa los logs del servidor.',
+            isError: true,
+          });
+          return;
+        }
+
+        try {
+          const [hRes, stRes] = await Promise.allSettled([
+            api.getHealth(),
+            api.getUpdateStatus(false),
+          ]);
+
+          if (hRes.status === 'rejected') {
+            sawDisconnect = true;
+            setUpdateProgress({
+              active: true,
+              pct: 75,
+              label: 'Reiniciando servidor…',
+            });
+            return;
+          }
+
+          const liveCommit = hRes.value.buildCommit ?? null;
+          const liveStatus = stRes.status === 'fulfilled' ? stRes.value : null;
+          if (liveStatus) setUpdateStatus(liveStatus);
+
+          const commitChanged =
+            Boolean(liveCommit) &&
+            ((Boolean(previousCommit) && liveCommit !== previousCommit) ||
+              (sawDisconnect && (!expectedLatest || liveCommit === expectedLatest)));
+
+          if (commitChanged) {
+            if (updatePollTimerRef.current !== null) {
+              window.clearInterval(updatePollTimerRef.current);
+              updatePollTimerRef.current = null;
+            }
+            setUpdateProgress({
+              active: true,
+              pct: 100,
+              label: '¡Actualizado correctamente! Recargando…',
+            });
+            window.setTimeout(() => window.location.reload(), 1200);
+            return;
+          }
+
+          const phase = liveStatus?.updatePhase;
+          const phaseMsg = liveStatus?.updatePhaseMessage;
+          if (phase === 'error') {
+            if (updatePollTimerRef.current !== null) {
+              window.clearInterval(updatePollTimerRef.current);
+              updatePollTimerRef.current = null;
+            }
+            setTriggeringUpdate(false);
+            setUpdateProgress({
+              active: false,
+              pct: 100,
+              label: phaseMsg || 'Error durante la actualización.',
+              isError: true,
+            });
+          } else if (phase === 'pulling') {
+            setUpdateProgress({
+              active: true,
+              pct: 45,
+              label: phaseMsg || 'Descargando nueva versión…',
+            });
+          } else if (phase === 'building') {
+            setUpdateProgress({
+              active: true,
+              pct: 60,
+              label: phaseMsg || 'Compilando nueva versión…',
+            });
+          } else if (phase === 'restarting' || sawDisconnect) {
+            setUpdateProgress({
+              active: true,
+              pct: 75,
+              label: phaseMsg || 'Reiniciando servidor…',
+            });
+          } else {
+            setUpdateProgress((prev) => ({
+              active: true,
+              pct: Math.min(70, (prev?.pct ?? 35) + 5),
+              label: phaseMsg || prev?.label || 'Descargando nueva versión…',
+            }));
+          }
+        } catch {
+          sawDisconnect = true;
+          setUpdateProgress({
+            active: true,
+            pct: 75,
+            label: 'Reiniciando servidor…',
+          });
+        }
+      };
+
+      updatePollTimerRef.current = window.setInterval(() => {
+        void pollOnce();
+      }, 2000);
     } catch (err) {
-      setUpdateFeedback(
-        err instanceof Error ? err.message : 'No se pudo iniciar la actualización automática.'
-      );
-    } finally {
       setTriggeringUpdate(false);
+      setUpdateProgress({
+        active: false,
+        pct: 100,
+        label:
+          err instanceof Error ? err.message : 'No se pudo iniciar la actualización automática.',
+        isError: true,
+      });
     }
   }
 
@@ -498,83 +659,133 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
         </article>
       </section>
 
-      {/* HU-41 System Update Banner (admin only) */}
-      {isAdmin && updateStatus?.updateAvailable ? (
-        <section className="card" aria-label="Actualización disponible de Bifrost">
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: 14,
-              flexWrap: 'wrap',
-            }}
-          >
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                <span className="status-badge active">Actualización disponible</span>
-                <strong style={{ fontSize: '0.94rem' }}>
-                  {updateStatus.latestCommitMessage || 'Nueva versión de Bifrost disponible'}
-                </strong>
-                {updateStatus.latestCommitUrl ? (
-                  <a
-                    href={updateStatus.latestCommitUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="meta-tag accent mono"
-                    style={{ textDecoration: 'none' }}
-                  >
-                    {updateStatus.latestCommit?.slice(0, 7) || 'commit'} ↗
-                  </a>
+      {/* HU-41 System Update Card (always accessible for admin) */}
+      {isAdmin ? (
+        <section className="card" aria-label="Estado de versión y actualizaciones de Bifrost">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 14,
+                flexWrap: 'wrap',
+              }}
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  {updateStatus?.updateAvailable ? (
+                    <span className="status-badge active">Actualización disponible</span>
+                  ) : (
+                    <span className="meta-tag verified">Al día</span>
+                  )}
+                  <strong style={{ fontSize: '0.92rem' }}>
+                    {updateStatus?.updateAvailable
+                      ? updateStatus.latestCommitMessage || 'Nueva versión de Bifrost disponible'
+                      : 'Sistema Bifrost actualizado'}
+                  </strong>
+                  {(updateStatus?.currentVersion || healthInfo?.version) ? (
+                    <span className="meta-tag mono">
+                      v{updateStatus?.currentVersion || healthInfo?.version}
+                      {(updateStatus?.currentCommit || healthInfo?.buildCommit)
+                        ? ` · ${(updateStatus?.currentCommit || healthInfo?.buildCommit)?.slice(0, 7)}`
+                        : ''}
+                    </span>
+                  ) : null}
+                  {updateStatus?.updateAvailable && updateStatus.latestCommitUrl ? (
+                    <a
+                      href={updateStatus.latestCommitUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="meta-tag accent mono"
+                      style={{ textDecoration: 'none' }}
+                    >
+                      → {updateStatus.latestCommit?.slice(0, 7) || 'commit'} ↗
+                    </a>
+                  ) : null}
+                </div>
+                {updateFeedback && !updateProgress ? (
+                  <span className="field-hint" style={{ color: 'var(--ok)' }}>
+                    {updateFeedback}
+                  </span>
                 ) : null}
               </div>
-              {updateFeedback ? (
-                <span className="field-hint" style={{ color: 'var(--ok)' }}>
-                  {updateFeedback}
-                </span>
-              ) : null}
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  disabled={checkingUpdate || triggeringUpdate}
+                  onClick={() => void handleCheckUpdateNow()}
+                >
+                  {checkingUpdate ? 'Comprobando…' : 'Comprobar ahora'}
+                </button>
+                {updateStatus?.updateAvailable ? (
+                  updateStatus.canAutoUpdate ? (
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      disabled={triggeringUpdate}
+                      onClick={() => void handleTriggerUpdateNow()}
+                    >
+                      {triggeringUpdate ? 'Actualizando…' : 'Actualizar ahora'}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      onClick={() => {
+                        const cmd =
+                          updateStatus.runtimeMode === 'docker'
+                            ? 'docker compose pull && docker compose up -d'
+                            : 'git pull && npm run build && systemctl restart bifrost';
+                        void copyTextToClipboard(cmd).then((ok) => {
+                          if (!ok) return;
+                          setCopiedUpdateCmd(true);
+                          window.setTimeout(() => setCopiedUpdateCmd(false), 2200);
+                        });
+                      }}
+                    >
+                      {copiedUpdateCmd
+                        ? '✓ Comando copiado'
+                        : `Copiar comando (${updateStatus.runtimeMode})`}
+                    </button>
+                  )
+                ) : null}
+              </div>
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                disabled={checkingUpdate}
-                onClick={() => void handleCheckUpdateNow()}
-              >
-                {checkingUpdate ? 'Comprobando…' : 'Comprobar ahora'}
-              </button>
-              {updateStatus.canAutoUpdate ? (
-                <button
-                  type="button"
-                  className="btn btn-primary btn-sm"
-                  disabled={triggeringUpdate}
-                  onClick={() => void handleTriggerUpdateNow()}
-                >
-                  {triggeringUpdate ? 'Actualizando…' : 'Actualizar ahora'}
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="btn btn-primary btn-sm"
-                  onClick={() => {
-                    const cmd =
-                      updateStatus.runtimeMode === 'docker'
-                        ? 'docker compose pull && docker compose up -d'
-                        : 'git pull && npm run build && systemctl restart bifrost';
-                    void copyTextToClipboard(cmd).then((ok) => {
-                      if (!ok) return;
-                      setCopiedUpdateCmd(true);
-                      window.setTimeout(() => setCopiedUpdateCmd(false), 2200);
-                    });
+            {updateProgress ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 10,
+                    fontSize: '0.82rem',
                   }}
                 >
-                  {copiedUpdateCmd
-                    ? '✓ Comando copiado'
-                    : `Copiar comando (${updateStatus.runtimeMode})`}
-                </button>
-              )}
-            </div>
+                  <span style={{ color: updateProgress.isError ? 'var(--err)' : 'var(--fg-2)' }}>
+                    {updateProgress.label}
+                  </span>
+                  {!updateProgress.isError ? (
+                    <strong className="mono" style={{ color: 'var(--accent)' }}>
+                      {updateProgress.pct}%
+                    </strong>
+                  ) : null}
+                </div>
+                <div className="quota-track" style={{ height: 6 }}>
+                  <div
+                    className={`quota-fill ${updateProgress.isError ? 'err' : 'ok'}`}
+                    style={{
+                      width: `${updateProgress.pct}%`,
+                      transition: 'width 0.35s ease',
+                    }}
+                  />
+                </div>
+              </div>
+            ) : null}
           </div>
         </section>
       ) : null}
