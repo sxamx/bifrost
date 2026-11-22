@@ -996,8 +996,47 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
 
           {catalogLoading && catalog.manifests.length === 0 ? (
             <div className="card">
-              <p className="field-hint">Consultando fichas disponibles en bifrost-providers…</p>
+              <p className="field-hint">Consultando fichas disponibles en los repositorios…</p>
             </div>
+          ) : (catalog.enabledSourcesCount ?? sources.filter((s) => s.enabled).length) === 0 ? (
+            (() => {
+              const officialSource = sources.find((s) => s.isOfficial) ?? null;
+              return (
+                <div className="card">
+                  <div className="empty-state">
+                    <h3 style={{ fontSize: '1.05rem' }}>
+                      Catálogo remoto desactivado por defecto (opt-in)
+                    </h3>
+                    <p className="field-hint" style={{ maxWidth: 500 }}>
+                      Por privacidad, Bifrost no consulta repositorios externos hasta que actives
+                      uno. Activa el repositorio oficial recomendado o añade tu propio catálogo
+                      HTTPS arriba; también puedes importar fichas JSON locales.
+                    </p>
+                    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'center' }}>
+                      {officialSource ? (
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={togglingSourceId === officialSource.id}
+                          onClick={() => void handleToggleSource(officialSource)}
+                        >
+                          {togglingSourceId === officialSource.id
+                            ? 'Activando…'
+                            : `Activar repositorio oficial (${officialSource.name})`}
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => setSubView('local-json')}
+                      >
+                        Subir ficha JSON local
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()
           ) : filteredManifests.length === 0 ? (
             <div className="card">
               <div className="empty-state">

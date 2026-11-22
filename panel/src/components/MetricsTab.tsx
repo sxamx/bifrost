@@ -369,6 +369,10 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
             {freeQuota.providers.map((pq) => {
               const unitTxt = pq.unit === 'requests' ? 'pet.' : 'tok';
               const winTxt = pq.windowLabel || formatQuotaWindow(pq.activeWindow);
+              const confidenceTxt =
+                pq.effectiveLimit === null && pq.recent429Count7d === 0
+                  ? 'Sin límite fijo'
+                  : formatQuotaConfidence(pq.confidence);
               return (
                 <div
                   key={pq.providerId}
@@ -396,12 +400,22 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                     <span className="meta-tag mono">{winTxt}</span>
                   </div>
                   <div className="mono" style={{ fontSize: '0.84rem', color: 'var(--sub)' }}>
-                    <strong style={{ color: 'var(--fg)' }}>
-                      {pq.usedInWindow.toLocaleString('es-ES')}
-                    </strong>
-                    {pq.effectiveLimit
-                      ? ` / ${pq.effectiveLimit.toLocaleString('es-ES')} ${unitTxt}`
-                      : ` ${unitTxt}`}
+                    {pq.unit === 'none' ? (
+                      <strong style={{ color: 'var(--fg)' }}>
+                        {pq.rateLimitKind === 'concurrency'
+                          ? 'Límite por concurrencia'
+                          : 'Sin límite de cuota'}
+                      </strong>
+                    ) : (
+                      <>
+                        <strong style={{ color: 'var(--fg)' }}>
+                          {pq.usedInWindow.toLocaleString('es-ES')}
+                        </strong>
+                        {pq.effectiveLimit !== null
+                          ? ` / ${pq.effectiveLimit.toLocaleString('es-ES')} ${unitTxt}`
+                          : ` ${unitTxt} usados`}
+                      </>
+                    )}
                   </div>
                   <div
                     style={{
@@ -415,7 +429,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
                     }}
                   >
                     <span>
-                      {formatQuotaConfidence(pq.confidence)} · {pq.usableKeysCount}{' '}
+                      {confidenceTxt} · {pq.usableKeysCount}{' '}
                       {pq.usableKeysCount === 1 ? 'clave' : 'claves'}
                     </span>
                     {pq.recent429Count7d > 0 ? (
