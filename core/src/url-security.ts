@@ -240,6 +240,7 @@ export function validateProviderTargetUrl(
   rawUrl: string,
   packageType: ProviderPackageType,
   fieldLabel: 'baseUrl' | 'adapterUrl' = 'baseUrl',
+  options?: { allowLoopback?: boolean },
 ): UrlSecurityValidationResult {
   if (typeof rawUrl !== 'string' || rawUrl.trim().length === 0 || /\s/.test(rawUrl)) {
     return { valid: false, error: `${fieldLabel} must be a non-empty URL without whitespace.` };
@@ -272,8 +273,10 @@ export function validateProviderTargetUrl(
   }
 
   if (packageType === 'official-json') {
+    const loopbackAllowed =
+      options?.allowLoopback !== undefined ? options.allowLoopback : allowLocalOfficialUpstreams();
     if (hostClass.kind === 'loopback') {
-      if (!allowLocalOfficialUpstreams()) {
+      if (!loopbackAllowed) {
         return {
           valid: false,
           error: `${fieldLabel} for official-json providers cannot target loopback addresses in production.`,

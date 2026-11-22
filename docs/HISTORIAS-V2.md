@@ -1,4 +1,4 @@
-# Historias de Usuario — V2 (`HU-27` a `HU-41`)
+# Historias de Usuario — V2 (`HU-27` a `HU-42`)
 
 Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`). Todas las historias siguen el formato de criterios de aceptación verificables y mantienen las garantías de seguridad y arquitectura descritas en [`DECISIONS.md`](DECISIONS.md) y [`ARQUITECTURA.md`](ARQUITECTURA.md).
 
@@ -192,6 +192,28 @@ Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`
 3. **Capa 3 — Actualización en 1 clic («Actualizar ahora») para Core y Nodos de salida:**
    - **Servidor Core (`POST /api/system/update`):** solo accesible para administradores cuando `canAutoUpdate === true`. En Docker dispara la actualización mediante la API HTTP de **Watchtower**; en ejecución nativa (`systemd`) ejecuta `git pull` + recompilación (`build`) y reinicio controlado del servicio, devolviendo `{ ok, mode: 'watchtower' | 'native', message, restarting }`.
    - **Nodos de salida (`POST /api/nodes/:id/update`):** el Core reenvía de forma autenticada la orden de actualización al endpoint `POST /_bifrost/update` del agente del nodo (`Egress Node`) y devuelve `{ ok, message, restarting }`. Desde `NodesTab`, el administrador dispone del botón **«Actualizar nodo»** con feedback visual de carga/reinicio en curso.
+
+---
+
+### HU-42 — Marketplace multi-repositorio opt-in, versionado de catálogo y actualización en sitio de proveedores
+
+**Como** administrador de Bifrost,  
+**quiero** poder activar opcionalmente el repositorio oficial recomendado (`sxamx/bifrost-providers`) o añadir múltiples repositorios HTTPS externos de manifiestos, consultar las versiones del catálogo y comprobar si existen actualizaciones para los proveedores ya instalados,  
+**para** descubrir nuevos proveedores sin descargas externas obligatorias por defecto y actualizar en sitio sus manifiestos (`schema_json`) sin perder claves, modelos ni historial de uso.
+
+**Criterios de aceptación:**
+1. **Repositorios multi-fuente opt-in y validación SSRF:**
+   - El repositorio oficial recomendado (`sxamx/bifrost-providers`) viene pre-registrado en el Core con `enabled = false` por defecto (modelo *opt-in*: mientras no sea activado explícitamente por el administrador, el catálogo no realiza consultas remotas externas y utiliza únicamente el catálogo local integrado).
+   - El administrador puede añadir, habilitar, deshabilitar y eliminar múltiples repositorios HTTPS personalizados mediante los endpoints `/api/marketplace/sources`, aplicando validación SSRF estricta sobre cada URL de índice remota (bloqueo de esquemas no HTTPS, IPs privadas/loopback/link-local y redirecciones inseguras).
+2. **Versionado de catálogo y comprobación bajo demanda:**
+   - Los manifiestos y el catálogo exponen metadatos de versión (`catalogVersion`, `manifestVersion` y `manifestHash`) que la interfaz muestra en el encabezado del Marketplace y en cada tarjeta de proveedor.
+   - El botón **«Comprobar actualizaciones»** invoca `GET /api/marketplace?refresh=1`, fuerza la recarga remota desde todas las fuentes habilitadas y compara `manifestVersion` / `manifestHash` de los proveedores instalados frente a los disponibles en los repositorios activos (`updateAvailable: true`, `installedVersion`, `availableVersion`, `updateSourceId`).
+3. **Actualización en sitio sin pérdida de datos (`POST /api/marketplace/update-installed`):**
+   - Desde la vista de proveedores instalados o el Marketplace, el administrador puede pulsar **«Actualizar proveedor»** (individual) o **«Actualizar todos»** (en lote), invocando `POST /api/marketplace/update-installed` con `providerId` opcional.
+   - El backend actualiza `schema_json` (y los metadatos derivados del manifiesto) en sitio dentro de la tabla `providers` **sin** eliminar ni reiniciar `provider_keys`, `models` ni `usage_logs`, manteniendo intactas las credenciales, asignaciones de nodos y métricas históricas.
+4. **Resolución determinista de colisiones de ID:**
+   - Cuando dos o más fuentes activas exponen un proveedor con el mismo `id`, la resolución es determinista: tiene prioridad el repositorio oficial (`isOfficial = true`) y, en caso de empate entre repositorios personalizados, prevalece el registrado más tempranamente (`createdAt` / orden de registro más antiguo).
+   - Cada tarjeta del catálogo muestra un distintivo (*badge*) con el origen (`sourceName` / `sourceId` o indicador oficial) del repositorio que aporta ese manifiesto.
 
 ---
 

@@ -1,7 +1,7 @@
 # Guía de Handoff UI — Bifrost V2
 
 Documento técnico para implementar los cambios de interfaz de la V2 en el panel (`panel/src/`).  
-Refleja las historias `HU-27` a `HU-41` descritas en [`HISTORIAS-V2.md`](HISTORIAS-V2.md).
+Refleja las historias `HU-27` a `HU-42` descritas en [`HISTORIAS-V2.md`](HISTORIAS-V2.md).
 
 ---
 
@@ -308,47 +308,119 @@ export interface SystemUpdateStatus {
 
 ---
 
-## 3. Checklist final de implementación UI
+### 2.10 Marketplace Multi-Repositorio, Versionado y Actualización en Sitio (`HU-42`)
 
-- [ ] **`ProviderVaultCard.tsx`**: switch **Activar / Desactivar** (`status === 'disabled'`), badge `no_node`, botón **Probar clave** (`ProviderKeyTestResult`) y badge/tooltip de advertencia de privacidad (`HU-40`).
-- [ ] **`NodesTab.tsx`**: botón **Probar nodo** (`ExitNodeTestResult`) con estado de carga/latencia, botón **Actualizar nodo** (`api.updateNode`) habilitado/visible solo cuando `node.updateAvailable === true` (o badge **«Al día»** si `false`, manejando `upToDate === true` sin esperar reinicio) con feedback de carga/reinicio (`HU-41`), y advertencia de claves afectadas al eliminar nodo.
-- [ ] **`ModelsTab.tsx`**: interruptor de visibilidad admin (`api.setModelVisibility`), soporte y filtro para modelos deshabilitados y no-texto (`embeddings`), badge `hasCatalogInfo`, saneamiento de `formatReleaseDate` (`>= 2018` o `'No reportada'`) e indicador `providerPrivacy` (`HU-40`).
-- [ ] **`UsersTab.tsx`**: botón **Eliminar** en invitaciones pendientes (`api.deleteInvitation`), buscador de modelos en modales sin perder selección e interruptor/badge `enforceStrictQuota`.
-- [ ] **`ApiKeysTab.tsx`**: selector de expiración (`expiresInDays` / `expiresAt`), columna/badge de expiración y estado **Expirada**, y métricas compactas por clave (`usedTokens` / `requestsCount`).
-- [ ] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`) y opción **Por API key** en `ActivityGroupBy`.
-- [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx`**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter), detalle de `training` y badge de clasificación de límites (`rateLimitKind` / `rateLimitWindows`, `HU-38`).
-- [ ] **`OverviewTab.tsx` / `MetricsTab.tsx` (Cuota gratuita, `HU-39`)**: mostrar ventana activa (`hora` / `día` / `semana`), indicador de confianza (`Exacto por cabecera`, `Configurado`, `Inferido por 429`), `effectiveLimit`, estado `adaptiveAdjusted` y detalle por proveedor (`providerQuotas` / `FreeQuotaStatus.providers`).
-- [x] **`OverviewTab.tsx` / Topbar (Detección y ejecución de actualizaciones, `HU-41`)**: implementado en PR #48 (ver ajustes pendientes en Sección 4).
+**Contrato TypeScript en `panel/src/types.ts` (añadido por Backend):**
+```ts
+export interface MarketplaceSourceItem {
+  id: string;
+  name: string;
+  url: string;
+  isOfficial: boolean;
+  enabled: boolean;
+  catalogVersion: string | null;
+  lastCheckedAt: number | null;
+  lastError: string | null;
+  createdAt: number;
+}
+
+export interface MarketplaceProviderEntry extends ProviderManifest {
+  sourceId?: string;
+  sourceName?: string;
+  isOfficial?: boolean;
+  manifestHash?: string;
+  manifestVersion?: string;
+  installed?: boolean;
+  installedHash?: string | null;
+  updateAvailable?: boolean;
+}
+
+export interface MarketplaceCatalogState {
+  manifests: MarketplaceProviderEntry[];
+  offline: boolean;
+  notice?: string;
+  sources?: MarketplaceSourceItem[];
+  catalogVersion?: string | null;
+  checkedAt?: number | null;
+  updatesAvailableCount?: number;
+  enabledSourcesCount?: number;
+}
+
+export interface MarketplaceUpdateResult {
+  ok: boolean;
+  updated: string[];
+  skipped: string[];
+  providers: ProviderSummary[];
+}
+```
+
+**Campos en `ProviderSummary` (`panel/src/types.ts`, devuelto por `GET /api/providers` y normalizado en `normalizeProviderSummary`):**
+- `sourceId?: string | null`
+- `manifestHash?: string | null`
+
+> **Nota sobre `updateAvailable` para proveedores instalados:** `ProviderSummary` **no** incluye `updateAvailable` ni `manifestVersion`; para saber si un proveedor instalado tiene actualización disponible, emparejar `provider.id` contra `MarketplaceCatalogState.manifests` (p. ej. `catalog.manifests.find(m => m.id === p.id)?.updateAvailable`, además de `manifestVersion`, `manifestHash`, `installedHash` y `sourceName`).
+
+**Métodos en `api` (`panel/src/api.ts`):**
+- `api.getMarketplace(refresh?: boolean): Promise<MarketplaceCatalogState>`  
+  Llama a `GET /api/marketplace` (o `GET /api/marketplace?refresh=1` cuando `refresh === true` para forzar descarga remota y comparación de versiones contra todas las fuentes activas).
+- `api.getMarketplaceSources(): Promise<MarketplaceSourceItem[]>`  
+  Llama a `GET /api/marketplace/sources` (lista el repositorio oficial recomendado `sxamx/bifrost-providers` —por defecto `enabled: false`— y los repositorios personalizados).
+- `api.addMarketplaceSource(input: { name: string; url: string; enabled?: boolean }): Promise<MarketplaceSourceItem>`  
+  Llama a `POST /api/marketplace/sources` (con validación SSRF estricta en backend para URLs HTTPS remotas).
+- `api.updateMarketplaceSource(id: string, input: { name?: string; enabled?: boolean }): Promise<MarketplaceSourceItem>`  
+  Llama a `PATCH /api/marketplace/sources/:id` (para activar/desactivar `enabled` o editar `name`).
+- `api.deleteMarketplaceSource(id: string): Promise<{ ok: boolean; id: string }>`  
+  Llama a `DELETE /api/marketplace/sources/:id` (elimina repositorios personalizados; el oficial permanece pre-registrado).
+- `api.updateInstalledMarketplaceProviders(providerId?: string): Promise<MarketplaceUpdateResult>`  
+  Llama a `POST /api/marketplace/update-installed` (con `{ providerId }` para actualizar un proveedor concreto o sin `providerId` para actualizar todos los proveedores con `updateAvailable === true`, actualizando `schema_json` en sitio sin borrar `provider_keys`, `models` ni `usage_logs`).
+
+**Requisitos UI (`ProvidersTab.tsx` / `MarketplaceTab.tsx` y `ProviderVaultCard.tsx`):**
+1. **Gestor de repositorios del Marketplace (opt-in):**
+   - Mostrar un panel/sección colapsable de **Repositorios de proveedores** con el repositorio oficial recomendado (`sxamx/bifrost-providers`, `isOfficial: true`) pre-listado y un interruptor para activarlo (`enabled = true`) o desactivarlo (`enabled = false`), explicando que por defecto está desactivado (*opt-in*).
+   - Incluir formulario para añadir un repositorio HTTPS personalizado (`name` + `url`, usando `api.addMarketplaceSource({ name, url, enabled? })`), controles de activar/desactivar y edición de nombre (`api.updateMarketplaceSource(id, { name?, enabled? })`), y botón eliminar para repositorios no oficiales (`api.deleteMarketplaceSource(id)`), mostrando `lastError` / `catalogVersion` / `lastCheckedAt` por fuente y `enabledSourcesCount` / `checkedAt` del catálogo, manejando errores SSRF/HTTP vía `ApiError`.
+2. **Versionado, origen y comprobación de actualizaciones:**
+   - Mostrar `catalogVersion` (y `checkedAt` / `enabledSourcesCount`) en la cabecera del Marketplace y `manifestVersion` (y `manifestHash` abreviado en tooltip/subtítulo) junto al badge de origen (`sourceName` o distintivo **Oficial** cuando `isOfficial === true`) en cada tarjeta del catálogo (`MarketplaceProviderEntry`).
+   - Añadir el botón **«Comprobar actualizaciones»** que llame a `api.getMarketplace(true)` con estado de carga y actualice los indicadores de actualización (`updatesAvailableCount` y `updateAvailable`).
+3. **Actualización en sitio sin pérdida de datos:**
+   - En las tarjetas del catálogo (`MarketplaceProviderEntry`) con `installed === true && updateAvailable === true`, y en los proveedores instalados (`ProviderVaultCard.tsx`, determinando la actualización mediante `catalog.manifests.find(m => m.id === p.id)?.updateAvailable`), mostrar indicador de versión/hash (`installedHash` / `provider.manifestHash` frente a `manifestVersion` / `manifestHash`) y botón **«Actualizar»** / **«Actualizar proveedor»** que llame a `api.updateInstalledMarketplaceProviders(provider.id)`.
+   - Cuando existan 1 o más proveedores instalados actualizables (`updatesAvailableCount > 0`), mostrar botón global **«Actualizar todos»** que invoque `api.updateInstalledMarketplaceProviders()` sin parámetros (procesando `updated`, `skipped` y `providers` de `MarketplaceUpdateResult`) y refresque `providers` y el catálogo sin perder claves ni modelos.
 
 ---
 
-## 4. Pendientes UI acumulados (Ronda 2 — para próxima PR de diseño)
+## 3. Checklist final de implementación UI
+
+- [x] **`ProviderVaultCard.tsx`**: switch **Activar / Desactivar** (`status === 'disabled'`), badge `no_node`, botón **Probar clave** (`ProviderKeyTestResult`) y badge/tooltip de advertencia de privacidad (`HU-40`).
+- [x] **`NodesTab.tsx`**: botón **Probar nodo** (`ExitNodeTestResult`) con estado de carga/latencia, botón **Actualizar nodo** (`api.updateNode`) con manejo de `updateAvailable === true | false | null` y feedback de carga/reinicio (`HU-41`), y advertencia de claves afectadas al eliminar nodo.
+- [x] **`ModelsTab.tsx`**: interruptor de visibilidad admin (`api.setModelVisibility`), soporte y filtro para modelos deshabilitados y no-texto (`embeddings`), badge `hasCatalogInfo`, saneamiento de `formatReleaseDate` (`>= 2018` o `'No reportada'`) e indicador `providerPrivacy` (`HU-40`).
+- [x] **`UsersTab.tsx`**: botón **Eliminar** en invitaciones pendientes (`api.deleteInvitation`), buscador de modelos en modales sin perder selección e interruptor/badge `enforceStrictQuota` *(ver ajustes menores pendientes en Sección 4)*.
+- [x] **`ApiKeysTab.tsx`**: selector de expiración (`expiresInDays`), columna/badge de expiración y estado **Expirada**, y métricas compactas por clave (`usedTokens` / `requestsCount`).
+- [x] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`), `requestsCount` en tooltip de actividad y opción **Por API key** en `ActivityGroupBy`.
+- [x] **`MarketplaceTab.tsx` / `ProvidersTab.tsx` (`HU-38`, `HU-40`)**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter), detalle de `training` y badge de clasificación de límites (`rateLimitKind` / `rateLimitWindows`, incluyendo `concurrency`).
+- [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx` / `ProviderVaultCard.tsx` (`HU-42`)**: gestor de repositorios multi-fuente opt-in (`api.getMarketplaceSources` / `addMarketplaceSource` / `updateMarketplaceSource` / `deleteMarketplaceSource`), badges de versión (`catalogVersion`, `manifestVersion`, `manifestHash`) y origen (`sourceName`, `isOfficial`, `sourceId`), botón **«Comprobar actualizaciones»** (`api.getMarketplace(true)`) y botones **«Actualizar» / «Actualizar todos»** (`api.updateInstalledMarketplaceProviders`).
+- [x] **`OverviewTab.tsx` (Cuota gratuita, `HU-39`)**: mostrar ventana activa (`hora` / `día` / `semana`), indicador de confianza (`Exacto por cabecera`, `Configurado`, `Inferido por 429`), `effectiveLimit`, estado `adaptiveAdjusted` y detalle por proveedor (`providerQuotas` / `FreeQuotaStatus.providers`). *(Pendiente replicar resumen en `MetricsTab.tsx` y mostrar `usableKeysCount`, ver Sección 4)*.
+- [x] **`OverviewTab.tsx` / Topbar (`HU-41`)**: implementado y completado en PR #48, PR #51 y PR #52 (botón **«Comprobar ahora»** siempre accesible, versión visible en sidebar y progreso real por fases con auto-recarga).
+
+---
+
+## 4. Pendientes UI acumulados (Ronda 3 — para próxima PR de diseño)
 
 Lista viva de ajustes, añadidos y correcciones que debe implementar la IA de diseño en la siguiente PR (sin tocar `panel/src/api.ts`, `panel/src/types.ts`, `core/`, `nodes/` ni `tests/`):
 
-1. **`UsersTab.tsx` (`HU-35`)** — *Corregir + Añadir*:
+> **Resueltos en PR #50, PR #51 y PR #52:** progreso en tiempo real y auto-recarga del autoupdater + versión visible en sidebar (`App.tsx` / `OverviewTab.tsx`), botón «Comprobar ahora» siempre accesible (`OverviewTab.tsx`), manejo de `node.updateAvailable === null` (`NodesTab.tsx`), `requestsCount` en actividad (`MetricsTab.tsx`), `usedTokens` y `requestsCount` en `ApiKeysTab.tsx`, desglose `providerQuotas` en `OverviewTab.tsx`, formato `es-ES` con `tabular-nums` en percentiles de `MetricsTab.tsx`, filtrado de `disabledByAdmin` en `PlaygroundTab.tsx` y selector de `reasoning_effort` con opción `'none'` (`Desactivado / Estándar`).
+
+1. **`UsersTab.tsx` (`HU-31`, `HU-35`)** — *Corregir + Añadir*:
    - Cambiar el estado inicial de `inviteEnforceStrict` de `false` a **`true`** (activado por defecto al crear invitaciones).
    - Mostrar etiqueta visual **«Flexible»** cuando `enforceStrictQuota === false` en las tablas de usuarios e invitaciones (actualmente solo muestra «Estricta» si es `true`).
-   - *(Menor, `HU-31`)*: En invitaciones no usadas pero ya expiradas, mostrar **«Expirada»** en vez de «Pendiente».
-2. **`OverviewTab.tsx` y `App.tsx` (`HU-41`)** — *Corregir + Añadir*:
-   - Dejar el botón **«Comprobar ahora»** (`api.getUpdateStatus(true)`) siempre accesible para `admin` (actualmente está escondido dentro de `updateStatus?.updateAvailable`, impidiendo forzar la comprobación cuando aún no hay actualización detectada).
-   - **Versión visible del panel:** Mostrar de forma discreta la versión y commit corto actual (ej. `v1.0.0 · 7d26e84`, obtenido de `api.getHealth()` o `updateStatus`) en el footer del sidebar (`App.tsx`) o en `OverviewTab.tsx`.
-   - **Progreso real con fases y auto-recarga al actualizar (`HU-41`):** Al pulsar **«Actualizar ahora»**, guardar `previousCommit` y mostrar una barra/indicador de progreso con fases claras haciendo polling cada 2s a `api.getHealth()` (complementado por `updatePhase` / `updatePhaseMessage` cuando aplique):
-     - `15%`: Enviando orden de actualización…
-     - `45%`: Descargando nueva versión… (o según `updatePhase`: `'pulling'` / `'building'` en entorno nativo)
-     - `75%`: Reiniciando servidor… (cuando `/api/health` se desconecta brevemente durante el reemplazo o `updatePhase === 'restarting'`)
-     - `100%`: Cuando `/api/health` responde `200 OK` con `buildCommit !== previousCommit`, mostrar «¡Actualizado correctamente!» y recargar la página automáticamente (`window.location.reload()`). Si pasan 90s sin cambio de commit (o `updatePhase === 'error'`), mostrar error claro de timeout o fallo.
-3. **`NodesTab.tsx` (`HU-41`)** — *Corregir*:
-   - Manejar `node.updateAvailable === null` (cuando el nodo es antiguo y no reporta `commit` o aún no hubo check remoto): mostrar estado neutro o botón **«Actualizar nodo»** en vez de mostrar falsamente «Al día».
-4. **`MetricsTab.tsx` y `ApiKeysTab.tsx` (`HU-37`)** — *Añadir*:
-   - En `MetricsTab.tsx`: renderizar **`requestsCount`** en la sección de actividad (junto a los tokens).
-   - En `ApiKeysTab.tsx`: mostrar columnas/indicadores compactos de **`usedTokens`** y **`requestsCount`** por clave (ya devueltos por `GET /api/keys`).
-5. **`OverviewTab.tsx` y `MetricsTab.tsx` (`HU-39`)** — *Añadir*:
-   - Renderizar el desglose por proveedor de cuota adaptativa (**`providerQuotas` / `freeQuota.providers`**) mostrando para cada proveedor su **`windowLabel`** (ej. `4h`, `24h`, `30m`), su **`unit`** real (`tokens` / `peticiones` sin mezclar unidades), **`usableKeysCount`** (claves `active` + `rate_limited`) y **`confidence`**.
-   - Añadir el bloque/indicador de ventana activa (`windowLabel` o `hora`/`día`/`semana` como respaldo) y confianza (`Exacto por cabecera`/`Configurado`/`Inferido por 429`) también en **`MetricsTab.tsx`**.
-6. **`MetricsTab.tsx` (`HU-34`)** — *Corregir*:
-   - Formatear los valores de velocidad por modelo (`tok/s`) con `toLocaleString('es-ES', { maximumFractionDigits: 1 })` en lugar de `.toFixed(1)` / `Math.round(...)` crudos, y pulir cualquier fallo restante de alineación o espaciado visual en la tabla y tarjetas de percentiles (separación etiqueta/valor, `tabular-nums` y unidades).
-7. **`CompareTab.tsx` (`HU-30` y NVIDIA NIM `thinking`)** — *Corregir + Añadir*:
-   - Filtrar fuera del selector de modelos del Playground cualquier modelo con `disabledByAdmin === true` (un modelo desactivado globalmente no debe aparecer como opción seleccionable en el Playground).
-   - Añadir la opción **«Desactivado» (`none`)** en el selector de esfuerzo de razonamiento (`reasoning_effort`, junto a `low`, `medium`, `high`). El backend ya soporta `'none'` y para `nvidia-nim` envía `chat_template_kwargs: { enable_thinking: false }` cuando se selecciona explícitamente `'none'`.
+   - *(Menor, `HU-31`)*: En invitaciones no usadas pero ya expiradas (`!inv.usedAt && inv.expiresAt <= now`), mostrar **«Expirada»** en vez de «Pendiente».
+2. **`OverviewTab.tsx` y `MetricsTab.tsx` (`HU-39`)** — *Completar*:
+   - En `OverviewTab.tsx`: mostrar también **`usableKeysCount`** (claves `active` + `rate_limited`) dentro de cada tarjeta del desglose `providerQuotasList`.
+   - En `MetricsTab.tsx`: añadir el bloque/indicador de ventana activa (`windowLabel` o `hora`/`día`/`semana`), confianza (`Exacto por cabecera` / `Configurado` / `Inferido por 429`) y el desglose por proveedor (`freeQuota.providers`) con `unit`, `windowLabel`, `usableKeysCount` y `confidence`.
+3. **`CompareTab.tsx` (`HU-30` y `HU-34`)** — *Corregir*:
+   - Filtrar modelos con `disabledByAdmin === true` en `CompareTab.tsx` igual que en `PlaygroundTab.tsx` (`m.active !== false && !m.disabledByAdmin`).
+   - Formatear el valor de velocidad `P50` (`tokensPerSec.p50`) y `TTFT P50` en `CompareTab.tsx` con `toLocaleString('es-ES', { minimumFractionDigits: 1, maximumFractionDigits: 1 })` (en lugar de `.toFixed(1)` crudo).
+4. **`ProvidersTab.tsx` / `MarketplaceTab.tsx` y `ProviderVaultCard.tsx` (`HU-42`)** — *Nuevo*:
+   - **Panel gestor de repositorios (`MarketplaceSourceItem`):** añadir UI para listar fuentes (`api.getMarketplaceSources()`), activar/desactivar con toggle el repositorio oficial recomendado (`sxamx/bifrost-providers`, `isOfficial: true`, `enabled = false` por defecto opt-in) y añadir/habilitar/deshabilitar/eliminar repositorios HTTPS personalizados (`api.addMarketplaceSource({ name, url, enabled? })`, `api.updateMarketplaceSource(id, { name?, enabled? })`, `api.deleteMarketplaceSource(id)`), mostrando `url`, `catalogVersion`, `lastCheckedAt`, `lastError` y `enabledSourcesCount`.
+   - **Badges de versión y origen:** mostrar `catalogVersion` y `checkedAt` en la cabecera del catálogo (`MarketplaceCatalogState`), y `manifestVersion` (junto con `manifestHash` abreviado) + badge de repositorio origen (`sourceName` / `isOfficial` / `sourceId`) en cada tarjeta del catálogo (`MarketplaceProviderEntry`) y en los proveedores instalados (`ProviderSummary.sourceId`, `ProviderSummary.manifestHash`).
+   - **Botón «Comprobar actualizaciones»:** añadir botón en el Marketplace (y/o cabecera de Proveedores) que invoque `api.getMarketplace(true)` (`?refresh=1`) con estado de carga y feedback de actualizaciones detectadas (`updatesAvailableCount`).
+   - **Botones «Actualizar» y «Actualizar todos» en sitio (`MarketplaceUpdateResult`):** determinar `updateAvailable` para proveedores instalados emparejando `provider.id` contra `MarketplaceCatalogState.manifests` (p. ej. `catalog.manifests.find(m => m.id === p.id)?.updateAvailable`); cuando `updateAvailable === true` (tanto en `ProviderVaultCard.tsx` como en tarjetas del catálogo con `installed === true`), mostrar el hash/versión instalada (`installedHash` / `provider.manifestHash`) frente a la disponible (`manifestVersion` / `manifestHash`) y botón **«Actualizar»** (`api.updateInstalledMarketplaceProviders(provider.id)`), más botón global **«Actualizar todos»** (`api.updateInstalledMarketplaceProviders()`) cuando `updatesAvailableCount > 0`, procesando `updated` / `skipped` / `providers` y refrescando el estado sin perder claves ni modelos.
 

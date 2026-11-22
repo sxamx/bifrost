@@ -27,6 +27,9 @@ import type {
   LmArenaPeerEntry,
   ManagedUserItem,
   MarketplaceCatalogState,
+  MarketplaceProviderEntry,
+  MarketplaceSourceItem,
+  MarketplaceUpdateResult,
   MeResponse,
   MetricsSummary,
   ModelBenchmarksData,
@@ -919,6 +922,18 @@ function normalizeProviderSummary(raw: unknown): ProviderSummary {
         ? r.adapterUrl
         : typeof r.adapter_url === 'string'
           ? r.adapter_url
+          : null,
+    sourceId:
+      typeof r.sourceId === 'string'
+        ? r.sourceId
+        : typeof r.source_id === 'string'
+          ? r.source_id
+          : null,
+    manifestHash:
+      typeof r.manifestHash === 'string'
+        ? r.manifestHash
+        : typeof r.manifest_hash === 'string'
+          ? r.manifest_hash
           : null,
     enabled: r.enabled !== undefined ? Boolean(r.enabled) : true,
     reviewedAt,
@@ -1994,11 +2009,37 @@ export const api = {
     return normalizeProviderKey(r.key ?? raw);
   },
 
-  /* Providers & Marketplace (Phase 2 & Phase 7 HU-23) */
+  /* Providers & Marketplace (Phase 2, Phase 7 HU-23 & HU-42) */
 
-  async getMarketplace(): Promise<MarketplaceCatalogState> {
+  async getMarketplace(refresh?: boolean): Promise<MarketplaceCatalogState> {
+    const normalizeSource = (rawSrc: unknown): MarketplaceSourceItem => {
+      const s = asRecord(rawSrc);
+      return {
+        id: String(s.id ?? ''),
+        name: String(s.name ?? ''),
+        url: String(s.url ?? ''),
+        isOfficial: Boolean(s.isOfficial ?? s.is_official ?? false),
+        enabled: Boolean(s.enabled ?? false),
+        catalogVersion:
+          typeof s.catalogVersion === 'string'
+            ? s.catalogVersion
+            : typeof s.catalog_version === 'string'
+              ? s.catalog_version
+              : null,
+        lastCheckedAt: asNullableNum(s.lastCheckedAt ?? s.last_checked_at),
+        lastError:
+          typeof s.lastError === 'string'
+            ? s.lastError
+            : typeof s.last_error === 'string'
+              ? s.last_error
+              : null,
+        createdAt: asNum(s.createdAt ?? s.created_at, 0),
+      };
+    };
+
     try {
-      const raw = await request<unknown>('/api/marketplace', { method: 'GET' });
+      const query = refresh ? '?refresh=1' : '';
+      const raw = await request<unknown>(`/api/marketplace${query}`, { method: 'GET' });
       const r = asRecord(raw);
       const list = Array.isArray(raw)
         ? raw
@@ -2022,7 +2063,7 @@ export const api = {
               : undefined;
 
       // HU-23: Only expose approved packages from marketplace catalog
-      const approvedManifests = (list as ProviderManifest[])
+      const approvedManifests: MarketplaceProviderEntry[] = (list as MarketplaceProviderEntry[])
         .filter((m) => m.approved !== false)
         .map((m) => ({
           ...m,
@@ -2031,10 +2072,28 @@ export const api = {
           rateLimitWindows: normalizeRateLimitWindows(m.rateLimitWindows),
         }));
 
+      const sources = Array.isArray(r.sources) ? r.sources.map(normalizeSource) : undefined;
+      const catalogVersion =
+        typeof r.catalogVersion === 'string'
+          ? r.catalogVersion
+          : r.catalogVersion === null
+            ? null
+            : undefined;
+      const checkedAt = asNullableNum(r.checkedAt);
+      const updatesAvailableCount =
+        typeof r.updatesAvailableCount === 'number' ? r.updatesAvailableCount : undefined;
+      const enabledSourcesCount =
+        typeof r.enabledSourcesCount === 'number' ? r.enabledSourcesCount : undefined;
+
       return {
         manifests: approvedManifests,
         offline,
         notice,
+        sources,
+        catalogVersion,
+        checkedAt,
+        updatesAvailableCount,
+        enabledSourcesCount,
       };
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
@@ -2049,6 +2108,135 @@ export const api = {
             : 'No se pudo consultar el catálogo remoto bifrost-providers.',
       };
     }
+  },
+
+  async getMarketplaceSources(): Promise<MarketplaceSourceItem[]> {
+    const raw = await request<unknown>('/api/marketplace/sources', { method: 'GET' });
+    const r = asRecord(raw);
+    const list = Array.isArray(r.sources) ? r.sources : Array.isArray(raw) ? raw : [];
+    return list.map((item) => {
+      const s = asRecord(item);
+      return {
+        id: String(s.id ?? ''),
+        name: String(s.name ?? ''),
+        url: String(s.url ?? ''),
+        isOfficial: Boolean(s.isOfficial ?? s.is_official ?? false),
+        enabled: Boolean(s.enabled ?? false),
+        catalogVersion:
+          typeof s.catalogVersion === 'string'
+            ? s.catalogVersion
+            : typeof s.catalog_version === 'string'
+              ? s.catalog_version
+              : null,
+        lastCheckedAt: asNullableNum(s.lastCheckedAt ?? s.last_checked_at),
+        lastError:
+          typeof s.lastError === 'string'
+            ? s.lastError
+            : typeof s.last_error === 'string'
+              ? s.last_error
+              : null,
+        createdAt: asNum(s.createdAt ?? s.created_at, 0),
+      };
+    });
+  },
+
+  async addMarketplaceSource(input: {
+    name: string;
+    url: string;
+    enabled?: boolean;
+  }): Promise<MarketplaceSourceItem> {
+    const raw = await request<unknown>('/api/marketplace/sources', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    });
+    const r = asRecord(raw);
+    const s = asRecord(r.source ?? raw);
+    return {
+      id: String(s.id ?? ''),
+      name: String(s.name ?? ''),
+      url: String(s.url ?? ''),
+      isOfficial: Boolean(s.isOfficial ?? s.is_official ?? false),
+      enabled: Boolean(s.enabled ?? false),
+      catalogVersion:
+        typeof s.catalogVersion === 'string'
+          ? s.catalogVersion
+          : typeof s.catalog_version === 'string'
+            ? s.catalog_version
+            : null,
+      lastCheckedAt: asNullableNum(s.lastCheckedAt ?? s.last_checked_at),
+      lastError:
+        typeof s.lastError === 'string'
+          ? s.lastError
+          : typeof s.last_error === 'string'
+            ? s.last_error
+            : null,
+      createdAt: asNum(s.createdAt ?? s.created_at, 0),
+    };
+  },
+
+  async updateMarketplaceSource(
+    id: string,
+    input: { name?: string; enabled?: boolean }
+  ): Promise<MarketplaceSourceItem> {
+    const raw = await request<unknown>(
+      `/api/marketplace/sources/${encodeURIComponent(id)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(input),
+      }
+    );
+    const r = asRecord(raw);
+    const s = asRecord(r.source ?? raw);
+    return {
+      id: String(s.id ?? ''),
+      name: String(s.name ?? ''),
+      url: String(s.url ?? ''),
+      isOfficial: Boolean(s.isOfficial ?? s.is_official ?? false),
+      enabled: Boolean(s.enabled ?? false),
+      catalogVersion:
+        typeof s.catalogVersion === 'string'
+          ? s.catalogVersion
+          : typeof s.catalog_version === 'string'
+            ? s.catalog_version
+            : null,
+      lastCheckedAt: asNullableNum(s.lastCheckedAt ?? s.last_checked_at),
+      lastError:
+        typeof s.lastError === 'string'
+          ? s.lastError
+          : typeof s.last_error === 'string'
+            ? s.last_error
+            : null,
+      createdAt: asNum(s.createdAt ?? s.created_at, 0),
+    };
+  },
+
+  async deleteMarketplaceSource(id: string): Promise<{ ok: boolean; id: string }> {
+    const raw = await request<unknown>(
+      `/api/marketplace/sources/${encodeURIComponent(id)}`,
+      { method: 'DELETE' }
+    );
+    const r = asRecord(raw);
+    return {
+      ok: Boolean(r.ok ?? true),
+      id: String(r.id ?? id),
+    };
+  },
+
+  async updateInstalledMarketplaceProviders(
+    providerId?: string
+  ): Promise<MarketplaceUpdateResult> {
+    const raw = await request<unknown>('/api/marketplace/update-installed', {
+      method: 'POST',
+      body: JSON.stringify(providerId ? { providerId } : {}),
+    });
+    const r = asRecord(raw);
+    const providersList = Array.isArray(r.providers) ? r.providers : [];
+    return {
+      ok: Boolean(r.ok ?? true),
+      updated: asStringArray(r.updated),
+      skipped: asStringArray(r.skipped),
+      providers: providersList.map(normalizeProviderSummary),
+    };
   },
 
   async installFromMarketplace(

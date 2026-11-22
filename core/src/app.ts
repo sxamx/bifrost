@@ -29,7 +29,12 @@ import {
   sha256Hex,
   verifyPassword,
 } from './crypto.js';
-import { redactSecretsInText, writeSystemLog } from './db.js';
+import {
+  OFFICIAL_MARKETPLACE_SOURCE_ID,
+  OFFICIAL_MARKETPLACE_SOURCE_NAME,
+  redactSecretsInText,
+  writeSystemLog,
+} from './db.js';
 import {
   type ActivityGroupBy,
   type ActivityRange,
@@ -48,10 +53,15 @@ import {
   round2,
 } from './metrics/index.js';
 import {
-  fetchRemoteMarketplaceCatalog,
+  addMarketplaceSource,
+  computeManifestHash,
+  deleteMarketplaceSource,
+  fetchAndMergeMarketplaceCatalog,
   isKnownUnapprovedMarketplaceId,
+  listMarketplaceSources,
   readCachedOrBundledMarketplaceCatalog,
   stripMarketplaceWrapperFields,
+  updateMarketplaceSource,
   validateProviderTargetUrl,
 } from './marketplace.js';
 import {
@@ -121,8 +131,6 @@ export {
 
 const SESSION_COOKIE_NAME = 'bifrost_session';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
-const DEFAULT_MARKETPLACE_URL =
-  'https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json';
 
 export interface AuthUser {
   id: string;
@@ -147,6 +155,7 @@ export interface CreateAppOptions {
   panelDistDir?: string;
   schemasDir?: string;
   marketplaceUrl?: string;
+  allowLocalhostUpstreamsForTests?: boolean;
   fetchImpl?: typeof fetch;
   upstreamTls?: UpstreamTlsOptions;
   maxBackupUncompressedBytes?: number;
@@ -270,6 +279,12 @@ function formatProviderSummaryRow(
     baseUrl: manifest?.baseUrl,
     adapterUrl:
       row.adapter_url === null || row.adapter_url === undefined ? null : String(row.adapter_url),
+    sourceId:
+      row.source_id === null || row.source_id === undefined ? null : String(row.source_id),
+    manifestHash:
+      row.manifest_hash === null || row.manifest_hash === undefined
+        ? null
+        : String(row.manifest_hash),
     enabled: Number(row.enabled) === 1,
     reviewedAt: manifest?.reviewedAt ?? null,
     privacy: manifest?.privacy ?? null,
@@ -298,13 +313,32 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   const resolvedSchemasDir = path.resolve(
     options.schemasDir ?? path.resolve(import.meta.dirname, '../../schemas'),
   );
-  const marketplaceUrl =
-    options.marketplaceUrl ?? process.env.BIFROST_MARKETPLACE_URL ?? DEFAULT_MARKETPLACE_URL;
+  const allowLocalhostUpstreamsForTests = Boolean(options.allowLocalhostUpstreamsForTests);
+  const explicitMarketplaceUrl =
+    options.marketplaceUrl ?? process.env.BIFROST_MARKETPLACE_URL ?? undefined;
 
   const registry = new DrainingRegistry();
   const app = new Hono<AppEnv>();
 
   const nowSeconds = () => Math.floor(now() / 1000);
+
+  // Backward compatibility: if marketplaceUrl is explicitly passed (e.g., tests or env override),
+  // configure and enable the official source to point to that URL. Normal startup keeps official opt-in (enabled = 0).
+  if (explicitMarketplaceUrl) {
+    db.prepare(
+      `INSERT INTO marketplace_sources (
+         id, name, url, is_official, enabled, catalog_version, last_checked_at, last_error, created_at
+       ) VALUES (?, ?, ?, 1, 1, NULL, NULL, NULL, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         url = excluded.url,
+         enabled = 1`,
+    ).run(
+      OFFICIAL_MARKETPLACE_SOURCE_ID,
+      OFFICIAL_MARKETPLACE_SOURCE_NAME,
+      explicitMarketplaceUrl,
+      nowSeconds(),
+    );
+  }
 
   const isAdminInitialized = (): boolean => {
     const row = db
@@ -708,57 +742,141 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     }
   });
 
-  // --- Marketplace & Provider Installation (HU-06, HU-23, HU-24) ---
+  // --- Marketplace & Provider Installation (HU-06, HU-23, HU-24, HU-42) ---
 
   const loadCachedOrSeedCatalog = () =>
     readCachedOrBundledMarketplaceCatalog(db, resolvedSchemasDir);
 
   app.get('/api/marketplace', async (c) => {
     const nowSec = nowSeconds();
+    const refreshParam = c.req.query('refresh');
+    const forceRefresh = refreshParam === '1' || refreshParam === 'true';
 
-    try {
-      const { manifests: validManifests } = await fetchRemoteMarketplaceCatalog({
-        db,
-        marketplaceUrl,
-        schemasDir: resolvedSchemasDir,
-        fetchImpl,
-        nowSec,
-      });
+    const catalog = await fetchAndMergeMarketplaceCatalog(db, {
+      fetchImpl,
+      forceRefresh,
+      nowSec,
+      bundledDir: resolvedSchemasDir,
+    });
 
-      const normalizedManifests = validManifests.map((m) => ({
-        ...m,
-        privacy: m.privacy ?? null,
-        rateLimitKind: m.rateLimitKind ?? null,
-        rateLimitWindows: m.rateLimitWindows ?? [],
-      }));
+    return c.json(catalog);
+  });
 
-      return c.json({
-        online: true,
-        offline: false,
-        providers: normalizedManifests,
-        manifests: normalizedManifests,
-      });
-    } catch (err) {
-      const fallback = loadCachedOrSeedCatalog().map((m) => ({
-        ...m,
-        privacy: m.privacy ?? null,
-        rateLimitKind: m.rateLimitKind ?? null,
-        rateLimitWindows: m.rateLimitWindows ?? [],
-      }));
-      const errMsg = redactSecretsInText(
-        err instanceof Error ? err.message : 'Unable to reach remote marketplace catalog.',
-      );
-
-      return c.json({
-        online: false,
-        offline: true,
-        providers: fallback,
-        manifests: fallback,
-        notice:
-          'Catálogo remoto fuera de línea. Mostrando fichas locales verificadas; también puedes importar un archivo JSON local.',
-        error: errMsg,
-      });
+  app.get('/api/marketplace/sources', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
     }
+    return c.json({ sources: listMarketplaceSources(db) });
+  });
+
+  app.post('/api/marketplace/sources', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const nowSec = nowSeconds();
+    const result = await addMarketplaceSource(
+      db,
+      {
+        name: typeof body.name === 'string' ? body.name : '',
+        url: typeof body.url === 'string' ? body.url : '',
+        enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
+      },
+      nowSec,
+      { allowLocalhostForTests: allowLocalhostUpstreamsForTests },
+    );
+
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.status);
+    }
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Marketplace source "${result.source.name}" added (${result.source.url})`,
+      {
+        sourceId: result.source.id,
+        url: result.source.url,
+        enabled: result.source.enabled,
+        actor: user.username,
+      },
+      nowSec,
+    );
+
+    return c.json({ source: result.source }, 201);
+  });
+
+  app.patch('/api/marketplace/sources/:id', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const id = c.req.param('id');
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    const result = updateMarketplaceSource(db, id, {
+      ...(body.name !== undefined ? { name: body.name as string } : {}),
+      ...(body.enabled !== undefined ? { enabled: body.enabled as boolean } : {}),
+    });
+
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.status);
+    }
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Marketplace source "${result.source.name}" (${result.source.id}) updated (enabled=${result.source.enabled})`,
+      {
+        sourceId: result.source.id,
+        enabled: result.source.enabled,
+        actor: user.username,
+      },
+      nowSeconds(),
+    );
+
+    return c.json({ source: result.source }, 200);
+  });
+
+  app.delete('/api/marketplace/sources/:id', (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    const id = c.req.param('id');
+    const result = deleteMarketplaceSource(db, id);
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.status);
+    }
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Marketplace source "${id}" deleted`,
+      { sourceId: id, actor: user.username },
+      nowSeconds(),
+    );
+
+    return c.json({ ok: true, id: result.id }, 200);
   });
 
   const handleInstallProvider = async (
@@ -766,6 +884,10 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     allowCatalogIdLookup: boolean,
   ) => {
     let candidateManifest: unknown;
+    let resolvedSourceId: string | null =
+      typeof body.sourceId === 'string' && body.sourceId.trim().length > 0
+        ? body.sourceId.trim()
+        : null;
     const rawAdapterUrl =
       typeof body.adapterUrl === 'string' && body.adapterUrl.trim().length > 0
         ? body.adapterUrl.trim()
@@ -792,6 +914,9 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           payload: { error: `Provider "${rawM.id}" is not approved in the marketplace catalog.` },
         };
       }
+      if (!resolvedSourceId && typeof rawM.sourceId === 'string' && rawM.sourceId.trim().length > 0) {
+        resolvedSourceId = rawM.sourceId.trim();
+      }
       candidateManifest = allowCatalogIdLookup ? stripMarketplaceWrapperFields(rawM) : rawM;
     } else if (
       allowCatalogIdLookup &&
@@ -814,6 +939,9 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           payload: { error: `Provider "${targetId}" was not found in the approved marketplace catalog.` },
         };
       }
+      if (!resolvedSourceId && typeof found.sourceId === 'string' && found.sourceId.trim().length > 0) {
+        resolvedSourceId = found.sourceId.trim();
+      }
       candidateManifest = stripMarketplaceWrapperFields(found as unknown as Record<string, unknown>);
     } else {
       candidateManifest = allowCatalogIdLookup ? stripMarketplaceWrapperFields(body) : body;
@@ -831,6 +959,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     }
 
     const manifest = validation.manifest;
+    const manifestHash = computeManifestHash(manifest);
     let adapterUrl: string | null = null;
     if (manifest.packageType === 'experimental-adapter') {
       const targetAdapterUrl = rawAdapterUrl ?? manifest.baseUrl;
@@ -885,8 +1014,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     db.prepare(
       `INSERT INTO providers (
          id, name, package_type, models_source, schema_json,
-         adapter_url, enabled, last_models_sync_at, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, 1, NULL, ?)`,
+         adapter_url, source_id, manifest_hash, enabled, last_models_sync_at, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)`,
     ).run(
       manifest.id,
       manifest.name,
@@ -894,6 +1023,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       manifest.modelsSource,
       JSON.stringify(manifest),
       adapterUrl,
+      resolvedSourceId,
+      manifestHash,
       createdAt,
     );
 
@@ -906,6 +1037,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         providerId: manifest.id,
         packageType: manifest.packageType,
         modelsSource: manifest.modelsSource,
+        sourceId: resolvedSourceId,
+        manifestHash,
         ...(adapterUrl ? { adapterUrl } : {}),
       },
       createdAt,
@@ -939,6 +1072,142 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     const result = await handleInstallProvider(body, true);
     return c.json(result.payload, result.status);
+  });
+
+  app.post('/api/marketplace/update-installed', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
+    let body: Record<string, unknown> = {};
+    const rawBody = await c.req.text();
+    if (rawBody.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(rawBody) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          body = parsed as Record<string, unknown>;
+        } else {
+          return c.json({ error: 'Invalid JSON request body.' }, 400);
+        }
+      } catch {
+        return c.json({ error: 'Invalid JSON request body.' }, 400);
+      }
+    }
+
+    const requestedProviderId =
+      typeof body.providerId === 'string' && body.providerId.trim().length > 0
+        ? body.providerId.trim()
+        : undefined;
+
+    const nowSec = nowSeconds();
+    const catalog = await fetchAndMergeMarketplaceCatalog(db, {
+      fetchImpl,
+      forceRefresh: true,
+      nowSec,
+      bundledDir: resolvedSchemasDir,
+    });
+
+    const catalogById = new Map(catalog.manifests.map((m) => [m.id, m]));
+    const updated: string[] = [];
+    const skipped: string[] = [];
+
+    let targetRows: Array<{ id: string; schema_json: string }>;
+    if (requestedProviderId) {
+      const row = db
+        .prepare(`SELECT id, schema_json FROM providers WHERE id = ?`)
+        .get(requestedProviderId) as { id: string; schema_json: string } | undefined;
+      if (!row) {
+        return c.json({ error: `Installed provider "${requestedProviderId}" not found.` }, 404);
+      }
+      targetRows = [row];
+    } else {
+      targetRows = db
+        .prepare(`SELECT id, schema_json FROM providers ORDER BY created_at ASC`)
+        .all() as Array<{ id: string; schema_json: string }>;
+    }
+
+    const updateStmt = db.prepare(
+      `UPDATE providers
+       SET name = ?, package_type = ?, models_source = ?, schema_json = ?, source_id = ?, manifest_hash = ?
+       WHERE id = ?`,
+    );
+
+    for (const row of targetRows) {
+      const entry = catalogById.get(row.id);
+      if (!entry || !entry.updateAvailable) {
+        skipped.push(row.id);
+        continue;
+      }
+
+      const cleanCandidate = stripMarketplaceWrapperFields(
+        entry as unknown as Record<string, unknown>,
+      );
+      const validation = validateProviderManifest(cleanCandidate, resolvedSchemasDir);
+      if (!validation.valid || !validation.manifest) {
+        skipped.push(row.id);
+        continue;
+      }
+
+      const nextManifest = validation.manifest;
+      const nextHash = computeManifestHash(nextManifest);
+
+      // In-place update ONLY on `providers` — NEVER touches `provider_keys`, `models`, or `usage_logs`.
+      updateStmt.run(
+        nextManifest.name,
+        nextManifest.packageType,
+        nextManifest.modelsSource,
+        JSON.stringify(nextManifest),
+        entry.sourceId,
+        nextHash,
+        row.id,
+      );
+      updated.push(row.id);
+    }
+
+    writeSystemLog(
+      db,
+      'info',
+      'system',
+      `Marketplace in-place update completed (updated=${updated.length}, skipped=${skipped.length})`,
+      {
+        requestedProviderId: requestedProviderId ?? null,
+        updated,
+        skipped,
+        actor: user.username,
+      },
+      nowSec,
+    );
+
+    const providerRows = db
+      .prepare(`SELECT * FROM providers ORDER BY created_at ASC`)
+      .all() as Array<Record<string, unknown>>;
+
+    const providers = providerRows.map((r) => {
+      const pid = String(r.id);
+      const keysCount = Number(
+        (
+          db
+            .prepare(`SELECT COUNT(*) AS count FROM provider_keys WHERE provider_id = ?`)
+            .get(pid) as { count: number | bigint }
+        ).count,
+      );
+      const modelsCount = Number(
+        (
+          db
+            .prepare(`SELECT COUNT(*) AS count FROM models WHERE provider_id = ? AND active = 1`)
+            .get(pid) as { count: number | bigint }
+        ).count,
+      );
+      return formatProviderSummaryRow(r, keysCount, modelsCount, true);
+    });
+
+    return c.json({
+      ok: true,
+      updated,
+      skipped,
+      providers,
+    });
   });
 
   app.post('/api/providers', async (c) => {

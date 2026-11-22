@@ -537,10 +537,45 @@ export interface ProviderManifest {
   rateLimitWindows?: ProviderRateLimitWindow[];
 }
 
+export interface MarketplaceSourceItem {
+  id: string;
+  name: string;
+  url: string;
+  isOfficial: boolean;
+  enabled: boolean;
+  catalogVersion: string | null;
+  lastCheckedAt: number | null;
+  lastError: string | null;
+  createdAt: number;
+}
+
+export interface MarketplaceProviderEntry extends ProviderManifest {
+  sourceId?: string;
+  sourceName?: string;
+  isOfficial?: boolean;
+  manifestHash?: string;
+  manifestVersion?: string;
+  installed?: boolean;
+  installedHash?: string | null;
+  updateAvailable?: boolean;
+}
+
 export interface MarketplaceCatalogState {
-  manifests: ProviderManifest[];
+  manifests: MarketplaceProviderEntry[];
   offline: boolean;
   notice?: string;
+  sources?: MarketplaceSourceItem[];
+  catalogVersion?: string | null;
+  checkedAt?: number | null;
+  updatesAvailableCount?: number;
+  enabledSourcesCount?: number;
+}
+
+export interface MarketplaceUpdateResult {
+  ok: boolean;
+  updated: string[];
+  skipped: string[];
+  providers: ProviderSummary[];
 }
 
 export interface ProviderKeyItem {
@@ -604,6 +639,8 @@ export interface ProviderSummary {
   publishedAt?: string | null;
   baseUrl?: string;
   adapterUrl?: string | null;
+  sourceId?: string | null;
+  manifestHash?: string | null;
   enabled?: boolean;
   reviewedAt?: string | null;
   privacy?: ProviderPrivacyConfig | null;

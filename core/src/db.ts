@@ -94,6 +94,8 @@ CREATE TABLE IF NOT EXISTS providers (
   models_source TEXT NOT NULL CHECK (models_source IN ('api', 'static')),
   schema_json TEXT NOT NULL,
   adapter_url TEXT,
+  source_id TEXT,
+  manifest_hash TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   last_models_sync_at INTEGER,
   created_at INTEGER NOT NULL
@@ -177,6 +179,19 @@ CREATE TABLE IF NOT EXISTS external_cache (
   payload_json TEXT NOT NULL,
   etag TEXT,
   fetched_at INTEGER NOT NULL
+);
+
+-- Fuentes de repositorios del Marketplace (HU-42)
+CREATE TABLE IF NOT EXISTS marketplace_sources (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL UNIQUE,
+  is_official INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  catalog_version TEXT,
+  last_checked_at INTEGER,
+  last_error TEXT,
+  created_at INTEGER NOT NULL
 );
 `;
 
@@ -309,6 +324,43 @@ function ensureUsageLogsColumns(db: DatabaseSync): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_usage_internal_key ON usage_logs(internal_api_key_id);`);
 }
 
+export const OFFICIAL_MARKETPLACE_SOURCE_ID = 'official';
+export const OFFICIAL_MARKETPLACE_SOURCE_NAME = 'Bifrost Oficial (sxamx/bifrost-providers)';
+export const OFFICIAL_MARKETPLACE_SOURCE_URL =
+  'https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json';
+
+export function ensureProvidersMarketplaceColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare(`PRAGMA table_info(providers)`)
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+
+  if (!colNames.has('source_id')) {
+    db.exec(`ALTER TABLE providers ADD COLUMN source_id TEXT;`);
+  }
+  if (!colNames.has('manifest_hash')) {
+    db.exec(`ALTER TABLE providers ADD COLUMN manifest_hash TEXT;`);
+  }
+}
+
+function ensureOfficialMarketplaceSource(db: DatabaseSync): void {
+  const existing = db
+    .prepare(`SELECT id FROM marketplace_sources WHERE id = ?`)
+    .get(OFFICIAL_MARKETPLACE_SOURCE_ID) as { id: string } | undefined;
+  if (!existing) {
+    db.prepare(
+      `INSERT OR IGNORE INTO marketplace_sources (
+         id, name, url, is_official, enabled, catalog_version, last_checked_at, last_error, created_at
+       ) VALUES (?, ?, ?, 1, 0, NULL, NULL, NULL, ?)`,
+    ).run(
+      OFFICIAL_MARKETPLACE_SOURCE_ID,
+      OFFICIAL_MARKETPLACE_SOURCE_NAME,
+      OFFICIAL_MARKETPLACE_SOURCE_URL,
+      Math.floor(Date.now() / 1000),
+    );
+  }
+}
+
 export function initDatabase(db: DatabaseSync): DatabaseSync {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
@@ -318,6 +370,8 @@ export function initDatabase(db: DatabaseSync): DatabaseSync {
   ensureUsersColumns(db);
   ensureInvitationsColumns(db);
   ensureProviderKeysStatusCheck(db);
+  ensureProvidersMarketplaceColumns(db);
+  ensureOfficialMarketplaceSource(db);
   ensureModelsColumns(db);
   ensureInternalApiKeysColumns(db);
   ensureUsageLogsColumns(db);

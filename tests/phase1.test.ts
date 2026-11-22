@@ -72,6 +72,7 @@ describe('Phase 1 Backend Acceptance Tests', () => {
           'external_cache',
           'internal_api_keys',
           'invitations',
+          'marketplace_sources',
           'models',
           'nodes',
           'provider_keys',
