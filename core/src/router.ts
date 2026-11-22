@@ -885,8 +885,7 @@ export async function executeChatCompletions(options: {
     quotaCheck.enforceStrictQuota && quotaCheck.remainingTokens !== null
       ? quotaCheck.remainingTokens
       : null;
-  const estimatedPromptTokens =
-    strictRemainingTokens !== null ? estimateMessagesPromptTokens(originalMessages) : 0;
+  const estimatedPromptTokens = estimateMessagesPromptTokens(originalMessages);
   const strictMaxOutputTokens =
     strictRemainingTokens !== null
       ? Math.max(1, strictRemainingTokens - estimatedPromptTokens)
@@ -1114,7 +1113,10 @@ export async function executeChatCompletions(options: {
             ? (usage.prompt_tokens_details as Record<string, unknown>)
             : {};
 
-        const promptTokens = Number(usage.prompt_tokens ?? 0);
+        let promptTokens = Number(usage.prompt_tokens ?? 0);
+        if ((!Number.isFinite(promptTokens) || promptTokens <= 0) && estimatedPromptTokens > 0) {
+          promptTokens = estimatedPromptTokens;
+        }
         const completionTokens = Number(usage.completion_tokens ?? 0);
         const reasoningTokens = Number(
           compDetails.reasoning_tokens ?? usage.reasoning_tokens ?? 0,
@@ -1656,7 +1658,7 @@ export async function executeChatCompletions(options: {
             if (reasoningTokens === 0 && reasoningAccumulated.length > 0) {
               reasoningTokens = Math.max(1, Math.ceil(reasoningAccumulated.length / 4));
             }
-            if (quotaCutMidStream && promptTokens === 0 && estimatedPromptTokens > 0) {
+            if (promptTokens === 0 && estimatedPromptTokens > 0) {
               promptTokens = estimatedPromptTokens;
             }
 
@@ -1791,7 +1793,12 @@ export async function executeChatCompletions(options: {
             providerKeyId: lastKeyUsedId,
             internalApiKeyId,
             modelFullId,
-            promptTokens,
+            promptTokens:
+              promptTokens > 0
+                ? promptTokens
+                : contentAccumulated.length > 0 || reasoningAccumulated.length > 0
+                  ? estimatedPromptTokens
+                  : 0,
             completionTokens:
               completionTokens ||
               (contentAccumulated.length > 0 ? Math.ceil(contentAccumulated.length / 4) : 0),

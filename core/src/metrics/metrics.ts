@@ -386,17 +386,19 @@ export function getSpeedAndCacheMetrics(
     }
   }
 
-  const models: ModelSpeedMetrics[] = activeModels.map((m) => {
-    const entry = perModelSamples.get(m.full_id) ?? { count: 0, ttft: [], tps: [] };
-    return {
-      modelFullId: m.full_id,
-      modelName: m.name,
-      providerId: m.provider_id,
-      sampleCount: entry.count,
-      ttftMs: computePercentiles(entry.ttft),
-      tokensPerSec: computePercentiles(entry.tps),
-    };
-  });
+  const models: ModelSpeedMetrics[] = activeModels
+    .map((m) => {
+      const entry = perModelSamples.get(m.full_id) ?? { count: 0, ttft: [], tps: [] };
+      return {
+        modelFullId: m.full_id,
+        modelName: m.name,
+        providerId: m.provider_id,
+        sampleCount: entry.count,
+        ttftMs: computePercentiles(entry.ttft),
+        tokensPerSec: computePercentiles(entry.tps),
+      };
+    })
+    .filter((m) => m.sampleCount > 0);
 
   const providerRows = db
     .prepare(

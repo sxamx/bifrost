@@ -304,5 +304,31 @@ export interface SystemUpdateStatus {
 - [ ] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`) y opción **Por API key** en `ActivityGroupBy`.
 - [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx`**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter), detalle de `training` y badge de clasificación de límites (`rateLimitKind` / `rateLimitWindows`, `HU-38`).
 - [ ] **`OverviewTab.tsx` / `MetricsTab.tsx` (Cuota gratuita, `HU-39`)**: mostrar ventana activa (`hora` / `día` / `semana`), indicador de confianza (`Exacto por cabecera`, `Configurado`, `Inferido por 429`), `effectiveLimit`, estado `adaptiveAdjusted` y detalle por proveedor (`providerQuotas` / `FreeQuotaStatus.providers`).
-- [ ] **`OverviewTab.tsx` / Topbar (Detección y ejecución de actualizaciones, `HU-41`)**: solo para `admin`, consumir `api.getUpdateStatus(refresh)` (`SystemUpdateStatus`), mostrar banner/badge sutil cuando `updateAvailable === true`, enlace a `latestCommitUrl`, botón **Comprobar ahora** (`refresh=true`), botón **«Actualizar ahora»** (`api.triggerSystemUpdate()`) cuando `updateAvailable && canAutoUpdate`, y comando copiable según `runtimeMode` (`docker compose pull && docker compose up -d` vs `git pull && npm run build`) cuando `canAutoUpdate === false`.
+- [x] **`OverviewTab.tsx` / Topbar (Detección y ejecución de actualizaciones, `HU-41`)**: implementado en PR #48 (ver ajustes pendientes en Sección 4).
+
+---
+
+## 4. Pendientes UI acumulados (Ronda 2 — para próxima PR de diseño)
+
+Lista viva de ajustes, añadidos y correcciones que debe implementar la IA de diseño en la siguiente PR (sin tocar `panel/src/api.ts`, `panel/src/types.ts`, `core/`, `nodes/` ni `tests/`):
+
+1. **`UsersTab.tsx` (`HU-35`)** — *Corregir + Añadir*:
+   - Cambiar el estado inicial de `inviteEnforceStrict` de `false` a **`true`** (activado por defecto al crear invitaciones).
+   - Mostrar etiqueta visual **«Flexible»** cuando `enforceStrictQuota === false` en las tablas de usuarios e invitaciones (actualmente solo muestra «Estricta» si es `true`).
+   - *(Menor, `HU-31`)*: En invitaciones no usadas pero ya expiradas, mostrar **«Expirada»** en vez de «Pendiente».
+2. **`OverviewTab.tsx` (`HU-41`)** — *Corregir*:
+   - Dejar el botón **«Comprobar ahora»** (`api.getUpdateStatus(true)`) siempre accesible para `admin` (actualmente está escondido dentro de `updateStatus?.updateAvailable`, impidiendo forzar la comprobación cuando aún no hay actualización detectada).
+3. **`NodesTab.tsx` (`HU-41`)** — *Corregir*:
+   - Manejar `node.updateAvailable === null` (cuando el nodo es antiguo y no reporta `commit` o aún no hubo check remoto): mostrar estado neutro o botón **«Actualizar nodo»** en vez de mostrar falsamente «Al día».
+4. **`MetricsTab.tsx` y `ApiKeysTab.tsx` (`HU-37`)** — *Añadir*:
+   - En `MetricsTab.tsx`: renderizar **`requestsCount`** en la sección de actividad (junto a los tokens).
+   - En `ApiKeysTab.tsx`: mostrar columnas/indicadores compactos de **`usedTokens`** y **`requestsCount`** por clave (ya devueltos por `GET /api/keys`).
+5. **`OverviewTab.tsx` y `MetricsTab.tsx` (`HU-39`)** — *Añadir*:
+   - Renderizar el desglose por proveedor de cuota adaptativa (**`providerQuotas` / `freeQuota.providers`**).
+   - Añadir el bloque/indicador de ventana activa (`hora`/`día`/`semana`) y confianza (`Exacto por cabecera`/`Configurado`/`Inferido por 429`) también en **`MetricsTab.tsx`**.
+6. **`MetricsTab.tsx` (`HU-34`)** — *Corregir*:
+   - Formatear los valores de velocidad por modelo (`tok/s`) con `toLocaleString('es-ES', { maximumFractionDigits: 1 })` en lugar de `.toFixed(1)` / `Math.round(...)` crudos, y pulir cualquier fallo restante de alineación o espaciado visual en la tabla y tarjetas de percentiles (separación etiqueta/valor, `tabular-nums` y unidades).
+7. **`CompareTab.tsx` (`HU-30` y NVIDIA NIM `thinking`)** — *Corregir + Añadir*:
+   - Filtrar fuera del selector de modelos del Playground cualquier modelo con `disabledByAdmin === true` (un modelo desactivado globalmente no debe aparecer como opción seleccionable en el Playground).
+   - Añadir la opción **«Desactivado» (`none`)** en el selector de esfuerzo de razonamiento (`reasoning_effort`, junto a `low`, `medium`, `high`). El backend ya soporta `'none'` y para `nvidia-nim` envía `chat_template_kwargs: { enable_thinking: false }` cuando se selecciona explícitamente `'none'`.
 

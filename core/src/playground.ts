@@ -145,8 +145,10 @@ export async function handlePlaygroundChat(
 
   // Validate reasoning_effort / reasoningEffort ('none' | 'low' | 'medium' | 'high')
   const rawEffort = rawBody.reasoning_effort ?? rawBody.reasoningEffort;
+  const hasExplicitReasoningEffort =
+    rawEffort !== undefined && rawEffort !== null && rawEffort !== '';
   let reasoningEffort: ReasoningEffort = 'none';
-  if (rawEffort !== undefined && rawEffort !== null && rawEffort !== '') {
+  if (hasExplicitReasoningEffort) {
     if (typeof rawEffort !== 'string' || !VALID_REASONING_EFFORTS.has(rawEffort.trim().toLowerCase())) {
       return jsonResponse(
         {
@@ -210,7 +212,7 @@ export async function handlePlaygroundChat(
 
   if (
     !modelRow ||
-    (user.role !== 'admin' && Number(modelRow.disabled_by_admin ?? 0) === 1) ||
+    Number(modelRow.disabled_by_admin ?? 0) === 1 ||
     isProviderOrAllKeysDraining(modelRow.provider_id)
   ) {
     return jsonResponse(
@@ -266,6 +268,15 @@ export async function handlePlaygroundChat(
   }
   if (reasoningEffort !== 'none') {
     upstreamPayload.reasoning_effort = reasoningEffort;
+  } else if (
+    hasExplicitReasoningEffort &&
+    modelRow.provider_id === 'nvidia-nim' &&
+    rawBody.chat_template_kwargs === undefined
+  ) {
+    upstreamPayload.chat_template_kwargs = { enable_thinking: false };
+  }
+  if (rawBody.chat_template_kwargs !== undefined) {
+    upstreamPayload.chat_template_kwargs = rawBody.chat_template_kwargs;
   }
   if (rawBody.tools !== undefined) {
     upstreamPayload.tools = rawBody.tools;

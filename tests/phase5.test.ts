@@ -734,7 +734,7 @@ describe('Phase 5 Backend — Telemetry, UTC Quota, Percentiles, 60d Uptime, Act
       assert.equal(orModelSpeed?.ttftMs.p95, 105);
       assert.equal(orModelSpeed?.tokensPerSec.p50, 70);
       assert.equal(orModelSpeed?.tokensPerSec.p99, 119);
-      assert.equal(groqModelSpeed?.ttftMs.p50, null);
+      assert.equal(groqModelSpeed, undefined);
 
       const orCache = speedBody.cacheByProvider.find((p) => p.providerId === 'openrouter');
       const groqCache = speedBody.cacheByProvider.find((p) => p.providerId === 'groq');

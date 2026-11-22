@@ -1546,4 +1546,198 @@ describe('Bifrost v1.1 Features (P0-P2)', () => {
       }
     });
   });
+
+  describe('Backend Bugfixes (HU-30, SSE prompt_tokens, Speed Metrics, NVIDIA NIM reasoning_effort)', () => {
+    it('estimates prompt_tokens > 0 when streaming SSE omits usage, blocks disabled_by_admin in Playground even for admin, filters unused models from speed metrics, and forwards chat_template_kwargs on nvidia-nim reasoning_effort=none', async () => {
+      let clockMs = Date.UTC(2026, 10, 21, 16, 0, 0);
+      const capturedBodies: Array<Record<string, unknown>> = [];
+
+      const mockFetch: typeof fetch = async (input, init) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url.endsWith('/chat/completions')) {
+          const parsedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+          capturedBodies.push(parsedBody);
+          clockMs += 50;
+
+          if (parsedBody.stream === true) {
+            const encoder = new TextEncoder();
+            const sseStream = new ReadableStream<Uint8Array>({
+              start(ctrl) {
+                ctrl.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({
+                      id: 'chatcmpl-no-usage-sse',
+                      choices: [{ index: 0, delta: { content: 'Hello without usage!' }, finish_reason: 'stop' }],
+                    })}\n\n`,
+                  ),
+                );
+                ctrl.enqueue(encoder.encode('data: [DONE]\n\n'));
+                ctrl.close();
+              },
+            });
+            return new Response(sseStream, {
+              status: 200,
+              headers: { 'Content-Type': 'text/event-stream' },
+            });
+          }
+
+          return new Response(
+            JSON.stringify({
+              id: 'chatcmpl-no-usage-json',
+              object: 'chat.completion',
+              choices: [
+                {
+                  index: 0,
+                  message: { role: 'assistant', content: 'Non-streaming response without usage' },
+                  finish_reason: 'stop',
+                },
+              ],
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        return new Response('Not found', { status: 404 });
+      };
+
+      const { db, app, adminCookie } = await setupAdminAndProvider({
+        fetchImpl: mockFetch,
+        now: () => clockMs,
+      });
+
+      try {
+        // Install nvidia-nim provider with two static models (one used, one unused)
+        const nimProvRes = await app.request('http://localhost/api/providers', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            schemaVersion: '1.0',
+            id: 'nvidia-nim',
+            name: 'NVIDIA NIM',
+            packageType: 'official-json',
+            baseUrl: 'https://integrate.api.nvidia.com/v1',
+            auth: { type: 'bearer', header: 'Authorization', prefix: 'Bearer ' },
+            modelsSource: 'static',
+            reviewedAt: '2026-11-01',
+            staticModels: [
+              { id: 'qwen/qwen3-32b', name: 'Qwen 3 32B' },
+              { id: 'meta/llama-3.1-8b-instruct', name: 'Llama 3.1 8B (Unused)' },
+            ],
+          }),
+        });
+        assert.equal(nimProvRes.status, 201);
+
+        const nimKeyRes = await app.request('http://localhost/api/providers/nvidia-nim/keys', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label: 'NIM Key', secret: 'nvapi-test-key-1234567890' }),
+        });
+        assert.equal(nimKeyRes.status, 201);
+
+        const reloadNimRes = await app.request(
+          'http://localhost/api/providers/nvidia-nim/reload-models',
+          { method: 'POST', headers: { Cookie: adminCookie } },
+        );
+        assert.equal(reloadNimRes.status, 200);
+
+        // 1) Playground SSE call on nvidia-nim with explicit reasoning_effort: 'none'
+        //    -> forwards chat_template_kwargs: { enable_thinking: false }
+        //    -> records prompt_tokens > 0 even though upstream SSE omits usage
+        const pgRes1 = await app.request('http://localhost/api/playground/chat', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'nvidia-nim/qwen/qwen3-32b',
+            stream: true,
+            reasoning_effort: 'none',
+            messages: [{ role: 'user', content: 'Explain Bifrost routing in one sentence.' }],
+          }),
+        });
+        assert.equal(pgRes1.status, 200);
+        const pgSseBody = await pgRes1.text();
+        assert.ok(pgSseBody.includes('Hello without usage!'));
+
+        assert.equal(capturedBodies.length, 1);
+        assert.deepEqual(capturedBodies[0]!.chat_template_kwargs, { enable_thinking: false });
+        assert.equal(capturedBodies[0]!.reasoning_effort, undefined);
+
+        const sseLog = db
+          .prepare(
+            `SELECT prompt_tokens, completion_tokens, status
+             FROM usage_logs
+             WHERE model_full_id = 'nvidia-nim/qwen/qwen3-32b'
+             ORDER BY id DESC LIMIT 1`,
+          )
+          .get() as { prompt_tokens: number; completion_tokens: number; status: string };
+        assert.equal(sseLog.status, 'ok');
+        assert.ok(sseLog.prompt_tokens > 0, `Expected estimated prompt_tokens > 0, got ${sseLog.prompt_tokens}`);
+        assert.ok(sseLog.completion_tokens > 0, `Expected estimated completion_tokens > 0, got ${sseLog.completion_tokens}`);
+
+        // 2) Playground call on nvidia-nim WITHOUT reasoning_effort -> does NOT inject chat_template_kwargs
+        const pgRes2 = await app.request('http://localhost/api/playground/chat', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'nvidia-nim/qwen/qwen3-32b',
+            stream: false,
+            messages: [{ role: 'user', content: 'Non-streaming prompt without usage field.' }],
+          }),
+        });
+        assert.equal(pgRes2.status, 200);
+        assert.equal(capturedBodies.length, 2);
+        assert.equal(capturedBodies[1]!.chat_template_kwargs, undefined);
+
+        const jsonLog = db
+          .prepare(
+            `SELECT prompt_tokens, status
+             FROM usage_logs
+             WHERE model_full_id = 'nvidia-nim/qwen/qwen3-32b'
+             ORDER BY id DESC LIMIT 1`,
+          )
+          .get() as { prompt_tokens: number; status: string };
+        assert.equal(jsonLog.status, 'ok');
+        assert.ok(jsonLog.prompt_tokens > 0, `Expected non-streaming estimated prompt_tokens > 0, got ${jsonLog.prompt_tokens}`);
+
+        // 3) Speed metrics exclude unused models (sampleCount === 0)
+        const speedRes = await app.request('http://localhost/api/metrics/speed?range=today', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(speedRes.status, 200);
+        const speedJson = (await speedRes.json()) as {
+          models: Array<{ modelFullId: string; sampleCount: number }>;
+        };
+        assert.ok(
+          speedJson.models.some((m) => m.modelFullId === 'nvidia-nim/qwen/qwen3-32b' && m.sampleCount === 2),
+          'Used model should appear in speed metrics',
+        );
+        assert.ok(
+          !speedJson.models.some((m) => m.modelFullId === 'nvidia-nim/meta/llama-3.1-8b-instruct'),
+          'Unused model with sampleCount === 0 must be excluded from speed metrics',
+        );
+
+        // 4) HU-30: disabled_by_admin = 1 blocks Playground even for admin
+        const disableRes = await app.request(
+          `http://localhost/api/models/${encodeURIComponent('nvidia-nim/qwen/qwen3-32b')}/visibility`,
+          {
+            method: 'PATCH',
+            headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ disabledByAdmin: true }),
+          },
+        );
+        assert.equal(disableRes.status, 200);
+
+        const pgBlockedAdmin = await app.request('http://localhost/api/playground/chat', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'nvidia-nim/qwen/qwen3-32b',
+            stream: false,
+            messages: [{ role: 'user', content: 'Should be blocked for admin too' }],
+          }),
+        });
+        assert.equal(pgBlockedAdmin.status, 404);
+      } finally {
+        db.close();
+      }
+    });
+  });
 });
