@@ -35,7 +35,7 @@ export const PlaygroundTab: React.FC = () => {
       .getModels()
       .then((list) => {
         if (cancelled) return;
-        const active = list.filter((m) => m.active !== false);
+        const active = list.filter((m) => m.active !== false && !m.disabledByAdmin);
         setModels(active);
         if (active.length > 0) {
           setSelectedModel((prev) =>

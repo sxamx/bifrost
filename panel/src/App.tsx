@@ -216,9 +216,27 @@ export const App: React.FC = () => {
   const [cmdQuery, setCmdQuery] = useState('');
   const cmdInputRef = useRef<HTMLInputElement | null>(null);
 
-  // PWA Install State
+  // PWA Install State & Build Version
   const [installPromptEvt, setInstallPromptEvt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isStandalone, setIsStandalone] = useState<boolean>(() => detectStandaloneMode());
+  const [buildInfo, setBuildInfo] = useState<{ version?: string; buildCommit?: string | null } | null>(
+    null
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getHealth()
+      .then((h) => {
+        if (!cancelled) setBuildInfo({ version: h.version, buildCommit: h.buildCommit });
+      })
+      .catch(() => {
+        // ignore
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const tabButtonRefs = useRef<Partial<Record<ActiveTab, HTMLButtonElement | null>>>({});
 
@@ -782,6 +800,26 @@ export const App: React.FC = () => {
                 );
               })}
             </div>
+          </div>
+        ) : null}
+
+        {buildInfo?.version || buildInfo?.buildCommit ? (
+          <div
+            className="mono"
+            style={{
+              marginTop: 'auto',
+              padding: '10px 10px 4px',
+              borderTop: '1px solid var(--line)',
+              fontSize: '10.5px',
+              color: 'var(--fg-3)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 6,
+            }}
+          >
+            <span>{buildInfo.version ? `v${buildInfo.version}` : 'Bifrost'}</span>
+            {buildInfo.buildCommit ? <span>{buildInfo.buildCommit.slice(0, 7)}</span> : null}
           </div>
         ) : null}
       </aside>

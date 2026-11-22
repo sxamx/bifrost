@@ -451,7 +451,17 @@ export const NodesTab: React.FC<NodesTabProps> = ({
                               </button>
                             ) : node.updateAvailable === false ? (
                               <span className="meta-tag verified">Al día</span>
-                            ) : null}
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn btn-secondary btn-sm"
+                                disabled={updatingId === node.id}
+                                onClick={() => void handleUpdateNode(node)}
+                                title="Versión del nodo no reportada aún"
+                              >
+                                {updatingId === node.id ? 'Actualizando…' : 'Actualizar nodo'}
+                              </button>
+                            )}
                             <button
                               type="button"
                               className="btn btn-secondary btn-sm"
