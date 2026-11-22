@@ -108,7 +108,9 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
     const ok = await copyTextToClipboard(fullId);
     if (ok) {
       setCopiedId(fullId);
-      window.setTimeout(() => setCopiedId(null), 2000);
+      window.setTimeout(() => {
+        setCopiedId((prev) => (prev === fullId ? null : prev));
+      }, 2000);
     } else {
       setCopiedId(null);
     }

@@ -496,11 +496,15 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   const hasConfiguredLimit = totalLimit !== null && totalLimit > 0;
 
   const pctRemaining =
-    summary?.quotaPercentageRemaining !== null && summary?.quotaPercentageRemaining !== undefined
-      ? Math.round(summary.quotaPercentageRemaining)
-      : hasConfiguredLimit && totalLimit
-        ? Math.max(0, Math.min(100, Math.round(((totalLimit - usedToday) / totalLimit) * 100)))
-        : null;
+    freeQuota?.quotaPercentageRemaining !== null && freeQuota?.quotaPercentageRemaining !== undefined
+      ? Math.round(freeQuota.quotaPercentageRemaining)
+      : summary?.quotaPercentageRemaining !== null && summary?.quotaPercentageRemaining !== undefined
+        ? Math.round(summary.quotaPercentageRemaining)
+        : hasConfiguredLimit && totalLimit
+          ? Math.max(0, Math.min(100, Math.round(((totalLimit - usedToday) / totalLimit) * 100)))
+          : null;
+
+  const providerQuotasList = freeQuota?.providers ?? summary?.providerQuotas ?? [];
 
   const resetMode = summary?.resetMode ?? user.quotaResetMode ?? 'utc_midnight';
   const resetTargetMs = parseResetTimestampMs(summary?.nextResetAt ?? null);
@@ -810,7 +814,7 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                 </div>
                 <div className="quota-track" style={{ height: 6 }}>
                   <div
-                    className={`quota-fill ${updateProgress.isError ? 'err' : 'ok'}`}
+                    className={`quota-fill ${updateProgress.isError ? 'critical' : 'healthy'}`}
                     style={{
                       width: `${updateProgress.pct}%`,
                       transition: 'width 0.35s ease',
@@ -934,6 +938,75 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             </span>
           ) : null}
         </div>
+
+        {providerQuotasList.length > 0 ? (
+          <div
+            style={{
+              marginTop: 6,
+              paddingTop: 12,
+              borderTop: '1px solid var(--line)',
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))',
+              gap: 10,
+            }}
+          >
+            {providerQuotasList.map((pq) => {
+              const unitTxt = pq.unit === 'requests' ? 'pet.' : 'tok';
+              const winTxt = pq.windowLabel || formatActiveWindowLabel(pq.activeWindow);
+              return (
+                <div
+                  key={pq.providerId}
+                  style={{
+                    background: 'var(--bg)',
+                    border: '1px solid var(--line)',
+                    borderRadius: 8,
+                    padding: '9px 11px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 6,
+                    }}
+                  >
+                    <strong style={{ fontSize: '0.82rem', color: 'var(--fg)' }}>
+                      {pq.providerName}
+                    </strong>
+                    <span className="meta-tag mono">{winTxt}</span>
+                  </div>
+                  <div className="mono" style={{ fontSize: '0.78rem', color: 'var(--sub)' }}>
+                    <strong style={{ color: 'var(--fg)' }}>
+                      {pq.usedInWindow.toLocaleString('es-ES')}
+                    </strong>
+                    {pq.effectiveLimit
+                      ? ` / ${pq.effectiveLimit.toLocaleString('es-ES')} ${unitTxt}`
+                      : ` ${unitTxt}`}
+                  </div>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 6,
+                      fontSize: '0.72rem',
+                      color: 'var(--fg-3)',
+                    }}
+                  >
+                    <span>{formatConfidenceLabel(pq.confidence)}</span>
+                    {pq.recent429Count7d > 0 ? (
+                      <span style={{ color: 'var(--partial)' }}>{pq.recent429Count7d} × 429</span>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
       </section>
 
       {showOnboarding ? (

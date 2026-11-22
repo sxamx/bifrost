@@ -847,6 +847,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                   setSearchQuery('');
                   setProviderFilter('all');
                   setCapFilter('all');
+                  setVisibilityFilter('all');
                 }}
               >
                 Limpiar filtros

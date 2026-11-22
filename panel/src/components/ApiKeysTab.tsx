@@ -310,6 +310,7 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
                 <tr>
                   <th>Nombre</th>
                   <th>Prefijo</th>
+                  <th>Uso</th>
                   <th>Creada</th>
                   <th>Vencimiento</th>
                   <th>Último uso</th>
@@ -331,6 +332,16 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
                       <td style={{ fontWeight: 700 }}>{item.name}</td>
                       <td>
                         <code className="key-prefix-pill">{formatKeyPrefix(item.keyPrefix)}</code>
+                      </td>
+                      <td className="mono" style={{ fontSize: '0.78rem', color: 'var(--sub)' }}>
+                        {typeof item.usedTokens === 'number' || typeof item.requestsCount === 'number' ? (
+                          <span>
+                            {(item.usedTokens ?? 0).toLocaleString('es-ES')} tok ·{' '}
+                            {(item.requestsCount ?? 0).toLocaleString('es-ES')} pet.
+                          </span>
+                        ) : (
+                          '—'
+                        )}
                       </td>
                       <td style={{ color: 'var(--sub)' }}>{formatCreatedDate(item.createdAt)}</td>
                       <td>
