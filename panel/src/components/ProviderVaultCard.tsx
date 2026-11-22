@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
 import type {
   ExitNodeItem,
+  MarketplaceProviderEntry,
   ModelSyncDiff,
   ProviderKeyItem,
   ProviderKeyTestResult,
@@ -17,6 +18,9 @@ interface ProviderVaultCardProps {
   keys: ProviderKeyItem[];
   models: ProviderModelItem[];
   nodes: ExitNodeItem[];
+  catalogEntry?: MarketplaceProviderEntry | null;
+  updatingManifest?: boolean;
+  onUpdateManifest?: () => void;
   onOpenModel?: (fullId: string) => void;
   onRefreshAll: () => Promise<void>;
   onRequestDeleteProvider: (provider: ProviderSummary) => void;
@@ -86,6 +90,9 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
   keys,
   models,
   nodes,
+  catalogEntry,
+  updatingManifest = false,
+  onUpdateManifest,
   onOpenModel,
   onRefreshAll,
   onRequestDeleteProvider,
@@ -431,17 +438,66 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
             {!isStaticSource && provider.lastModelsSyncAt ? (
               <span>Sincronizado: {formatSyncDate(provider.lastModelsSyncAt)}</span>
             ) : null}
+            {provider.sourceId ? (
+              <span>
+                Fuente: <code className="mono">{provider.sourceId}</code>
+              </span>
+            ) : null}
+            {provider.manifestHash ? (
+              <span>
+                Hash: <code className="mono">{provider.manifestHash.slice(0, 8)}</code>
+              </span>
+            ) : null}
           </div>
         </div>
 
-        <button
-          type="button"
-          className="btn btn-danger btn-sm"
-          onClick={() => onRequestDeleteProvider(provider)}
-        >
-          Eliminar proveedor
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          {catalogEntry?.updateAvailable && onUpdateManifest ? (
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              disabled={updatingManifest}
+              onClick={onUpdateManifest}
+              title={`Actualización disponible: ${(catalogEntry.installedHash || provider.manifestHash || '').slice(0, 8)} → ${catalogEntry.manifestVersion || catalogEntry.manifestHash?.slice(0, 8) || 'nueva'}`}
+            >
+              {updatingManifest ? 'Actualizando…' : 'Actualizar ficha'}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="btn btn-danger btn-sm"
+            onClick={() => onRequestDeleteProvider(provider)}
+          >
+            Eliminar proveedor
+          </button>
+        </div>
       </div>
+
+      {catalogEntry?.updateAvailable ? (
+        <div className="diff-banner" role="status">
+          <span>
+            Hay una actualización disponible para la ficha de <strong>{provider.name}</strong>:{' '}
+            <code className="mono">
+              {(catalogEntry.installedHash || provider.manifestHash || 'local').slice(0, 8)}
+            </code>{' '}
+            →{' '}
+            <strong className="mono">
+              {catalogEntry.manifestVersion || catalogEntry.manifestHash?.slice(0, 8) || 'nueva'}
+            </strong>{' '}
+            (tus claves y modelos se conservarán).
+          </span>
+          {onUpdateManifest ? (
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              disabled={updatingManifest}
+              onClick={onUpdateManifest}
+            >
+              {updatingManifest ? 'Actualizando…' : 'Actualizar'}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       {cardError ? (
         <div className="alert alert-error" role="alert">

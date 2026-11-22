@@ -995,9 +995,13 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                       gap: 6,
                       fontSize: '0.72rem',
                       color: 'var(--fg-3)',
+                      flexWrap: 'wrap',
                     }}
                   >
-                    <span>{formatConfidenceLabel(pq.confidence)}</span>
+                    <span>
+                      {formatConfidenceLabel(pq.confidence)} · {pq.usableKeysCount}{' '}
+                      {pq.usableKeysCount === 1 ? 'clave' : 'claves'}
+                    </span>
                     {pq.recent429Count7d > 0 ? (
                       <span style={{ color: 'var(--partial)' }}>{pq.recent429Count7d} × 429</span>
                     ) : null}
