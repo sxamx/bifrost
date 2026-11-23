@@ -375,18 +375,26 @@ export async function triggerSystemUpdate(
   if (updateInFlight) {
     throw new SystemUpdateError('A system update is already in progress.', 409);
   }
+  updateInFlight = true;
 
   if (options.db) {
-    const status = await checkSystemUpdate({
-      db: options.db,
-      fetchImpl,
-      forceRefresh: true,
-      runtimeMode,
-      repoDir,
-      watchtowerUrl,
-      currentCommit: options.currentCommit,
-    });
+    let status: SystemUpdateStatus;
+    try {
+      status = await checkSystemUpdate({
+        db: options.db,
+        fetchImpl,
+        forceRefresh: true,
+        runtimeMode,
+        repoDir,
+        watchtowerUrl,
+        currentCommit: options.currentCommit,
+      });
+    } catch (err) {
+      updateInFlight = false;
+      throw err;
+    }
     if (status.currentCommit && status.latestCommit && !status.updateAvailable) {
+      updateInFlight = false;
       return {
         ok: true,
         upToDate: true,
@@ -396,11 +404,6 @@ export async function triggerSystemUpdate(
       };
     }
   }
-
-  if (updateInFlight) {
-    throw new SystemUpdateError('A system update is already in progress.', 409);
-  }
-  updateInFlight = true;
 
   // Docker + Watchtower mode (or explicit BIFROST_WATCHTOWER_URL)
   if (mode === 'watchtower') {
@@ -422,7 +425,6 @@ export async function triggerSystemUpdate(
         if (!response.ok) {
           const errMsg = `Watchtower returned HTTP ${response.status}`;
           setUpdatePhase('error', errMsg);
-          updateInFlight = false;
         }
       } catch (err) {
         const name = err instanceof Error ? err.name : '';
@@ -434,8 +436,9 @@ export async function triggerSystemUpdate(
         if (!isExpectedRestartInterrupt) {
           const errMsg = `Failed to reach Watchtower at ${endpoint}: ${msg}`;
           setUpdatePhase('error', errMsg);
-          updateInFlight = false;
         }
+      } finally {
+        updateInFlight = false;
       }
     })();
 

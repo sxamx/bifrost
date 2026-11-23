@@ -1049,5 +1049,66 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       else process.env.BIFROST_BUILD_COMMIT = prevCommit;
     }
   });
+
+  it('releases updateInFlight lock after Watchtower 200 OK if container survives so a new POST /api/system/update does not 409', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+    let wtCalls = 0;
+
+    const app = createApp({
+      db,
+      masterKey,
+      fetchImpl: async (input) => {
+        if (String(input) === GITHUB_COMMITS_MAIN_URL) {
+          return makeGitHubCommitResponse('2222222222222222222222222222222222222222');
+        }
+        wtCalls += 1;
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+
+    const setupRes = await app.request('http://localhost/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'adminPassword123!' }),
+    });
+    assert.equal(setupRes.status, 201);
+    const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+    const prevRuntime = process.env.BIFROST_RUNTIME;
+    const prevWtUrl = process.env.BIFROST_WATCHTOWER_URL;
+    const prevCommit = process.env.BIFROST_BUILD_COMMIT;
+
+    try {
+      process.env.BIFROST_RUNTIME = 'docker';
+      process.env.BIFROST_WATCHTOWER_URL = 'http://watchtower.internal:8080';
+      process.env.BIFROST_BUILD_COMMIT = '1111111';
+
+      // First Watchtower trigger completes with 200 OK without killing the process
+      const firstRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(firstRes.status, 202);
+      await waitForBackgroundUpdateForTests();
+      assert.equal(wtCalls, 1);
+
+      // Without calling resetUpdatePhaseForTests(), a subsequent POST must NOT return 409
+      const secondRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(secondRes.status, 202);
+      await waitForBackgroundUpdateForTests();
+      assert.equal(wtCalls, 2);
+    } finally {
+      if (prevRuntime === undefined) delete process.env.BIFROST_RUNTIME;
+      else process.env.BIFROST_RUNTIME = prevRuntime;
+      if (prevWtUrl === undefined) delete process.env.BIFROST_WATCHTOWER_URL;
+      else process.env.BIFROST_WATCHTOWER_URL = prevWtUrl;
+      if (prevCommit === undefined) delete process.env.BIFROST_BUILD_COMMIT;
+      else process.env.BIFROST_BUILD_COMMIT = prevCommit;
+    }
+  });
 });
 
