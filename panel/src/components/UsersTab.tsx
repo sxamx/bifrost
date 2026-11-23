@@ -309,7 +309,7 @@ export const UsersTab: React.FC = () => {
                 id="inv-daily-limit"
                 type="number"
                 min={100}
-                step={1000}
+                step={100}
                 className="input mono"
                 value={inviteDailyLimit}
                 onChange={(e) => setInviteDailyLimit(Number(e.target.value))}
