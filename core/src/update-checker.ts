@@ -479,6 +479,7 @@ export async function triggerSystemUpdate(
       const msg = err instanceof Error ? err.message : String(err);
       const errMsg = `Native update failed: ${msg}`;
       setUpdatePhase('error', errMsg);
+    } finally {
       updateInFlight = false;
     }
   })();
