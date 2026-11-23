@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { copyTextToClipboard } from '../clipboard';
 import type {
@@ -34,6 +34,10 @@ const ModelTelemetryBlock: React.FC<ModelTelemetryBlockProps> = ({ model }) => {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    setSpeedEntry(null);
+    setCacheEntry(null);
+    setUptimeEntry(null);
+    setActivityEntry(null);
 
     Promise.allSettled([
       api.getMetricsSpeed(),
@@ -169,7 +173,7 @@ const ModelTelemetryBlock: React.FC<ModelTelemetryBlockProps> = ({ model }) => {
                   </strong>
                 </div>
                 <div className="uptime-strip" style={{ height: 18 }}>
-                  {uptimeEntry.days.slice(-30).map((d, idx) => {
+                  {uptimeEntry.days.slice(-60).map((d, idx) => {
                     const cls =
                       d.uptimePct === null
                         ? 'notraffic'
@@ -306,6 +310,15 @@ function formatPrivacyPill(
       tip: privacy.note || 'Sin retención de prompts y sin entrenamiento.',
     };
   }
+  if (privacy.retention === 'zero') {
+    return {
+      label: 'ZDR parcial',
+      cls: 'meta-tag accent',
+      tip:
+        privacy.note ||
+        'Sin retención de prompts (política de entrenamiento opt-out o no confirmada).',
+    };
+  }
   if (privacy.retention === 'retained' || privacy.training === 'allowed') {
     return {
       label: 'Sin ZDR',
@@ -328,6 +341,12 @@ function formatPrivacyPill(
 }
 
 function formatReferencePricing(model: ProviderModelItem): string {
+  if (model.isFree === false) {
+    if (model.pricing?.prompt !== undefined || model.pricing?.completion !== undefined) {
+      return `$${model.pricing?.prompt ?? 0} in / $${model.pricing?.completion ?? 0} out`;
+    }
+    return 'Tarifa estándar (de pago)';
+  }
   const refIn = model.pricing?.referencePromptPer1M;
   const refOut = model.pricing?.referenceCompletionPer1M;
   if (typeof refIn === 'number' || typeof refOut === 'number') {
@@ -358,6 +377,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
   const [selectedFullId, setSelectedFullId] = useState<string | null>(null);
   const [detailModel, setDetailModel] = useState<ProviderModelItem | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const detailReqIdRef = useRef(0);
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -427,6 +447,7 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
 
   const openModelDetail = useCallback(
     async (targetFullId: string) => {
+      const reqId = ++detailReqIdRef.current;
       setSelectedFullId(targetFullId);
       const localMatch =
         models.find((m) => m.fullId.toLowerCase() === targetFullId.toLowerCase()) ?? null;
@@ -435,12 +456,14 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
 
       try {
         const fetchedDetail = await api.getModelDetail(targetFullId);
+        if (reqId !== detailReqIdRef.current) return;
         setDetailModel((prev) => ({
           ...(prev ?? {}),
           ...fetchedDetail,
           fullId: fetchedDetail.fullId || targetFullId,
         }));
       } catch {
+        if (reqId !== detailReqIdRef.current) return;
         if (!localMatch) {
           const parts = targetFullId.split('/');
           const providerId = parts.length > 1 ? parts[0] : 'referencia';
@@ -458,7 +481,9 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
           });
         }
       } finally {
-        setDetailLoading(false);
+        if (reqId === detailReqIdRef.current) {
+          setDetailLoading(false);
+        }
       }
     },
     [models]
@@ -519,6 +544,36 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
       );
     }).sort((a, b) => Number(Boolean(a.disabledByAdmin)) - Number(Boolean(b.disabledByAdmin)));
   }, [models, providerFilter, capFilter, visibilityFilter, isAdmin, searchQuery]);
+
+  /* DETAIL LOADING STATE (when target model is not in local catalog yet) */
+  if (selectedFullId && !detailModel) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+        <div>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            onClick={() => {
+              detailReqIdRef.current += 1;
+              setSelectedFullId(null);
+              setDetailModel(null);
+              setDetailLoading(false);
+            }}
+          >
+            ← Volver al catálogo de modelos
+          </button>
+        </div>
+        <section className="card">
+          <div className="empty-state" role="status" aria-live="polite">
+            <div className="spinner" aria-hidden="true" />
+            <p className="field-hint">
+              Cargando ficha y benchmarks de <code className="mono">{selectedFullId}</code>…
+            </p>
+          </div>
+        </section>
+      </div>
+    );
+  }
 
   /* DETAIL VIEW (HU-14, HU-14b, HU-14c, HU-15, HU-16) */
   if (selectedFullId && detailModel) {
@@ -876,12 +931,12 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                       <ProviderLogo
                         slug={model.logoSlug || model.providerId}
                         name={model.providerName || model.providerId}
-                        size={38}
+                        size={36}
                       />
                       <div style={{ minWidth: 0 }}>
                         <div
                           style={{
-                            fontSize: '0.76rem',
+                            fontSize: '0.75rem',
                             fontWeight: 700,
                             color: 'var(--sub)',
                             textTransform: 'uppercase',
@@ -916,19 +971,6 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                             </span>
                           ) : null}
                         </div>
-                        <h3
-                          style={{
-                            fontSize: '1.02rem',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            whiteSpace: 'nowrap',
-                            cursor: 'pointer',
-                            opacity: model.disabledByAdmin ? 0.58 : 1,
-                          }}
-                          onClick={() => void openModelDetail(model.fullId)}
-                        >
-                          {model.name}
-                        </h3>
                       </div>
                     </div>
 
@@ -947,6 +989,23 @@ export const ModelsTab: React.FC<ModelsTabProps> = ({
                       </button>
                     ) : null}
                   </div>
+
+                  <h3
+                    style={{
+                      fontSize: '1.02rem',
+                      lineHeight: 1.3,
+                      display: '-webkit-box',
+                      WebkitLineClamp: 2,
+                      WebkitBoxOrient: 'vertical',
+                      overflow: 'hidden',
+                      cursor: 'pointer',
+                      opacity: model.disabledByAdmin ? 0.58 : 1,
+                    }}
+                    title={model.name}
+                    onClick={() => void openModelDetail(model.fullId)}
+                  >
+                    {model.name}
+                  </h3>
 
                   {/* Copyable provider/model ID on every card (HU-15) */}
                   <div

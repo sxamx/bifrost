@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
 import type {
   ExitNodeItem,
@@ -174,12 +174,27 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
     }
   }
 
+  const [collisionError, setCollisionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!collisionPrompt) return;
+    setCollisionError(null);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !updatingKeyNodeId) {
+        setCollisionPrompt(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [collisionPrompt, updatingKeyNodeId]);
+
   async function executeNodeAssignment(
     key: ProviderKeyItem,
     targetNodeId: string | null,
     confirmForce: boolean
   ) {
     setCardError(null);
+    setCollisionError(null);
     setUpdatingKeyNodeId(key.id);
 
     try {
@@ -210,11 +225,15 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
           existingKeysOnNode: siblings,
         });
       } else {
-        setCardError(
+        const msg =
           err instanceof ApiError
             ? err.message
-            : 'No fue posible actualizar el nodo asignado a la clave.'
-        );
+            : 'No fue posible actualizar el nodo asignado a la clave.';
+        if (confirmForce) {
+          setCollisionError(msg);
+        } else {
+          setCardError(msg);
+        }
       }
     } finally {
       setUpdatingKeyNodeId(null);
@@ -754,7 +773,7 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
                             alignItems: 'center',
                             justifyContent: 'flex-end',
                             gap: 6,
-                            flexWrap: 'wrap',
+                            flexWrap: 'nowrap',
                           }}
                         >
                           <button
@@ -1066,6 +1085,12 @@ export const ProviderVaultCard: React.FC<ProviderVaultCardProps> = ({
                     </li>
                   ))}
                 </ul>
+              </div>
+            ) : null}
+
+            {collisionError ? (
+              <div className="alert alert-error" role="alert">
+                <span>{collisionError}</span>
               </div>
             ) : null}
 

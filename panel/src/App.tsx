@@ -238,7 +238,7 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  const tabButtonRefs = useRef<Partial<Record<ActiveTab, HTMLButtonElement | null>>>({});
+  const sessionVersionRef = useRef(0);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', themeMode);
@@ -332,6 +332,7 @@ export const App: React.FC = () => {
   }
 
   const loadWorkspaceData = useCallback(async (role: string) => {
+    const reqSession = sessionVersionRef.current;
     setKeysLoading(true);
     if (role === 'admin') {
       setProvidersLoading(true);
@@ -346,12 +347,15 @@ export const App: React.FC = () => {
       role === 'admin' ? api.getNodes() : Promise.resolve([] as ExitNodeItem[]),
     ]);
 
+    if (reqSession !== sessionVersionRef.current) return;
+
     if (
       role === 'admin' &&
       providersRes.status === 'fulfilled' &&
       Array.isArray(providersRes.value?.providers)
     ) {
       const hydrated = await enrichProvidersWithKeys(providersRes.value.providers);
+      if (reqSession !== sessionVersionRef.current) return;
       setProviders(hydrated);
       setProvidersLoaded(true);
     } else {
@@ -432,7 +436,9 @@ export const App: React.FC = () => {
   }, [bootstrap]);
 
   const refreshKeysAndStats = useCallback(async () => {
+    const reqSession = sessionVersionRef.current;
     const [keysResult, meResult] = await Promise.allSettled([api.getKeys(), api.getMe()]);
+    if (reqSession !== sessionVersionRef.current) return;
     if (keysResult.status === 'fulfilled' && Array.isArray(keysResult.value?.keys)) {
       setKeys(keysResult.value.keys);
     }
@@ -446,6 +452,7 @@ export const App: React.FC = () => {
   }, []);
 
   const refreshProvidersNodesAndStats = useCallback(async () => {
+    const reqSession = sessionVersionRef.current;
     setProvidersLoading(true);
     setNodesLoading(true);
     const [providersResult, nodesResult, meResult] = await Promise.allSettled([
@@ -453,9 +460,11 @@ export const App: React.FC = () => {
       api.getNodes(),
       api.getMe(),
     ]);
+    if (reqSession !== sessionVersionRef.current) return;
 
     if (providersResult.status === 'fulfilled' && Array.isArray(providersResult.value?.providers)) {
       const hydrated = await enrichProvidersWithKeys(providersResult.value.providers);
+      if (reqSession !== sessionVersionRef.current) return;
       setProviders(hydrated);
       setProvidersLoaded(true);
     }
@@ -476,6 +485,7 @@ export const App: React.FC = () => {
   }, []);
 
   async function handleLogout() {
+    sessionVersionRef.current += 1;
     setLoggingOut(true);
     setMobileMenuOpen(false);
     try {
@@ -486,8 +496,12 @@ export const App: React.FC = () => {
       setLoggingOut(false);
       setUser(null);
       setProviders([]);
+      setProvidersLoaded(false);
+      setProvidersLoading(false);
       setNodes([]);
+      setNodesLoading(false);
       setKeys([]);
+      setKeysLoading(false);
       setActiveTab('overview');
       setStage('login');
     }
@@ -545,6 +559,70 @@ export const App: React.FC = () => {
       (t) => t.label.toLowerCase().includes(q) || t.id.toLowerCase().includes(q)
     );
   }, [allVisibleTabs, cmdQuery]);
+
+  const filteredCmdProviders = useMemo(() => {
+    const q = cmdQuery.trim().toLowerCase();
+    if (!q || !isAdmin) return [];
+    return providers
+      .filter((p) => p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q))
+      .slice(0, 6);
+  }, [cmdQuery, isAdmin, providers]);
+
+  const filteredCmdKeys = useMemo(() => {
+    const q = cmdQuery.trim().toLowerCase();
+    if (!q) return [];
+    return keys
+      .filter(
+        (k) =>
+          (k.name ?? '').toLowerCase().includes(q) ||
+          (k.keyPrefix ?? '').toLowerCase().includes(q)
+      )
+      .slice(0, 6);
+  }, [cmdQuery, keys]);
+
+  const filteredCmdActions = useMemo(() => {
+    const q = cmdQuery.trim().toLowerCase();
+    const actions = [
+      {
+        id: 'create-key',
+        label: '+ Crear nueva clave interna sk-bf-…',
+        hint: 'API Keys',
+        keywords: 'crear nueva clave api key sk-bf',
+        run: () => {
+          setCmdOpen(false);
+          setActiveTab('keys');
+          setAutoFocusKeyInput(true);
+        },
+      },
+      {
+        id: 'copy-v1',
+        label: 'Copiar endpoint compatible con OpenAI',
+        hint: '/v1',
+        keywords: 'copiar endpoint openai url v1',
+        run: () => {
+          void handleCopyTopEndpoint();
+          setCmdOpen(false);
+        },
+      },
+      {
+        id: 'toggle-theme',
+        label: `Cambiar a modo ${themeMode === 'dark' ? 'Claro' : 'Oscuro'}`,
+        hint: 'Tema',
+        keywords: 'tema modo oscuro claro dark light',
+        run: () => {
+          setThemeMode((m) => (m === 'dark' ? 'light' : 'dark'));
+          setCmdOpen(false);
+        },
+      },
+    ];
+    if (!q) return actions;
+    return actions.filter(
+      (a) =>
+        a.label.toLowerCase().includes(q) ||
+        a.hint.toLowerCase().includes(q) ||
+        a.keywords.includes(q)
+    );
+  }, [cmdQuery, themeMode]);
 
   if (stage === 'loading') {
     return (
@@ -752,9 +830,6 @@ export const App: React.FC = () => {
               return (
                 <button
                   key={item.id}
-                  ref={(el) => {
-                    tabButtonRefs.current[item.id] = el;
-                  }}
                   type="button"
                   className={`sidebar-nav-item${isActive ? ' active' : ''}`}
                   aria-current={isActive ? 'page' : undefined}
@@ -782,9 +857,6 @@ export const App: React.FC = () => {
                 return (
                   <button
                     key={item.id}
-                    ref={(el) => {
-                      tabButtonRefs.current[item.id] = el;
-                    }}
                     type="button"
                     className={`sidebar-nav-item${isActive ? ' active' : ''}`}
                     aria-current={isActive ? 'page' : undefined}
@@ -964,9 +1036,19 @@ export const App: React.FC = () => {
                 type="text"
                 value={cmdQuery}
                 onChange={(e) => setCmdQuery(e.target.value)}
-                placeholder="Ir a sección, crear clave sk-bf-… o cambiar tema…"
+                placeholder="Buscar sección, proveedor o clave…"
               />
-              <span className="kbd">ESC</span>
+              <button
+                type="button"
+                className="cmd-close-btn"
+                onClick={() => setCmdOpen(false)}
+                aria-label="Cerrar buscador rápido"
+              >
+                <span className="cmd-close-kbd">ESC</span>
+                <span className="cmd-close-x" aria-hidden="true">
+                  ×
+                </span>
+              </button>
             </div>
             <div className="cmd-list">
               {filteredCmdTabs.map((t) => (
@@ -985,48 +1067,64 @@ export const App: React.FC = () => {
                   </span>
                 </button>
               ))}
-              <button
-                type="button"
-                className="cmd-item"
-                onClick={() => {
-                  setCmdOpen(false);
-                  setActiveTab('keys');
-                  setAutoFocusKeyInput(true);
-                }}
-              >
-                <span>+ Crear nueva clave interna sk-bf-…</span>
-                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
-                  API Keys
-                </span>
-              </button>
-              <button
-                type="button"
-                className="cmd-item"
-                onClick={() => {
-                  void handleCopyTopEndpoint();
-                  setCmdOpen(false);
-                }}
-              >
-                <span>Copiar endpoint compatible con OpenAI</span>
-                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
-                  /v1
-                </span>
-              </button>
-              <button
-                type="button"
-                className="cmd-item"
-                onClick={() => {
-                  setThemeMode((m) => (m === 'dark' ? 'light' : 'dark'));
-                  setCmdOpen(false);
-                }}
-              >
-                <span>
-                  Cambiar a modo {themeMode === 'dark' ? 'Claro' : 'Oscuro'}
-                </span>
-                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
-                  Tema
-                </span>
-              </button>
+              {filteredCmdProviders.map((p) => (
+                <button
+                  key={`cmd-prov-${p.id}`}
+                  type="button"
+                  className="cmd-item"
+                  onClick={() => {
+                    setTargetProviderId(p.id);
+                    setProvidersSubView('installed');
+                    selectSection('providers');
+                  }}
+                >
+                  <span>Proveedor: {p.name}</span>
+                  <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                    {p.id}
+                  </span>
+                </button>
+              ))}
+              {filteredCmdKeys.map((k) => (
+                <button
+                  key={`cmd-key-${k.id}`}
+                  type="button"
+                  className="cmd-item"
+                  onClick={() => selectSection('keys')}
+                >
+                  <span>Clave: {k.name || k.keyPrefix}</span>
+                  <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                    {k.keyPrefix}…
+                  </span>
+                </button>
+              ))}
+              {filteredCmdActions.map((act) => (
+                <button
+                  key={`cmd-act-${act.id}`}
+                  type="button"
+                  className="cmd-item"
+                  onClick={act.run}
+                >
+                  <span>{act.label}</span>
+                  <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>
+                    {act.hint}
+                  </span>
+                </button>
+              ))}
+              {filteredCmdTabs.length === 0 &&
+              filteredCmdProviders.length === 0 &&
+              filteredCmdKeys.length === 0 &&
+              filteredCmdActions.length === 0 ? (
+                <div
+                  style={{
+                    padding: '16px 12px',
+                    textAlign: 'center',
+                    fontSize: '0.82rem',
+                    color: 'var(--sub)',
+                  }}
+                >
+                  Sin resultados para «{cmdQuery.trim()}».
+                </div>
+              ) : null}
             </div>
           </div>
         </div>
@@ -1251,7 +1349,12 @@ export const App: React.FC = () => {
         ))}
         <button
           type="button"
-          className={`mobile-bottom-btn${mobileMenuOpen ? ' active' : ''}`}
+          className={`mobile-bottom-btn${
+            mobileMenuOpen ||
+            !(['overview', 'models', 'metrics', 'playground'] as ActiveTab[]).includes(activeTab)
+              ? ' active'
+              : ''
+          }`}
           onClick={() => setMobileMenuOpen(true)}
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
