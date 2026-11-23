@@ -3,6 +3,7 @@ import { api, ApiError } from '../api';
 import type {
   ExitNodeItem,
   MarketplaceCatalogState,
+  MarketplaceSourceItem,
   ProviderCategory,
   ProviderKeyItem,
   ProviderManifest,
@@ -177,6 +178,15 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     offline: false,
   });
   const [catalogLoading, setCatalogLoading] = useState(false);
+  const [sources, setSources] = useState<MarketplaceSourceItem[]>([]);
+  const [sourcesExpanded, setSourcesExpanded] = useState(false);
+  const [togglingSourceId, setTogglingSourceId] = useState<string | null>(null);
+  const [deletingSourceId, setDeletingSourceId] = useState<string | null>(null);
+  const [newSourceName, setNewSourceName] = useState('');
+  const [newSourceUrl, setNewSourceUrl] = useState('');
+  const [addingSource, setAddingSource] = useState(false);
+  const [updatingProviderId, setUpdatingProviderId] = useState<string | null>(null);
+  const [updatingAllProviders, setUpdatingAllProviders] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<MarketplaceCategoryFilter>('all');
   const [installingId, setInstallingId] = useState<string | null>(null);
@@ -214,21 +224,132 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     }
   }, [initialExpandedProviderId, onInitialExpandedProviderConsumed]);
 
-  const loadCatalog = useCallback(async () => {
+  const loadCatalog = useCallback(async (refresh = false) => {
     setCatalogLoading(true);
     try {
-      const state = await api.getMarketplace();
-      setCatalog(state);
-    } catch (err) {
-      setCatalog({
-        manifests: [],
-        offline: true,
-        notice: err instanceof Error ? err.message : 'Catálogo fuera de línea.',
-      });
+      const [stateRes, sourcesRes] = await Promise.allSettled([
+        api.getMarketplace(refresh),
+        api.getMarketplaceSources(),
+      ]);
+      if (stateRes.status === 'fulfilled') {
+        setCatalog(stateRes.value);
+        if (sourcesRes.status === 'fulfilled') {
+          setSources(sourcesRes.value);
+        } else if (Array.isArray(stateRes.value.sources)) {
+          setSources(stateRes.value.sources);
+        }
+        if (refresh) {
+          const cnt = stateRes.value.updatesAvailableCount ?? 0;
+          setGlobalBanner(
+            cnt > 0
+              ? `Comprobación completada: ${cnt} ${
+                  cnt === 1 ? 'actualización disponible' : 'actualizaciones disponibles'
+                } en el catálogo.`
+              : 'Catálogo comprobado: todos los proveedores instalados están al día.'
+          );
+        }
+      } else {
+        setCatalog({
+          manifests: [],
+          offline: true,
+          notice:
+            stateRes.reason instanceof Error
+              ? stateRes.reason.message
+              : 'Catálogo fuera de línea.',
+        });
+      }
     } finally {
       setCatalogLoading(false);
     }
   }, []);
+
+  async function handleToggleSource(src: MarketplaceSourceItem) {
+    setGlobalError(null);
+    setTogglingSourceId(src.id);
+    try {
+      await api.updateMarketplaceSource(src.id, { enabled: !src.enabled });
+      await loadCatalog(false);
+    } catch (err) {
+      setGlobalError(
+        err instanceof ApiError ? err.message : 'No se pudo actualizar el repositorio.'
+      );
+    } finally {
+      setTogglingSourceId(null);
+    }
+  }
+
+  async function handleAddSource(e: React.FormEvent) {
+    e.preventDefault();
+    setGlobalError(null);
+    const cleanName = newSourceName.trim();
+    const cleanUrl = newSourceUrl.trim();
+    if (!cleanName || !cleanUrl.startsWith('https://')) {
+      setGlobalError('Ingresa un nombre y una URL HTTPS válida para el repositorio.');
+      return;
+    }
+    setAddingSource(true);
+    try {
+      await api.addMarketplaceSource({ name: cleanName, url: cleanUrl, enabled: true });
+      setNewSourceName('');
+      setNewSourceUrl('');
+      setGlobalBanner(`Repositorio «${cleanName}» añadido y activado.`);
+      await loadCatalog(true);
+    } catch (err) {
+      setGlobalError(
+        err instanceof ApiError ? err.message : 'No se pudo añadir el repositorio.'
+      );
+    } finally {
+      setAddingSource(false);
+    }
+  }
+
+  async function handleDeleteSource(src: MarketplaceSourceItem) {
+    setGlobalError(null);
+    setDeletingSourceId(src.id);
+    try {
+      await api.deleteMarketplaceSource(src.id);
+      setGlobalBanner(`Repositorio «${src.name}» eliminado.`);
+      await loadCatalog(false);
+    } catch (err) {
+      setGlobalError(
+        err instanceof ApiError ? err.message : 'No se pudo eliminar el repositorio.'
+      );
+    } finally {
+      setDeletingSourceId(null);
+    }
+  }
+
+  async function handleUpdateInstalledProviders(providerId?: string) {
+    setGlobalError(null);
+    setGlobalBanner(null);
+    if (providerId) {
+      setUpdatingProviderId(providerId);
+    } else {
+      setUpdatingAllProviders(true);
+    }
+    try {
+      const res = await api.updateInstalledMarketplaceProviders(providerId);
+      const updatedCount = res.updated.length;
+      const skippedCount = res.skipped.length;
+      setGlobalBanner(
+        updatedCount > 0
+          ? `Actualización en sitio completada: ${updatedCount} ${
+              updatedCount === 1 ? 'proveedor actualizado' : 'proveedores actualizados'
+            }${skippedCount > 0 ? ` (${skippedCount} omitidos)` : ''}.`
+          : 'No había cambios pendientes por aplicar.'
+      );
+      await Promise.all([onProvidersChanged(), loadCatalog(false)]);
+    } catch (err) {
+      setGlobalError(
+        err instanceof ApiError
+          ? err.message
+          : 'No se pudo actualizar la ficha del proveedor.'
+      );
+    } finally {
+      setUpdatingProviderId(null);
+      setUpdatingAllProviders(false);
+    }
+  }
 
   const loadSupplementaryProviderData = useCallback(async (list: ProviderSummary[]) => {
     if (list.length === 0) {
@@ -574,6 +695,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                 selectedProv.models ??
                 allModels.filter((m) => m.providerId === selectedProv.id && m.active !== false);
 
+              const selectedCatalogEntry =
+                catalog.manifests.find((m) => m.id === selectedProv.id) ?? null;
+
               return (
                 <ProviderVaultCard
                   key={selectedProv.id}
@@ -581,6 +705,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                   keys={pKeys}
                   models={pModels}
                   nodes={nodes}
+                  catalogEntry={selectedCatalogEntry}
+                  updatingManifest={updatingProviderId === selectedProv.id}
+                  onUpdateManifest={() => void handleUpdateInstalledProviders(selectedProv.id)}
                   onOpenModel={onOpenModel}
                   onRefreshAll={refreshEverything}
                   onRequestDeleteProvider={(target) => setProviderToDelete(target)}
@@ -629,6 +756,164 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
             </div>
           ) : null}
 
+          {/* HU-42: Multi-Repo Marketplace Sources Manager */}
+          <div className="card" style={{ padding: '16px 20px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 12,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <strong style={{ fontSize: '0.94rem' }}>Repositorios del Marketplace</strong>
+                  <span className="meta-tag accent">
+                    {catalog.enabledSourcesCount ??
+                      sources.filter((s) => s.enabled).length}{' '}
+                    {(catalog.enabledSourcesCount ??
+                      sources.filter((s) => s.enabled).length) === 1
+                      ? 'activo'
+                      : 'activos'}{' '}
+                    de {sources.length}
+                  </span>
+                  {catalog.catalogVersion ? (
+                    <span className="meta-tag mono">v{catalog.catalogVersion}</span>
+                  ) : null}
+                  {catalog.checkedAt ? (
+                    <span className="field-hint" style={{ fontSize: '0.75rem' }}>
+                      Última comprobación:{' '}
+                      {new Intl.DateTimeFormat('es-ES', {
+                        dateStyle: 'short',
+                        timeStyle: 'short',
+                      }).format(
+                        new Date(
+                          catalog.checkedAt < 1_000_000_000_000
+                            ? catalog.checkedAt * 1000
+                            : catalog.checkedAt
+                        )
+                      )}
+                    </span>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setSourcesExpanded((prev) => !prev)}
+                >
+                  {sourcesExpanded ? 'Ocultar repositorios' : 'Gestionar repositorios'}
+                </button>
+              </div>
+
+              {sourcesExpanded || sources.every((s) => !s.enabled) ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {sources.map((src) => (
+                    <div
+                      key={src.id}
+                      style={{
+                        background: 'var(--bg)',
+                        border: '1px solid var(--line)',
+                        borderRadius: 8,
+                        padding: '10px 12px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 12,
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
+                          <strong style={{ fontSize: '0.86rem' }}>{src.name}</strong>
+                          {src.isOfficial ? (
+                            <span className="meta-tag verified">Oficial recomendado</span>
+                          ) : (
+                            <span className="meta-tag">Personalizado</span>
+                          )}
+                          {src.catalogVersion ? (
+                            <span className="meta-tag mono">v{src.catalogVersion}</span>
+                          ) : null}
+                        </div>
+                        <code
+                          className="mono"
+                          style={{ fontSize: '0.74rem', color: 'var(--sub)', wordBreak: 'break-all' }}
+                        >
+                          {src.url}
+                        </code>
+                        {src.lastError ? (
+                          <span style={{ fontSize: '0.74rem', color: 'var(--err)' }}>
+                            Error: {src.lastError}
+                          </span>
+                        ) : null}
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                        <button
+                          type="button"
+                          className={src.enabled ? 'btn btn-secondary btn-sm' : 'btn btn-primary btn-sm'}
+                          disabled={togglingSourceId === src.id}
+                          onClick={() => void handleToggleSource(src)}
+                        >
+                          {togglingSourceId === src.id
+                            ? '…'
+                            : src.enabled
+                              ? 'Desactivar'
+                              : 'Activar'}
+                        </button>
+                        {!src.isOfficial ? (
+                          <button
+                            type="button"
+                            className="btn btn-danger btn-sm"
+                            disabled={deletingSourceId === src.id}
+                            onClick={() => void handleDeleteSource(src)}
+                          >
+                            {deletingSourceId === src.id ? '…' : 'Eliminar'}
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  ))}
+
+                  <form
+                    onSubmit={handleAddSource}
+                    style={{
+                      display: 'flex',
+                      gap: 8,
+                      flexWrap: 'wrap',
+                      alignItems: 'center',
+                      paddingTop: 6,
+                      borderTop: '1px solid var(--line)',
+                    }}
+                  >
+                    <input
+                      type="text"
+                      className="input"
+                      style={{ flex: '1 1 160px', minWidth: 0 }}
+                      placeholder="Nombre (ej. Catálogo equipo)"
+                      value={newSourceName}
+                      onChange={(e) => setNewSourceName(e.target.value)}
+                      disabled={addingSource}
+                    />
+                    <input
+                      type="url"
+                      className="input mono"
+                      style={{ flex: '2 1 260px', minWidth: 0 }}
+                      placeholder="https://raw.githubusercontent.com/…/catalog.json"
+                      value={newSourceUrl}
+                      onChange={(e) => setNewSourceUrl(e.target.value)}
+                      disabled={addingSource}
+                    />
+                    <button type="submit" className="btn btn-secondary btn-sm" disabled={addingSource}>
+                      {addingSource ? 'Añadiendo…' : '+ Añadir repositorio'}
+                    </button>
+                  </form>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
           <div className="card" style={{ padding: '20px 24px' }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <div
@@ -648,14 +933,28 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => void loadCatalog()}
-                  disabled={catalogLoading}
-                >
-                  {catalogLoading ? 'Actualizando…' : 'Actualizar catálogo'}
-                </button>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                  {(catalog.updatesAvailableCount ?? 0) > 0 ? (
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      disabled={updatingAllProviders}
+                      onClick={() => void handleUpdateInstalledProviders()}
+                    >
+                      {updatingAllProviders
+                        ? 'Actualizando todos…'
+                        : `Actualizar todos (${catalog.updatesAvailableCount})`}
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => void loadCatalog(true)}
+                    disabled={catalogLoading}
+                  >
+                    {catalogLoading ? 'Comprobando…' : 'Comprobar actualizaciones'}
+                  </button>
+                </div>
               </div>
 
               <div
@@ -697,8 +996,47 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
 
           {catalogLoading && catalog.manifests.length === 0 ? (
             <div className="card">
-              <p className="field-hint">Consultando fichas disponibles en bifrost-providers…</p>
+              <p className="field-hint">Consultando fichas disponibles en los repositorios…</p>
             </div>
+          ) : (catalog.enabledSourcesCount ?? sources.filter((s) => s.enabled).length) === 0 ? (
+            (() => {
+              const officialSource = sources.find((s) => s.isOfficial) ?? null;
+              return (
+                <div className="card">
+                  <div className="empty-state">
+                    <h3 style={{ fontSize: '1.05rem' }}>
+                      Catálogo remoto desactivado por defecto (opt-in)
+                    </h3>
+                    <p className="field-hint" style={{ maxWidth: 500 }}>
+                      Por privacidad, Bifrost no consulta repositorios externos hasta que actives
+                      uno. Activa el repositorio oficial recomendado o añade tu propio catálogo
+                      HTTPS arriba; también puedes importar fichas JSON locales.
+                    </p>
+                    <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'center' }}>
+                      {officialSource ? (
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={togglingSourceId === officialSource.id}
+                          onClick={() => void handleToggleSource(officialSource)}
+                        >
+                          {togglingSourceId === officialSource.id
+                            ? 'Activando…'
+                            : `Activar repositorio oficial (${officialSource.name})`}
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => setSubView('local-json')}
+                      >
+                        Subir ficha JSON local
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()
           ) : filteredManifests.length === 0 ? (
             <div className="card">
               <div className="empty-state">
@@ -852,6 +1190,18 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                             Revisado: <strong className="mono">{manifest.reviewedAt}</strong>
                           </span>
                         ) : null}
+                        {manifest.manifestVersion || manifest.manifestHash ? (
+                          <span className="meta-tag mono">
+                            {manifest.manifestVersion ? `v${manifest.manifestVersion}` : ''}
+                            {manifest.manifestVersion && manifest.manifestHash ? ' · ' : ''}
+                            {manifest.manifestHash ? manifest.manifestHash.slice(0, 7) : ''}
+                          </span>
+                        ) : null}
+                        {manifest.sourceName || manifest.sourceId ? (
+                          <span className={`meta-tag${manifest.isOfficial ? ' verified' : ''}`}>
+                            {manifest.sourceName || manifest.sourceId}
+                          </span>
+                        ) : null}
                       </div>
 
                       {isExperimental && !isInstalled ? (
@@ -897,13 +1247,29 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                       </code>
 
                       {isInstalled ? (
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-sm"
-                          onClick={() => setSubView('installed')}
-                        >
-                          ✓ Instalado · Configurar
-                        </button>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                          {manifest.updateAvailable ? (
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              disabled={updatingProviderId === manifest.id}
+                              onClick={() => void handleUpdateInstalledProviders(manifest.id)}
+                              title={`Instalado: ${(manifest.installedHash || '').slice(0, 8)} → Disponible: ${manifest.manifestVersion || manifest.manifestHash?.slice(0, 8) || 'nueva'}`}
+                            >
+                              {updatingProviderId === manifest.id ? 'Actualizando…' : 'Actualizar'}
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => {
+                              setFocusedProviderId(manifest.id);
+                              setSubView('installed');
+                            }}
+                          >
+                            ✓ Instalado · Configurar
+                          </button>
+                        </div>
                       ) : (
                         <button
                           type="button"

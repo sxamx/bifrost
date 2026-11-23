@@ -50,7 +50,7 @@ export const UsersTab: React.FC = () => {
   const [deletingInviteId, setDeletingInviteId] = useState<string | null>(null);
 
   // HU-33 & HU-35 Model search + strict quota state
-  const [inviteEnforceStrict, setInviteEnforceStrict] = useState(false);
+  const [inviteEnforceStrict, setInviteEnforceStrict] = useState(true);
   const [inviteModelSearch, setInviteModelSearch] = useState('');
   const [editEnforceStrict, setEditEnforceStrict] = useState(false);
   const [editModelSearch, setEditModelSearch] = useState('');
@@ -309,7 +309,7 @@ export const UsersTab: React.FC = () => {
                 id="inv-daily-limit"
                 type="number"
                 min={100}
-                step={1000}
+                step={100}
                 className="input mono"
                 value={inviteDailyLimit}
                 onChange={(e) => setInviteDailyLimit(Number(e.target.value))}
@@ -466,8 +466,12 @@ export const UsersTab: React.FC = () => {
                               ? 'Ilimitado'
                               : `${u.dailyTokenLimit.toLocaleString('es-ES')} tok`}
                           </span>
-                          {!isAdminRow && u.enforceStrictQuota ? (
-                            <span className="status-badge rate_limited">Estricta</span>
+                          {!isAdminRow ? (
+                            u.enforceStrictQuota ? (
+                              <span className="status-badge rate_limited">Estricta</span>
+                            ) : (
+                              <span className="meta-tag">Flexible</span>
+                            )
                           ) : null}
                         </div>
                       </td>
@@ -544,45 +548,54 @@ export const UsersTab: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {invitations.map((inv) => (
-                  <tr key={inv.id}>
-                    <td>
-                      <code className="key-prefix-pill">{inv.id.slice(0, 10)}</code>
-                    </td>
-                    <td className="mono">
-                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                        <span>{inv.dailyTokenLimit.toLocaleString('es-ES')} tok/día</span>
-                        {inv.enforceStrictQuota ? (
-                          <span className="status-badge rate_limited">Estricta</span>
-                        ) : null}
-                      </div>
-                    </td>
-                    <td>
-                      {inv.usedAt ? (
-                        <span className="status-badge offline">Canjeada</span>
-                      ) : (
-                        <span className="status-badge active">Pendiente</span>
-                      )}
-                    </td>
-                    <td style={{ color: 'var(--sub)', fontSize: '0.85rem' }}>
-                      {formatShortDate(inv.expiresAt)}
-                    </td>
-                    <td style={{ textAlign: 'right' }}>
-                      {!inv.usedAt ? (
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          disabled={deletingInviteId === inv.id}
-                          onClick={() => void handleDeleteInvitation(inv.id)}
-                        >
-                          {deletingInviteId === inv.id ? 'Eliminando…' : 'Eliminar'}
-                        </button>
-                      ) : (
-                        <span className="field-hint">—</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {invitations.map((inv) => {
+                  const expMs =
+                    inv.expiresAt < 1_000_000_000_000 ? inv.expiresAt * 1000 : inv.expiresAt;
+                  const isInvExpired = !inv.usedAt && Number.isFinite(expMs) && expMs <= Date.now();
+                  return (
+                    <tr key={inv.id}>
+                      <td>
+                        <code className="key-prefix-pill">{inv.id.slice(0, 10)}</code>
+                      </td>
+                      <td className="mono">
+                        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                          <span>{inv.dailyTokenLimit.toLocaleString('es-ES')} tok/día</span>
+                          {inv.enforceStrictQuota ? (
+                            <span className="status-badge rate_limited">Estricta</span>
+                          ) : (
+                            <span className="meta-tag">Flexible</span>
+                          )}
+                        </div>
+                      </td>
+                      <td>
+                        {inv.usedAt ? (
+                          <span className="status-badge offline">Canjeada</span>
+                        ) : isInvExpired ? (
+                          <span className="status-badge error">Expirada</span>
+                        ) : (
+                          <span className="status-badge active">Pendiente</span>
+                        )}
+                      </td>
+                      <td style={{ color: 'var(--sub)', fontSize: '0.85rem' }}>
+                        {formatShortDate(inv.expiresAt)}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        {!inv.usedAt ? (
+                          <button
+                            type="button"
+                            className="btn btn-danger btn-sm"
+                            disabled={deletingInviteId === inv.id}
+                            onClick={() => void handleDeleteInvitation(inv.id)}
+                          >
+                            {deletingInviteId === inv.id ? 'Eliminando…' : 'Eliminar'}
+                          </button>
+                        ) : (
+                          <span className="field-hint">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

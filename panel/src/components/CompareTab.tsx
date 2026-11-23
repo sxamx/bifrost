@@ -53,7 +53,7 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
 
         const list =
           modelsRes.status === 'fulfilled'
-            ? modelsRes.value.filter((m) => m.active !== false)
+            ? modelsRes.value.filter((m) => m.active !== false && !m.disabledByAdmin)
             : [];
         setModels(list);
 
@@ -332,7 +332,9 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
                       <InfoTip text="Mediana real de Time to First Token registrada por tu propio router." />
                     </span>
                     <strong className="mono">
-                      {speed ? `${Math.round(speed.ttftMs.p50)} ms` : 'Sin tráfico aún'}
+                      {speed
+                        ? `${Math.round(speed.ttftMs.p50).toLocaleString('es-ES')} ms`
+                        : 'Sin tráfico aún'}
                     </strong>
                   </div>
 
@@ -340,7 +342,10 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
                     <span className="compare-spec-label">Velocidad (P50)</span>
                     <strong className="mono" style={{ color: 'var(--accent)' }}>
                       {speed
-                        ? `${speed.tokensPerSec.p50.toFixed(1)} tok/s`
+                        ? `${speed.tokensPerSec.p50.toLocaleString('es-ES', {
+                            minimumFractionDigits: 1,
+                            maximumFractionDigits: 1,
+                          })} tok/s`
                         : 'Sin tráfico aún'}
                     </strong>
                   </div>

@@ -4,10 +4,13 @@ import type {
   ActivityGroupBy,
   ActivityMetricsData,
   ActivityRange,
+  FreeQuotaStatus,
   LatencyBucketPoint,
   LatencyMetricsData,
   ModelSpeedEntry,
+  ProviderRateLimitWindow,
   ProviderReliabilityEntry,
+  QuotaConfidence,
   SpeedMetricsData,
   UptimeDayCell,
 } from '../types';
@@ -100,6 +103,18 @@ function buildSmoothSvgPath(xs: number[], ys: number[]): string {
   return d;
 }
 
+function formatQuotaWindow(w?: ProviderRateLimitWindow | null): string {
+  if (w === 'hour') return 'hora';
+  if (w === 'week') return 'semana';
+  return 'día';
+}
+
+function formatQuotaConfidence(c?: QuotaConfidence | null): string {
+  if (c === 'header_exact') return 'Exacto por cabecera';
+  if (c === 'inferred') return 'Inferido por 429';
+  return 'Configurado';
+}
+
 export const MetricsTab: React.FC<MetricsTabProps> = ({
   isAdmin,
   onOpenModel,
@@ -111,6 +126,7 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
     cacheByProvider: [],
   });
   const [uptimeList, setUptimeList] = useState<ProviderReliabilityEntry[]>([]);
+  const [freeQuota, setFreeQuota] = useState<FreeQuotaStatus | null>(null);
   const [coreLoading, setCoreLoading] = useState(true);
 
   // HU-20b Activity Controls & State
@@ -150,15 +166,17 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
 
   const loadTelemetry = useCallback(async () => {
     setCoreLoading(true);
-    const [latRes, spdRes, upRes] = await Promise.allSettled([
+    const [latRes, spdRes, upRes, fqRes] = await Promise.allSettled([
       api.getMetricsLatency('24h'),
       api.getMetricsSpeed(),
       api.getMetricsUptime(),
+      api.getFreeQuota(),
     ]);
 
     if (latRes.status === 'fulfilled') setLatencyData(latRes.value);
     if (spdRes.status === 'fulfilled') setSpeedData(spdRes.value);
     if (upRes.status === 'fulfilled') setUptimeList(upRes.value);
+    if (fqRes.status === 'fulfilled') setFreeQuota(fqRes.value);
     setCoreLoading(false);
   }, []);
 
@@ -321,6 +339,109 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
           Actualizar métricas
         </button>
       </header>
+
+      {/* 0. HU-39: Adaptive Free Quota Window & Per-Provider Breakdown */}
+      {freeQuota && freeQuota.providers.length > 0 ? (
+        <section className="card" aria-labelledby="quota-adaptive-section-title">
+          <div className="card-header">
+            <h2 id="quota-adaptive-section-title" className="card-title">
+              Cuota gratuita adaptativa por proveedor
+              <InfoTip text="Ventana real activa, unidad (tokens o peticiones), claves usables y nivel de confianza (cabeceras HTTP, configurado o inferido por 429)." />
+            </h2>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+              <span className="meta-tag accent">
+                Ventana: {formatQuotaWindow(freeQuota.activeWindow)}
+              </span>
+              <span className="meta-tag">{formatQuotaConfidence(freeQuota.confidence)}</span>
+              {freeQuota.adaptiveAdjusted ? (
+                <span className="status-badge rate_limited">Ajuste adaptativo 429</span>
+              ) : null}
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 230px), 1fr))',
+              gap: 10,
+            }}
+          >
+            {freeQuota.providers.map((pq) => {
+              const unitTxt = pq.unit === 'requests' ? 'pet.' : 'tok';
+              const winTxt = pq.windowLabel || formatQuotaWindow(pq.activeWindow);
+              const confidenceTxt =
+                pq.effectiveLimit === null && pq.recent429Count7d === 0
+                  ? 'Sin límite fijo'
+                  : formatQuotaConfidence(pq.confidence);
+              return (
+                <div
+                  key={pq.providerId}
+                  className="horiz-err-item"
+                  role={onOpenProvider ? 'button' : undefined}
+                  tabIndex={onOpenProvider ? 0 : undefined}
+                  style={onOpenProvider ? { cursor: 'pointer' } : undefined}
+                  onClick={() => onOpenProvider?.(pq.providerId)}
+                  onKeyDown={(e) => {
+                    if (onOpenProvider && (e.key === 'Enter' || e.key === ' ')) {
+                      e.preventDefault();
+                      onOpenProvider(pq.providerId);
+                    }
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 8,
+                    }}
+                  >
+                    <strong>{pq.providerName}</strong>
+                    <span className="meta-tag mono">{winTxt}</span>
+                  </div>
+                  <div className="mono" style={{ fontSize: '0.84rem', color: 'var(--sub)' }}>
+                    {pq.unit === 'none' ? (
+                      <strong style={{ color: 'var(--fg)' }}>
+                        {pq.rateLimitKind === 'concurrency'
+                          ? 'Límite por concurrencia'
+                          : 'Sin límite de cuota'}
+                      </strong>
+                    ) : (
+                      <>
+                        <strong style={{ color: 'var(--fg)' }}>
+                          {pq.usedInWindow.toLocaleString('es-ES')}
+                        </strong>
+                        {pq.effectiveLimit !== null
+                          ? ` / ${pq.effectiveLimit.toLocaleString('es-ES')} ${unitTxt}`
+                          : ` ${unitTxt} usados`}
+                      </>
+                    )}
+                  </div>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 6,
+                      fontSize: '0.73rem',
+                      color: 'var(--fg-3)',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <span>
+                      {confidenceTxt} · {pq.usableKeysCount}{' '}
+                      {pq.usableKeysCount === 1 ? 'clave' : 'claves'}
+                    </span>
+                    {pq.recent429Count7d > 0 ? (
+                      <span style={{ color: 'var(--partial)' }}>{pq.recent429Count7d} × 429</span>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
 
       {/* 1. HU-19 & HU-20: 60-Day Provider Uptime Strip + 7-Day Tool/Structured Error Bars */}
       <section className="card" aria-labelledby="uptime-section-title">

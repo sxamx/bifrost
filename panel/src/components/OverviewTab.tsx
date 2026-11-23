@@ -953,6 +953,10 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             {providerQuotasList.map((pq) => {
               const unitTxt = pq.unit === 'requests' ? 'pet.' : 'tok';
               const winTxt = pq.windowLabel || formatActiveWindowLabel(pq.activeWindow);
+              const confidenceTxt =
+                pq.effectiveLimit === null && pq.recent429Count7d === 0
+                  ? 'Sin límite fijo'
+                  : formatConfidenceLabel(pq.confidence);
               return (
                 <div
                   key={pq.providerId}
@@ -980,12 +984,22 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                     <span className="meta-tag mono">{winTxt}</span>
                   </div>
                   <div className="mono" style={{ fontSize: '0.78rem', color: 'var(--sub)' }}>
-                    <strong style={{ color: 'var(--fg)' }}>
-                      {pq.usedInWindow.toLocaleString('es-ES')}
-                    </strong>
-                    {pq.effectiveLimit
-                      ? ` / ${pq.effectiveLimit.toLocaleString('es-ES')} ${unitTxt}`
-                      : ` ${unitTxt}`}
+                    {pq.unit === 'none' ? (
+                      <strong style={{ color: 'var(--fg)' }}>
+                        {pq.rateLimitKind === 'concurrency'
+                          ? 'Límite por concurrencia'
+                          : 'Sin límite de cuota'}
+                      </strong>
+                    ) : (
+                      <>
+                        <strong style={{ color: 'var(--fg)' }}>
+                          {pq.usedInWindow.toLocaleString('es-ES')}
+                        </strong>
+                        {pq.effectiveLimit !== null
+                          ? ` / ${pq.effectiveLimit.toLocaleString('es-ES')} ${unitTxt}`
+                          : ` ${unitTxt} usados`}
+                      </>
+                    )}
                   </div>
                   <div
                     style={{
@@ -995,9 +1009,13 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                       gap: 6,
                       fontSize: '0.72rem',
                       color: 'var(--fg-3)',
+                      flexWrap: 'wrap',
                     }}
                   >
-                    <span>{formatConfidenceLabel(pq.confidence)}</span>
+                    <span>
+                      {confidenceTxt} · {pq.usableKeysCount}{' '}
+                      {pq.usableKeysCount === 1 ? 'clave' : 'claves'}
+                    </span>
                     {pq.recent429Count7d > 0 ? (
                       <span style={{ color: 'var(--partial)' }}>{pq.recent429Count7d} × 429</span>
                     ) : null}
