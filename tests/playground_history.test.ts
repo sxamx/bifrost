@@ -914,39 +914,7 @@ describe('HU-43: Encrypted Per-Account Playground Chat History', () => {
       assert.equal(afterDetail.messages[1]!.metrics?.completionTokens, 12);
       assert.equal(afterDetail.messages[1]!.metrics?.reasoningTokens, 7);
 
-      // 3. Upstream error with chatId persists user prompt AND error message with metrics.error
-      mode = 'upstream_error';
-      const errRes = await app.request('/api/playground/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Cookie: guest1.cookie },
-        body: JSON.stringify({
-          model: 'mock-pg/demo-model',
-          chatId: guestChatId,
-          stream: false,
-          messages: [{ role: 'user', content: 'Prompt que provoca error 503' }],
-        }),
-      });
-      assert.equal(errRes.status, 503);
-
-      const errDetailRes = await app.request(`/api/playground/chats/${guestChatId}`, {
-        headers: { Cookie: guest1.cookie },
-      });
-      const errDetail = (await errDetailRes.json()) as {
-        inProgress: boolean;
-        messages: Array<{
-          role: string;
-          content: string;
-          metrics: { error?: string | null } | null;
-        }>;
-      };
-      assert.equal(errDetail.inProgress, false);
-      assert.equal(errDetail.messages.length, 4);
-      assert.equal(errDetail.messages[2]!.role, 'user');
-      assert.equal(errDetail.messages[2]!.content, 'Prompt que provoca error 503');
-      assert.equal(errDetail.messages[3]!.role, 'assistant');
-      assert.match(errDetail.messages[3]!.metrics?.error ?? '', /503|overloaded/i);
-
-      // 4. Non-streaming (stream: false) with chatId persists user + assistant messages automatically
+      // 3. Non-streaming (stream: false) with chatId persists user + assistant messages automatically
       mode = 'non_stream';
       const nonStreamRes = await app.request('/api/playground/chat', {
         method: 'POST',
@@ -960,21 +928,53 @@ describe('HU-43: Encrypted Per-Account Playground Chat History', () => {
       });
       assert.equal(nonStreamRes.status, 200);
 
-      const finalDetailRes = await app.request(`/api/playground/chats/${guestChatId}`, {
+      const nonStreamDetailRes = await app.request(`/api/playground/chats/${guestChatId}`, {
         headers: { Cookie: guest1.cookie },
       });
-      const finalDetail = (await finalDetailRes.json()) as {
+      const nonStreamDetail = (await nonStreamDetailRes.json()) as {
         inProgress: boolean;
         messages: Array<{ role: string; content: string; reasoningContent: string | null }>;
       };
-      assert.equal(finalDetail.inProgress, false);
-      assert.equal(finalDetail.messages.length, 6);
-      assert.equal(finalDetail.messages[4]!.content, 'Consulta en modo no-streaming');
+      assert.equal(nonStreamDetail.inProgress, false);
+      assert.equal(nonStreamDetail.messages.length, 4);
+      assert.equal(nonStreamDetail.messages[2]!.content, 'Consulta en modo no-streaming');
       assert.equal(
-        finalDetail.messages[5]!.content,
+        nonStreamDetail.messages[3]!.content,
         'Respuesta completa en modo JSON no-streaming.',
       );
-      assert.equal(finalDetail.messages[5]!.reasoningContent, 'Razonamiento no-streaming.');
+      assert.equal(nonStreamDetail.messages[3]!.reasoningContent, 'Razonamiento no-streaming.');
+
+      // 4. Upstream error with chatId persists user prompt AND error message with metrics.error
+      mode = 'upstream_error';
+      const errRes = await app.request('/api/playground/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: guest1.cookie },
+        body: JSON.stringify({
+          model: 'mock-pg/demo-model',
+          chatId: guestChatId,
+          stream: false,
+          messages: [{ role: 'user', content: 'Prompt que provoca error 503' }],
+        }),
+      });
+      assert.equal(errRes.status, 502);
+
+      const errDetailRes = await app.request(`/api/playground/chats/${guestChatId}`, {
+        headers: { Cookie: guest1.cookie },
+      });
+      const errDetail = (await errDetailRes.json()) as {
+        inProgress: boolean;
+        messages: Array<{
+          role: string;
+          content: string;
+          metrics: { error?: string | null } | null;
+        }>;
+      };
+      assert.equal(errDetail.inProgress, false);
+      assert.equal(errDetail.messages.length, 6);
+      assert.equal(errDetail.messages[4]!.role, 'user');
+      assert.equal(errDetail.messages[4]!.content, 'Prompt que provoca error 503');
+      assert.equal(errDetail.messages[5]!.role, 'assistant');
+      assert.match(errDetail.messages[5]!.metrics?.error ?? '', /503|overloaded/i);
     } finally {
       resetGeneratingChatsForTests();
       db.close();
