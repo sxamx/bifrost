@@ -169,6 +169,9 @@ export interface PlaygroundChatRequest {
   temperature?: number;
   maxTokens?: number;
   reasoningEffort?: ReasoningEffort;
+  systemPrompt?: string;
+  chatId?: string;
+  stream?: boolean;
 }
 
 export interface PlaygroundChatResponse {
@@ -185,9 +188,16 @@ export interface PlaygroundChatResponse {
   };
 }
 
-/* HU-43 — Encrypted Per-Account Playground Chat History */
+/* HU-43 / HU-43b — Encrypted Per-Account Playground Chat History & Resilient Persistence */
 
 export type PlaygroundMessageRole = 'user' | 'assistant' | 'system';
+
+export interface PlaygroundChatSettings {
+  reasoningEffort?: ReasoningEffort;
+  temperature?: number | null;
+  maxTokens?: number | null;
+  systemPrompt?: string | null;
+}
 
 export interface PlaygroundMessageMetrics {
   ttftMs?: number | null;
@@ -195,12 +205,15 @@ export interface PlaygroundMessageMetrics {
   promptTokens?: number | null;
   completionTokens?: number | null;
   reasoningTokens?: number | null;
+  error?: string | null;
 }
 
 export interface PlaygroundChatSummary {
   id: string;
   title: string;
   modelFullId: string | null;
+  settings?: PlaygroundChatSettings | null;
+  inProgress?: boolean;
   messageCount: number;
   createdAt: number;
   updatedAt: number;
@@ -219,6 +232,8 @@ export interface PlaygroundChatMessage {
 
 export interface PlaygroundChatDetail {
   chat: PlaygroundChatSummary;
+  settings?: PlaygroundChatSettings | null;
+  inProgress?: boolean;
   messages: PlaygroundChatMessage[];
 }
 
@@ -236,7 +251,7 @@ export interface AppendPlaygroundMessagesResult {
   messages: PlaygroundChatMessage[];
 }
 
-/* Phase 8 — Users, Invitations (HU-04, HU-05) & Encrypted Backups (HU-25, HU-25b) */
+/* Phase 8 — Users, Invitations (HU-04, HU-05, HU-44) & Encrypted Backups (HU-25, HU-25b) */
 
 export interface ManagedUserItem {
   id: string;
@@ -260,6 +275,8 @@ export interface InvitationItem {
   allowedModels: string[];
   expiresAt: number;
   usedAt: number | null;
+  usedByUserId?: string | null;
+  usedByUsername?: string | null;
   createdAt?: number;
 }
 

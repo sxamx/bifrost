@@ -37,6 +37,8 @@ export interface InvitationSummary {
   allowedModels: string[];
   expiresAt: number;
   usedAt: number | null;
+  usedByUserId: string | null;
+  usedByUsername: string | null;
   createdBy: string;
   createdAt: number | null;
   status: 'pending' | 'used' | 'expired';
@@ -191,6 +193,14 @@ function formatInvitationRow(
 
   const status: 'pending' | 'used' | 'expired' =
     usedAt !== null ? 'used' : expiresAt <= nowSec ? 'expired' : 'pending';
+  const usedByUserId =
+    typeof row.used_by_user_id === 'string' && row.used_by_user_id.length > 0
+      ? row.used_by_user_id
+      : null;
+  const usedByUsername =
+    typeof row.used_by_username === 'string' && row.used_by_username.length > 0
+      ? row.used_by_username
+      : null;
 
   return {
     id: String(row.id),
@@ -200,6 +210,8 @@ function formatInvitationRow(
     allowedModels: parseAllowedModelsJson(row.allowed_models_json),
     expiresAt,
     usedAt,
+    usedByUserId,
+    usedByUsername,
     createdBy: String(row.created_by),
     createdAt,
     status,
@@ -427,7 +439,7 @@ export function listInvitations(
   const rows = db
     .prepare(
       `SELECT id, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
-              expires_at, used_at, created_by, created_at
+              expires_at, used_at, used_by_user_id, used_by_username, created_by, created_at
        FROM invitations
        ORDER BY COALESCE(created_at, expires_at) DESC, id DESC`,
     )
@@ -550,7 +562,7 @@ export function createInvitation(
   const row = db
     .prepare(
       `SELECT id, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
-              expires_at, used_at, created_by, created_at
+              expires_at, used_at, used_by_user_id, used_by_username, created_by, created_at
        FROM invitations
        WHERE id = ?`,
     )
@@ -708,6 +720,12 @@ export async function acceptInvitation(
       finalEnforceStrictQuota ? 1 : 0,
       nowSec,
     );
+
+    db.prepare(
+      `UPDATE invitations
+       SET used_by_user_id = ?, used_by_username = ?
+       WHERE id = ?`,
+    ).run(userId, username, String(invite.id));
 
     const insertAccess = db.prepare(
       `INSERT OR IGNORE INTO user_model_access (user_id, model_full_id) VALUES (?, ?)`,

@@ -44,6 +44,7 @@ import type {
   PlaygroundChatMessage,
   PlaygroundChatRequest,
   PlaygroundChatResponse,
+  PlaygroundChatSettings,
   PlaygroundChatSummary,
   PlaygroundMessageMetrics,
   PlaygroundMessageRole,
@@ -63,6 +64,7 @@ import type {
   QuotaConfidence,
   QuotaResetMode,
   QuotaUnit,
+  ReasoningEffort,
   RotateNodeTokenResult,
   SpeedMetricsData,
   StatusResponse,
@@ -478,6 +480,18 @@ function normalizeInvitation(raw: unknown): InvitationItem {
         ? r.usedAt
         : typeof r.used_at === 'number'
           ? r.used_at
+          : null,
+    usedByUserId:
+      typeof r.usedByUserId === 'string' && r.usedByUserId.length > 0
+        ? r.usedByUserId
+        : typeof r.used_by_user_id === 'string' && r.used_by_user_id.length > 0
+          ? r.used_by_user_id
+          : null,
+    usedByUsername:
+      typeof r.usedByUsername === 'string' && r.usedByUsername.length > 0
+        ? r.usedByUsername
+        : typeof r.used_by_username === 'string' && r.used_by_username.length > 0
+          ? r.used_by_username
           : null,
     createdAt:
       typeof r.createdAt === 'number'
@@ -1126,11 +1140,24 @@ export const api = {
     return normalizeModelBenchmarks(fullId, raw);
   },
 
-  /* Phase 6 — Playground Chat (HU-22) */
+  /* Phase 6 / HU-43b — Playground Chat (HU-22, HU-43b) */
+
+  streamPlaygroundChat(
+    input: PlaygroundChatRequest,
+    onDelta?: (partialText: string) => void,
+    options?: { signal?: AbortSignal }
+  ): Promise<PlaygroundChatResponse> {
+    return this.sendPlaygroundChat(
+      { ...input, stream: input.stream ?? true },
+      onDelta,
+      options
+    );
+  },
 
   async sendPlaygroundChat(
     input: PlaygroundChatRequest,
-    onDelta?: (partialText: string) => void
+    onDelta?: (partialText: string) => void,
+    options?: { signal?: AbortSignal }
   ): Promise<PlaygroundChatResponse> {
     const startedMs = performance.now();
     let firstTokenMs: number | null = null;
@@ -1142,14 +1169,24 @@ export const api = {
       max_tokens: input.maxTokens,
       maxTokens: input.maxTokens,
     };
-    if (input.reasoningEffort && input.reasoningEffort !== 'none') {
+    if (input.reasoningEffort !== undefined) {
       payload.reasoning_effort = input.reasoningEffort;
       payload.reasoningEffort = input.reasoningEffort;
+    }
+    if (typeof input.systemPrompt === 'string') {
+      payload.systemPrompt = input.systemPrompt;
+    }
+    if (typeof input.chatId === 'string' && input.chatId.trim().length > 0) {
+      payload.chatId = input.chatId.trim();
+    }
+    if (typeof input.stream === 'boolean') {
+      payload.stream = input.stream;
     }
 
     const response = await fetch('/api/playground/chat', {
       method: 'POST',
       credentials: 'include',
+      signal: options?.signal,
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
@@ -2499,7 +2536,7 @@ export const api = {
     });
   },
 
-  /* Playground Encrypted Chat History (HU-43) */
+  /* Playground Encrypted Chat History (HU-43, HU-43b) */
 
   async getPlaygroundChats(): Promise<PlaygroundChatSummary[]> {
     const raw = await request<unknown>('/api/playground/chats', { method: 'GET' });
@@ -2511,6 +2548,7 @@ export const api = {
   async createPlaygroundChat(input?: {
     title?: string;
     modelFullId?: string | null;
+    settings?: PlaygroundChatSettings | null;
   }): Promise<PlaygroundChatSummary> {
     const raw = await request<unknown>('/api/playground/chats', {
       method: 'POST',
@@ -2527,15 +2565,26 @@ export const api = {
     );
     const r = asRecord(raw);
     const messagesRaw = Array.isArray(r.messages) ? r.messages : [];
+    const chat = normalizePlaygroundChatSummary(r.chat);
+    const settings =
+      'settings' in r ? normalizePlaygroundChatSettings(r.settings) : (chat.settings ?? null);
+    const inProgress =
+      typeof r.inProgress === 'boolean' ? r.inProgress : Boolean(chat.inProgress);
     return {
-      chat: normalizePlaygroundChatSummary(r.chat),
+      chat: { ...chat, settings, inProgress },
+      settings,
+      inProgress,
       messages: messagesRaw.map(normalizePlaygroundChatMessage),
     };
   },
 
   async updatePlaygroundChat(
     chatId: string,
-    input: { title?: string; modelFullId?: string | null }
+    input: {
+      title?: string;
+      modelFullId?: string | null;
+      settings?: PlaygroundChatSettings | null;
+    }
   ): Promise<PlaygroundChatSummary> {
     const raw = await request<unknown>(
       `/api/playground/chats/${encodeURIComponent(chatId)}`,
@@ -2590,6 +2639,35 @@ export const api = {
   },
 };
 
+function normalizePlaygroundChatSettings(raw: unknown): PlaygroundChatSettings | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = asRecord(raw);
+  const out: PlaygroundChatSettings = {};
+  let hasAny = false;
+  if (
+    r.reasoningEffort === 'none' ||
+    r.reasoningEffort === 'low' ||
+    r.reasoningEffort === 'medium' ||
+    r.reasoningEffort === 'high'
+  ) {
+    out.reasoningEffort = r.reasoningEffort as ReasoningEffort;
+    hasAny = true;
+  }
+  if ('temperature' in r) {
+    out.temperature = asNullableNum(r.temperature);
+    hasAny = true;
+  }
+  if ('maxTokens' in r) {
+    out.maxTokens = asNullableNum(r.maxTokens);
+    hasAny = true;
+  }
+  if ('systemPrompt' in r) {
+    out.systemPrompt = typeof r.systemPrompt === 'string' ? r.systemPrompt : null;
+    hasAny = true;
+  }
+  return hasAny ? out : null;
+}
+
 function normalizePlaygroundChatSummary(raw: unknown): PlaygroundChatSummary {
   const r = asRecord(raw);
   return {
@@ -2601,6 +2679,8 @@ function normalizePlaygroundChatSummary(raw: unknown): PlaygroundChatSummary {
         : typeof r.model_full_id === 'string'
           ? r.model_full_id
           : null,
+    settings: normalizePlaygroundChatSettings(r.settings),
+    inProgress: Boolean(r.inProgress ?? r.in_progress ?? false),
     messageCount: asNum(r.messageCount ?? r.message_count, 0),
     createdAt: asNum(r.createdAt ?? r.created_at, 0),
     updatedAt: asNum(r.updatedAt ?? r.updated_at, 0),
@@ -2630,6 +2710,10 @@ function normalizePlaygroundMessageMetrics(raw: unknown): PlaygroundMessageMetri
   }
   if ('reasoningTokens' in r) {
     out.reasoningTokens = asNullableNum(r.reasoningTokens);
+    hasAny = true;
+  }
+  if ('error' in r) {
+    out.error = typeof r.error === 'string' && r.error.length > 0 ? r.error : null;
     hasAny = true;
   }
   return hasAny ? out : null;

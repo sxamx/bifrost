@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS invitations (
   allowed_models_json TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
   used_at INTEGER,
+  used_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+  used_by_username TEXT,
   created_by TEXT NOT NULL REFERENCES users(id),
   created_at INTEGER
 );
@@ -194,11 +196,12 @@ CREATE TABLE IF NOT EXISTS marketplace_sources (
   created_at INTEGER NOT NULL
 );
 
--- Historial de chats del Playground cifrado y privado por cuenta (HU-43)
+-- Historial de chats del Playground cifrado y privado por cuenta (HU-43, HU-43b)
 CREATE TABLE IF NOT EXISTS playground_chats (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   encrypted_title BLOB NOT NULL,
+  encrypted_settings BLOB,
   model_full_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -267,6 +270,25 @@ function ensureInvitationsColumns(db: DatabaseSync): void {
   }
   if (!colNames.has('created_at')) {
     db.exec(`ALTER TABLE invitations ADD COLUMN created_at INTEGER;`);
+  }
+  if (!colNames.has('used_by_user_id')) {
+    db.exec(
+      `ALTER TABLE invitations ADD COLUMN used_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL;`,
+    );
+  }
+  if (!colNames.has('used_by_username')) {
+    db.exec(`ALTER TABLE invitations ADD COLUMN used_by_username TEXT;`);
+  }
+}
+
+function ensurePlaygroundChatsColumns(db: DatabaseSync): void {
+  const cols = db
+    .prepare(`PRAGMA table_info(playground_chats)`)
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+
+  if (!colNames.has('encrypted_settings')) {
+    db.exec(`ALTER TABLE playground_chats ADD COLUMN encrypted_settings BLOB;`);
   }
 }
 
@@ -403,6 +425,7 @@ export function initDatabase(db: DatabaseSync): DatabaseSync {
   ensureModelsColumns(db);
   ensureInternalApiKeysColumns(db);
   ensureUsageLogsColumns(db);
+  ensurePlaygroundChatsColumns(db);
   return db;
 }
 

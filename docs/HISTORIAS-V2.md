@@ -1,4 +1,4 @@
-# Historias de Usuario — V2 (`HU-27` a `HU-43`)
+# Historias de Usuario — V2 (`HU-27` a `HU-44`)
 
 Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`). Todas las historias siguen el formato de criterios de aceptación verificables y mantienen las garantías de seguridad y arquitectura descritas en [`DECISIONS.md`](DECISIONS.md) y [`ARQUITECTURA.md`](ARQUITECTURA.md).
 
@@ -240,6 +240,40 @@ Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`
    - Al eliminar una cuenta (`DELETE /api/users/:id`), sus `playground_chats` y `playground_messages` se eliminan automáticamente mediante `ON DELETE CASCADE`.
 5. **Interfaz en `PlaygroundTab.tsx`:**
    - Barra lateral con la lista de chats propios ordenados por actividad reciente, botón **Nuevo chat**, acciones para **renombrar**, **eliminar chat** y **limpiar todo el historial**, más un aviso claro de cifrado privado por cuenta.
+
+---
+
+### HU-43b — Playground: persistencia resiliente en servidor y configuración cifrada por conversación
+
+**Como** usuario o administrador de Bifrost que usa el Playground con modelos largos o de razonamiento,  
+**quiero** que mis mensajes, errores y configuración por chat (`reasoningEffort`, `temperature`, `maxTokens`, `systemPrompt`) se guarden directamente en el servidor de forma cifrada y que la generación continúe aunque recargue la pestaña o cambie de chat,  
+**para** no perder nunca una respuesta en curso ni tener que reconfigurar cada conversación al volver a abrirla.
+
+**Criterios de aceptación:**
+1. **Configuración cifrada por conversación (`encrypted_settings`):**
+   - La tabla `playground_chats` añade la columna `encrypted_settings BLOB` (migración segura `ALTER TABLE`), cifrada con AES-256-GCM mediante la subclave por usuario (`deriveUserPlaygroundKey`), almacenando `{ reasoningEffort, temperature, maxTokens, systemPrompt }` sin texto plano en SQLite y excluida de backups `.bifrost.enc` y `system_logs`.
+   - `POST /api/playground/chats` y `PATCH /api/playground/chats/:id` aceptan `settings?: PlaygroundChatSettings | null`; `GET /api/playground/chats` y `GET /api/playground/chats/:id` devuelven `settings` e `inProgress: boolean`.
+2. **Persistencia resiliente desacoplada del socket del cliente (`POST /api/playground/chat` con `chatId`):**
+   - Cuando se envía `chatId`, el servidor valida estrictamente que pertenece al `user.id` autenticado (`404` en caso contrario, sin override de `admin`).
+   - **Antes** de contactar al proveedor upstream, persiste inmediatamente en SQLite el último mensaje `user` (autogenerando el título si era `"Nuevo chat"`), actualiza `model_full_id` y `encrypted_settings`, y marca `inProgress = true`.
+   - Si el navegador se desconecta, recarga o cambia de chat a mitad de un stream SSE (`cancel()` o error en `controller.enqueue`), el servidor **no aborta** la lectura del upstream: continúa leyendo en segundo plano hasta completar y guarda la respuesta completa del asistente (`content`, `reasoningContent`, `metrics`), liberando `inProgress = false` siempre en `finally`.
+   - Si el proveedor devuelve un error (HTTP no-2xx o corte del stream) o en modo no-streaming (`stream: false`), el mensaje del asistente (o error seguro con `metrics.error`) también se persiste automáticamente en SQLite.
+3. **Experiencia en `PlaygroundTab.tsx`:**
+   - Pasa `chatId` en `api.streamPlaygroundChat(...)` sin duplicar llamadas de guardado desde frontend, restaura `modelFullId` + `settings` al seleccionar un chat, persiste cambios de `settings` vía `api.updatePlaygroundChat`, y muestra indicador *«Generando en segundo plano…»* con polling suave mientras `inProgress === true`.
+
+---
+
+### HU-44 — Usuarios: vincular historial de invitaciones con la cuenta que la canjeó
+
+**Como** administrador de Bifrost,  
+**quiero** ver en el historial de invitaciones qué cuenta de usuario canjeó cada invitación utilizada,  
+**para** auditar rápidamente qué enlace originó cada usuario invitado sin cruzar manualmente fechas ni cuotas.
+
+**Criterios de aceptación:**
+1. La tabla `invitations` incorpora mediante migración segura `ALTER TABLE` las columnas `used_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL` y `used_by_username TEXT`.
+2. Al canjear una invitación en `POST /api/invitations/:token/accept` (`acceptInvitation`), el backend guarda `used_by_user_id` y `used_by_username` atómicamente en la misma transacción.
+3. `GET /api/invitations` expone `usedByUserId: string | null` y `usedByUsername: string | null` en cada elemento (`InvitationSummary` / `InvitationItem`).
+4. En `UsersTab.tsx`, la tabla de **Historial de invitaciones** muestra `@usedByUsername` cuando la invitación ha sido canjeada.
 
 ---
 
