@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { copyTextToClipboard } from '../clipboard';
 import type {
@@ -57,14 +57,32 @@ export const UsersTab: React.FC = () => {
 
   const [banner, setBanner] = useState<string | null>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [editModalError, setEditModalError] = useState<string | null>(null);
+  const [deleteModalError, setDeleteModalError] = useState<string | null>(null);
+  const loadReqIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!editingUser && !userToDelete) return;
+    setEditModalError(null);
+    setDeleteModalError(null);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (editingUser && !savingEdit) setEditingUser(null);
+      else if (userToDelete && !deletingUser) setUserToDelete(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [editingUser, userToDelete, savingEdit, deletingUser]);
 
   const loadData = useCallback(async () => {
+    const reqId = ++loadReqIdRef.current;
     setLoading(true);
     const [usersRes, invRes, modelsRes] = await Promise.allSettled([
       api.getUsers(),
       api.getInvitations(),
       api.getModels(),
     ]);
+    if (reqId !== loadReqIdRef.current) return;
 
     if (usersRes.status === 'fulfilled') setUsers(usersRes.value);
     if (invRes.status === 'fulfilled') setInvitations(invRes.value);
@@ -108,6 +126,15 @@ export const UsersTab: React.FC = () => {
         enforceStrictQuota: inviteEnforceStrict,
         allowedModels,
       });
+      const hasValidToken = Boolean(
+        (res?.token && res.token.trim().length > 0) ||
+          (res?.inviteUrl && !res.inviteUrl.endsWith('invite=') && res.inviteUrl.trim().length > 0)
+      );
+      if (!hasValidToken) {
+        setCreatedInvite(null);
+        setErrorBanner('El servidor no devolvió un token de invitación válido.');
+        return;
+      }
       setCreatedInvite(res);
       setCopiedInviteUrl(false);
       await loadData();
@@ -150,17 +177,18 @@ export const UsersTab: React.FC = () => {
   async function handleSaveUserEdit(e: React.FormEvent) {
     e.preventDefault();
     if (!editingUser) return;
+    setEditModalError(null);
     setErrorBanner(null);
 
     const parsedLimit = Number(editLimitInput.trim());
     if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
-      setErrorBanner('La cuota diaria del invitado debe ser mayor a 0 tokens.');
+      setEditModalError('La cuota diaria del invitado debe ser mayor a 0 tokens.');
       return;
     }
 
     const allowedModels = editWildcardAll ? ['*'] : editSelectedModels;
     if (!editWildcardAll && allowedModels.length === 0) {
-      setErrorBanner('Selecciona al menos un modelo permitido para el usuario.');
+      setEditModalError('Selecciona al menos un modelo permitido para el usuario.');
       return;
     }
 
@@ -177,7 +205,7 @@ export const UsersTab: React.FC = () => {
       await loadData();
       setBanner(`Cuota y modelos actualizados para «${updatedName}».`);
     } catch (err) {
-      setErrorBanner(
+      setEditModalError(
         err instanceof ApiError
           ? err.message
           : 'Error al actualizar los permisos del usuario.'
@@ -190,6 +218,7 @@ export const UsersTab: React.FC = () => {
   async function handleConfirmDeleteUser() {
     if (!userToDelete) return;
     setDeletingUser(true);
+    setDeleteModalError(null);
     setErrorBanner(null);
 
     try {
@@ -199,7 +228,7 @@ export const UsersTab: React.FC = () => {
       await loadData();
       setBanner(`Usuario «${removedUsername}» y sus llaves internas han sido revocados.`);
     } catch (err) {
-      setErrorBanner(
+      setDeleteModalError(
         err instanceof ApiError ? err.message : 'No fue posible eliminar el usuario.'
       );
     } finally {
@@ -308,8 +337,8 @@ export const UsersTab: React.FC = () => {
               <input
                 id="inv-daily-limit"
                 type="number"
-                min={1}
-                step={1}
+                min={100}
+                step={100}
                 className="input mono"
                 value={inviteDailyLimit}
                 onChange={(e) => setInviteDailyLimit(Number(e.target.value))}
@@ -438,7 +467,8 @@ export const UsersTab: React.FC = () => {
                 <tr>
                   <th>Usuario</th>
                   <th>Rol</th>
-                  <th>Cuota diaria</th>
+                  <th>Consumo hoy / Cuota</th>
+                  <th>Histórico acumulado</th>
                   <th>Reinicio</th>
                   <th>Modelos asignados</th>
                   <th>Creado</th>
@@ -450,6 +480,14 @@ export const UsersTab: React.FC = () => {
                   const isAdminRow = u.role === 'admin';
                   const hasAllModels =
                     isAdminRow || u.allowedModels.includes('*') || u.allowedModels.length === 0;
+                  const usedToday = u.usedTokensToday ?? 0;
+                  const usedTotal = u.usedTokens ?? 0;
+                  const reqTotal = u.requestsCount ?? 0;
+                  const hasLimit = !isAdminRow && typeof u.dailyTokenLimit === 'number' && u.dailyTokenLimit > 0;
+                  const pctUsed =
+                    hasLimit && u.dailyTokenLimit
+                      ? Math.min(100, Math.round((usedToday / u.dailyTokenLimit) * 100))
+                      : null;
 
                   return (
                     <tr key={u.id}>
@@ -459,20 +497,43 @@ export const UsersTab: React.FC = () => {
                           {isAdminRow ? 'admin' : 'invitado'}
                         </span>
                       </td>
-                      <td className="mono">
-                        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                          <span>
-                            {isAdminRow || u.dailyTokenLimit === null
-                              ? 'Ilimitado'
-                              : `${u.dailyTokenLimit.toLocaleString('es-ES')} tok`}
-                          </span>
-                          {!isAdminRow ? (
-                            u.enforceStrictQuota ? (
-                              <span className="status-badge rate_limited">Estricta</span>
-                            ) : (
-                              <span className="meta-tag">Flexible</span>
-                            )
+                      <td className="mono" style={{ fontVariantNumeric: 'tabular-nums' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 165 }}>
+                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                            <span>
+                              {hasLimit && u.dailyTokenLimit
+                                ? `${usedToday.toLocaleString('es-ES')} / ${u.dailyTokenLimit.toLocaleString('es-ES')} tok`
+                                : `${usedToday.toLocaleString('es-ES')} tok · Sin límite`}
+                            </span>
+                            {!isAdminRow ? (
+                              u.enforceStrictQuota ? (
+                                <span className="status-badge rate_limited">Estricta</span>
+                              ) : (
+                                <span className="meta-tag">Flexible</span>
+                              )
+                            ) : null}
+                          </div>
+                          {pctUsed !== null ? (
+                            <div className="quota-track" style={{ height: 4, maxWidth: 150 }}>
+                              <div
+                                className={`quota-fill ${
+                                  pctUsed >= 90 ? 'critical' : pctUsed >= 70 ? 'warn' : 'healthy'
+                                }`}
+                                style={{ width: `${pctUsed}%` }}
+                              />
+                            </div>
                           ) : null}
+                        </div>
+                      </td>
+                      <td className="mono" style={{ fontVariantNumeric: 'tabular-nums' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                          <span style={{ fontWeight: 600, color: 'var(--fg)' }}>
+                            {usedTotal.toLocaleString('es-ES')} tok
+                          </span>
+                          <span style={{ fontSize: '0.76rem', color: 'var(--sub)' }}>
+                            {reqTotal.toLocaleString('es-ES')}{' '}
+                            {reqTotal === 1 ? 'petición' : 'peticiones'}
+                          </span>
                         </div>
                       </td>
                       <td style={{ color: 'var(--sub)', fontSize: '0.85rem' }}>
@@ -622,6 +683,12 @@ export const UsersTab: React.FC = () => {
               Configurar invitado «{editingUser.username}»
             </h2>
 
+            {editModalError ? (
+              <div className="alert alert-error" role="alert">
+                <span>{editModalError}</span>
+              </div>
+            ) : null}
+
             <form onSubmit={handleSaveUserEdit} className="form-stack">
               <div className="field">
                 <label htmlFor="edit-user-limit" className="field-label">
@@ -762,6 +829,11 @@ export const UsersTab: React.FC = () => {
               Se eliminará la cuenta de invitado <strong>{userToDelete.username}</strong> junto con
               todas sus sesiones activas y llaves <code className="mono">sk-bf-…</code> asociadas.
             </p>
+            {deleteModalError ? (
+              <div className="alert alert-error" role="alert">
+                <span>{deleteModalError}</span>
+              </div>
+            ) : null}
             <div className="modal-actions">
               <button
                 type="button"

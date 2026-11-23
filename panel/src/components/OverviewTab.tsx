@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { api } from '../api';
 import { copyTextToClipboard } from '../clipboard';
 import type {
@@ -59,13 +60,17 @@ interface MiniSparkProps {
 }
 
 const MiniSparkline: React.FC<MiniSparkProps> = ({ points, labels, color, unit }) => {
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [hoverState, setHoverState] = useState<{ idx: number; top: number; left: number } | null>(
+    null
+  );
   const xs = [6, 18, 30, 42, 54, 68];
-  const minV = Math.min(...points, 0);
-  const maxV = Math.max(...points, 1);
+  const safePoints = points.length > 0 ? points : [0, 0, 0, 0, 0, 0];
+  const minV = Math.min(...safePoints, 0);
+  const maxV = Math.max(...safePoints, 1);
   const span = Math.max(1, maxV - minV);
-  const ys = points.map((v) => 28 - ((v - minV) / span) * 21);
-  const poly = xs.map((x, i) => `${x},${ys[i].toFixed(1)}`).join(' ');
+  const ys = safePoints.map((v) => 28 - ((v - minV) / span) * 21);
+  const poly = xs.map((x, i) => `${x},${(ys[i] ?? 28).toFixed(1)}`).join(' ');
+  const hoverIdx = hoverState ? hoverState.idx : null;
 
   return (
     <div
@@ -73,11 +78,15 @@ const MiniSparkline: React.FC<MiniSparkProps> = ({ points, labels, color, unit }
       style={{ position: 'relative' }}
       onMouseMove={(e) => {
         const rect = e.currentTarget.getBoundingClientRect();
+        if (rect.width <= 0 || safePoints.length === 0) return;
         const rel = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-        const idx = Math.min(points.length - 1, Math.floor(rel * points.length));
-        setHoverIdx(idx);
+        const idx = Math.min(safePoints.length - 1, Math.floor(rel * safePoints.length));
+        const vw = window.innerWidth || 360;
+        const clampedLeft = Math.max(88, Math.min(vw - 88, rect.left + rect.width / 2));
+        setHoverState({ idx, top: Math.max(58, rect.top - 8), left: clampedLeft });
       }}
-      onMouseLeave={() => setHoverIdx(null)}
+      onMouseLeave={() => setHoverState(null)}
+      onPointerLeave={() => setHoverState(null)}
     >
       <svg viewBox="0 0 74 34" aria-hidden="true">
         <polyline
@@ -116,37 +125,49 @@ const MiniSparkline: React.FC<MiniSparkProps> = ({ points, labels, color, unit }
           </>
         ) : null}
       </svg>
-      {hoverIdx !== null ? (
-        <div
-          className="floating-white-tooltip"
-          style={{
-            position: 'absolute',
-            bottom: 'calc(100% + 8px)',
-            right: 0,
-            minWidth: 145,
-            padding: '6px 9px',
-          }}
-        >
-          <div
-            className="mono"
-            style={{
-              fontSize: 10.5,
-              color: 'var(--tooltip-sub)',
-              display: 'flex',
-              justifyContent: 'space-between',
-              gap: 8,
-            }}
-          >
-            <span>{labels[hoverIdx]}</span>
-            <strong style={{ color: 'var(--tooltip-fg)' }}>
-              {points[hoverIdx].toLocaleString('es-ES')} {unit}
-            </strong>
-          </div>
-        </div>
-      ) : null}
+      {hoverState !== null && typeof document !== 'undefined'
+        ? createPortal(
+            <div
+              className="floating-white-tooltip"
+              style={{
+                position: 'fixed',
+                top: hoverState.top,
+                left: hoverState.left,
+                transform: 'translate(-50%, -100%)',
+                minWidth: 155,
+                padding: '6px 9px',
+                zIndex: 200,
+              }}
+            >
+              <div
+                className="mono"
+                style={{
+                  fontSize: 10.5,
+                  color: 'var(--tooltip-sub)',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                }}
+              >
+                <span>{labels[hoverState.idx] ?? 'Ref.'}</span>
+                <strong style={{ color: 'var(--tooltip-fg)' }}>
+                  {(safePoints[hoverState.idx] ?? 0).toLocaleString('es-ES')} {unit}
+                </strong>
+              </div>
+            </div>,
+            document.body
+          )
+        : null}
     </div>
   );
 };
+
+function commitsMatch(a: string | null | undefined, b: string | null | undefined): boolean {
+  const ca = (a ?? '').trim().toLowerCase();
+  const cb = (b ?? '').trim().toLowerCase();
+  if (!ca || !cb) return false;
+  return ca.startsWith(cb) || cb.startsWith(ca);
+}
 
 function formatActiveWindowLabel(w?: ProviderRateLimitWindow | null): string {
   if (w === 'hour') return 'Ventana: hora';
@@ -185,7 +206,9 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   const [updateStatus, setUpdateStatus] = useState<SystemUpdateStatus | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [triggeringUpdate, setTriggeringUpdate] = useState(false);
-  const [updateFeedback, setUpdateFeedback] = useState<string | null>(null);
+  const [updateFeedback, setUpdateFeedback] = useState<{ text: string; isError?: boolean } | null>(
+    null
+  );
   const [updateProgress, setUpdateProgress] = useState<{
     active: boolean;
     pct: number;
@@ -238,6 +261,143 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
     };
   }, [providers.length, keysCount]);
 
+  const startUpdatePolling = (previousCommit: string | null, expectedLatest: string | null) => {
+    if (updatePollTimerRef.current !== null) {
+      window.clearInterval(updatePollTimerRef.current);
+      updatePollTimerRef.current = null;
+    }
+    const startedAt = Date.now();
+    let sawDisconnect = false;
+    let polling = false;
+
+    const pollOnce = async () => {
+      if (!isMountedRef.current || polling) return;
+      polling = true;
+      try {
+        if (Date.now() - startedAt > 180_000) {
+          if (updatePollTimerRef.current !== null) {
+            window.clearInterval(updatePollTimerRef.current);
+            updatePollTimerRef.current = null;
+          }
+          if (!isMountedRef.current) return;
+          setTriggeringUpdate(false);
+          setUpdateProgress({
+            active: false,
+            pct: 100,
+            label:
+              'Tiempo de espera agotado (3 min). Recarga manualmente o revisa los logs del servidor.',
+            isError: true,
+          });
+          return;
+        }
+
+        const [hRes, stRes] = await Promise.allSettled([
+          api.getHealth(),
+          api.getUpdateStatus(false),
+        ]);
+        if (!isMountedRef.current) return;
+
+        if (hRes.status === 'rejected') {
+          sawDisconnect = true;
+          setUpdateProgress({
+            active: true,
+            pct: 75,
+            label: 'Reiniciando servidor…',
+          });
+          return;
+        }
+
+        const liveCommit = hRes.value.buildCommit ?? null;
+        const liveStatus = stRes.status === 'fulfilled' ? stRes.value : null;
+        if (liveStatus) setUpdateStatus(liveStatus);
+
+        const phase = liveStatus?.updatePhase;
+        const phaseMsg = liveStatus?.updatePhaseMessage;
+
+        const commitChanged =
+          (Boolean(liveCommit) &&
+            Boolean(previousCommit) &&
+            !commitsMatch(liveCommit, previousCommit)) ||
+          (sawDisconnect &&
+            Boolean(liveCommit) &&
+            Boolean(expectedLatest) &&
+            commitsMatch(liveCommit, expectedLatest)) ||
+          (sawDisconnect &&
+            (!liveCommit || (liveStatus && !liveStatus.updateAvailable)) &&
+            (!phase || phase === 'idle'));
+
+        if (commitChanged) {
+          if (updatePollTimerRef.current !== null) {
+            window.clearInterval(updatePollTimerRef.current);
+            updatePollTimerRef.current = null;
+          }
+          setUpdateProgress({
+            active: true,
+            pct: 100,
+            label: '¡Actualizado correctamente! Recargando…',
+          });
+          reloadTimerRef.current = window.setTimeout(() => {
+            if (isMountedRef.current) window.location.reload();
+          }, 1200);
+          return;
+        }
+
+        if (phase === 'error') {
+          if (updatePollTimerRef.current !== null) {
+            window.clearInterval(updatePollTimerRef.current);
+            updatePollTimerRef.current = null;
+          }
+          setTriggeringUpdate(false);
+          setUpdateProgress({
+            active: false,
+            pct: 100,
+            label: phaseMsg || 'Error durante la actualización.',
+            isError: true,
+          });
+        } else if (phase === 'pulling') {
+          setUpdateProgress({
+            active: true,
+            pct: 45,
+            label: phaseMsg || 'Descargando nueva versión…',
+          });
+        } else if (phase === 'building') {
+          setUpdateProgress({
+            active: true,
+            pct: 60,
+            label: phaseMsg || 'Compilando nueva versión…',
+          });
+        } else if (phase === 'restarting' || sawDisconnect) {
+          setUpdateProgress({
+            active: true,
+            pct: 75,
+            label: phaseMsg || 'Reiniciando servidor…',
+          });
+        } else {
+          setUpdateProgress((prev) => ({
+            active: true,
+            pct: Math.min(70, (prev?.pct ?? 25) + 4),
+            label: phaseMsg || prev?.label || 'Actualización en curso…',
+          }));
+        }
+      } catch {
+        if (!isMountedRef.current) return;
+        sawDisconnect = true;
+        setUpdateProgress({
+          active: true,
+          pct: 75,
+          label: 'Reiniciando servidor…',
+        });
+      } finally {
+        polling = false;
+      }
+    };
+
+    if (!isMountedRef.current) return;
+    updatePollTimerRef.current = window.setInterval(() => {
+      void pollOnce();
+    }, 2000);
+  };
+
   useEffect(() => {
     let cancelled = false;
     api
@@ -252,7 +412,21 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
       api
         .getUpdateStatus(false)
         .then((st) => {
-          if (!cancelled) setUpdateStatus(st);
+          if (cancelled) return;
+          setUpdateStatus(st);
+          if (
+            st.updatePhase === 'pulling' ||
+            st.updatePhase === 'building' ||
+            st.updatePhase === 'restarting'
+          ) {
+            setTriggeringUpdate(true);
+            setUpdateProgress({
+              active: true,
+              pct: st.updatePhase === 'pulling' ? 45 : st.updatePhase === 'building' ? 60 : 75,
+              label: st.updatePhaseMessage || 'Actualización en curso…',
+            });
+            startUpdatePolling(st.currentCommit ?? null, st.latestCommit ?? null);
+          }
         })
         .catch(() => {
           // Silent if backend does not expose or offline
@@ -271,12 +445,17 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
       const st = await api.getUpdateStatus(true);
       if (!isMountedRef.current) return;
       setUpdateStatus(st);
-      if (!st.updateAvailable) {
-        setUpdateFeedback('Bifrost ya está en la última versión disponible.');
+      if (st.error) {
+        setUpdateFeedback({ text: st.error, isError: true });
+      } else if (!st.updateAvailable) {
+        setUpdateFeedback({ text: 'Bifrost ya está en la última versión disponible.' });
       }
     } catch {
       if (!isMountedRef.current) return;
-      setUpdateFeedback('No se pudo comprobar actualizaciones en este momento.');
+      setUpdateFeedback({
+        text: 'No se pudo comprobar actualizaciones en este momento.',
+        isError: true,
+      });
     } finally {
       if (isMountedRef.current) setCheckingUpdate(false);
     }
@@ -304,146 +483,51 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
       label: 'Enviando orden de actualización…',
     });
 
+    // Start polling immediately so live phases (pulling -> building -> restarting)
+    // and container restarts are tracked even if POST /api/system/update blocks or resets.
+    startUpdatePolling(previousCommit, expectedLatest);
+
     try {
       const res = await api.triggerSystemUpdate();
       if (!isMountedRef.current) return;
       if (res.upToDate) {
+        if (updatePollTimerRef.current !== null) {
+          window.clearInterval(updatePollTimerRef.current);
+          updatePollTimerRef.current = null;
+        }
         setUpdateProgress(null);
         setTriggeringUpdate(false);
-        setUpdateFeedback(res.message || 'Bifrost ya está al día.');
+        setUpdateFeedback({ text: res.message || 'Bifrost ya está al día.' });
         return;
       }
 
-      setUpdateProgress({
+      setUpdateProgress((prev) => ({
         active: true,
-        pct: 35,
-        label: res.message || 'Descargando nueva versión…',
-      });
-
-      const startedAt = Date.now();
-      let sawDisconnect = false;
-      let polling = false;
-
-      const pollOnce = async () => {
-        if (!isMountedRef.current || polling) return;
-        polling = true;
-        try {
-          if (Date.now() - startedAt > 90_000) {
-            if (updatePollTimerRef.current !== null) {
-              window.clearInterval(updatePollTimerRef.current);
-              updatePollTimerRef.current = null;
-            }
-            if (!isMountedRef.current) return;
-            setTriggeringUpdate(false);
-            setUpdateProgress({
-              active: false,
-              pct: 100,
-              label:
-                'Tiempo de espera agotado (90s). Recarga manualmente o revisa los logs del servidor.',
-              isError: true,
-            });
-            return;
-          }
-
-          const [hRes, stRes] = await Promise.allSettled([
-            api.getHealth(),
-            api.getUpdateStatus(false),
-          ]);
-          if (!isMountedRef.current) return;
-
-          if (hRes.status === 'rejected') {
-            sawDisconnect = true;
-            setUpdateProgress({
-              active: true,
-              pct: 75,
-              label: 'Reiniciando servidor…',
-            });
-            return;
-          }
-
-          const liveCommit = hRes.value.buildCommit ?? null;
-          const liveStatus = stRes.status === 'fulfilled' ? stRes.value : null;
-          if (liveStatus) setUpdateStatus(liveStatus);
-
-          const commitChanged =
-            Boolean(liveCommit) &&
-            ((Boolean(previousCommit) && liveCommit !== previousCommit) ||
-              (sawDisconnect && (!expectedLatest || liveCommit === expectedLatest)));
-
-          if (commitChanged) {
-            if (updatePollTimerRef.current !== null) {
-              window.clearInterval(updatePollTimerRef.current);
-              updatePollTimerRef.current = null;
-            }
-            setUpdateProgress({
-              active: true,
-              pct: 100,
-              label: '¡Actualizado correctamente! Recargando…',
-            });
-            reloadTimerRef.current = window.setTimeout(() => {
-              if (isMountedRef.current) window.location.reload();
-            }, 1200);
-            return;
-          }
-
-          const phase = liveStatus?.updatePhase;
-          const phaseMsg = liveStatus?.updatePhaseMessage;
-          if (phase === 'error') {
-            if (updatePollTimerRef.current !== null) {
-              window.clearInterval(updatePollTimerRef.current);
-              updatePollTimerRef.current = null;
-            }
-            setTriggeringUpdate(false);
-            setUpdateProgress({
-              active: false,
-              pct: 100,
-              label: phaseMsg || 'Error durante la actualización.',
-              isError: true,
-            });
-          } else if (phase === 'pulling') {
-            setUpdateProgress({
-              active: true,
-              pct: 45,
-              label: phaseMsg || 'Descargando nueva versión…',
-            });
-          } else if (phase === 'building') {
-            setUpdateProgress({
-              active: true,
-              pct: 60,
-              label: phaseMsg || 'Compilando nueva versión…',
-            });
-          } else if (phase === 'restarting' || sawDisconnect) {
-            setUpdateProgress({
-              active: true,
-              pct: 75,
-              label: phaseMsg || 'Reiniciando servidor…',
-            });
-          } else {
-            setUpdateProgress((prev) => ({
-              active: true,
-              pct: Math.min(70, (prev?.pct ?? 35) + 5),
-              label: phaseMsg || prev?.label || 'Descargando nueva versión…',
-            }));
-          }
-        } catch {
-          if (!isMountedRef.current) return;
-          sawDisconnect = true;
-          setUpdateProgress({
-            active: true,
-            pct: 75,
-            label: 'Reiniciando servidor…',
-          });
-        } finally {
-          polling = false;
-        }
-      };
-
-      if (!isMountedRef.current) return;
-      updatePollTimerRef.current = window.setInterval(() => {
-        void pollOnce();
-      }, 2000);
+        pct: Math.max(prev?.pct ?? 35, 35),
+        label: res.message || prev?.label || 'Descargando nueva versión…',
+      }));
     } catch (err) {
       if (!isMountedRef.current) return;
+      const status =
+        typeof err === 'object' && err !== null && 'status' in err
+          ? Number((err as { status?: unknown }).status)
+          : 0;
+      const isExpectedRestartNetworkError =
+        !status || status === 502 || status === 503 || status === 504;
+
+      if (isExpectedRestartNetworkError) {
+        setUpdateProgress((prev) => ({
+          active: true,
+          pct: Math.max(prev?.pct ?? 75, 75),
+          label: 'Reiniciando servidor…',
+        }));
+        return;
+      }
+
+      if (updatePollTimerRef.current !== null) {
+        window.clearInterval(updatePollTimerRef.current);
+        updatePollTimerRef.current = null;
+      }
       setTriggeringUpdate(false);
       setUpdateProgress({
         active: false,
@@ -519,7 +603,18 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
           ? 'warn'
           : 'healthy';
 
-  const sparkLabels = ['T-5h', 'T-4h', 'T-3h', 'T-2h', 'T-1h', 'Ahora'];
+  const isRequestUnit =
+    providerQuotasList.length > 0 && providerQuotasList.every((pq) => pq.unit === 'requests');
+  const unitLabel = isRequestUnit ? 'peticiones' : 'tokens';
+  const unitShort = isRequestUnit ? 'req' : 'tok';
+  const windowPhrase =
+    effectiveActiveWindow === 'hour'
+      ? 'esta hora'
+      : effectiveActiveWindow === 'week'
+        ? 'esta semana'
+        : 'hoy';
+
+  const sparkLabels = ['Ref. 1', 'Ref. 2', 'Ref. 3', 'Ref. 4', 'Ref. 5', 'Actual'];
 
   return (
     <>
@@ -527,9 +622,8 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
         <div>
           <h1 className="page-title">Actividad y Resumen</h1>
           <p className="page-subtitle">
-            Balance de cuota gratuita del día, salud del enrutador y punto de enlace local
-            compatible con OpenAI. Pasa el cursor por las minigráficas para inspeccionar la
-            evolución.
+            Balance de cuota gratuita ({windowPhrase}), salud del enrutador y punto de enlace local
+            compatible con OpenAI.
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -544,12 +638,16 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
 
       {/* KPI Strip with Embedded Interactive Sparklines */}
       <section className="kpi-grid-5" aria-label="Indicadores principales">
-        <article className="kpi-card" onClick={onNavigateMetrics}>
+        <article
+          className="kpi-card"
+          style={{ cursor: 'pointer' }}
+          onClick={onNavigateMetrics}
+        >
           <div className="kpi-top-split">
             <div>
               <div className="kpi-label-row">
-                <span>Cuota gratuita hoy</span>
-                <InfoTip text="Porcentaje disponible combinando topes diarios y cabeceras x-ratelimit-*." />
+                <span>Cuota gratuita ({windowPhrase})</span>
+                <InfoTip text="Porcentaje disponible combinando topes configurados y cabeceras x-ratelimit-*." />
               </div>
               <div className="kpi-value">
                 {pctRemaining !== null
@@ -572,12 +670,18 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
           </div>
         </article>
 
-        <article className="kpi-card" onClick={onNavigateMetrics}>
+        <article
+          className="kpi-card"
+          style={{ cursor: 'pointer' }}
+          onClick={onNavigateMetrics}
+        >
           <div className="kpi-top-split">
             <div>
               <div className="kpi-label-row">
-                <span>Tokens consumidos hoy</span>
-                <InfoTip text="Volumen acumulado en la ventana diaria actual UTC." />
+                <span>
+                  {isRequestUnit ? 'Peticiones' : 'Tokens'} consumidos ({windowPhrase})
+                </span>
+                <InfoTip text="Volumen acumulado en la ventana activa UTC." />
               </div>
               <div className="kpi-value">{usedToday.toLocaleString('es-ES')}</div>
             </div>
@@ -592,19 +696,23 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
               ]}
               labels={sparkLabels}
               color="var(--accent)"
-              unit="tok"
+              unit={unitShort}
             />
           </div>
           <div className="kpi-footnote">
             <span>
               {totalLimit
-                ? `Tope: ${totalLimit.toLocaleString('es-ES')} tok`
+                ? `Tope: ${totalLimit.toLocaleString('es-ES')} ${unitShort}`
                 : 'Cuota abierta por proveedor'}
             </span>
           </div>
         </article>
 
-        <article className="kpi-card" onClick={handleAddProviderAction}>
+        <article
+          className="kpi-card"
+          style={{ cursor: 'pointer' }}
+          onClick={handleAddProviderAction}
+        >
           <div className="kpi-top-split">
             <div>
               <div className="kpi-label-row">
@@ -711,15 +819,19 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             >
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                  {updateStatus?.updateAvailable ? (
+                  {updateStatus?.error ? (
+                    <span className="status-badge error">Error al comprobar</span>
+                  ) : updateStatus?.updateAvailable ? (
                     <span className="status-badge active">Actualización disponible</span>
                   ) : (
                     <span className="meta-tag verified">Al día</span>
                   )}
                   <strong style={{ fontSize: '0.92rem' }}>
-                    {updateStatus?.updateAvailable
-                      ? updateStatus.latestCommitMessage || 'Nueva versión de Bifrost disponible'
-                      : 'Sistema Bifrost actualizado'}
+                    {updateStatus?.error
+                      ? 'No se pudo verificar actualizaciones'
+                      : updateStatus?.updateAvailable
+                        ? updateStatus.latestCommitMessage || 'Nueva versión de Bifrost disponible'
+                        : 'Sistema Bifrost actualizado'}
                   </strong>
                   {(updateStatus?.currentVersion || healthInfo?.version) ? (
                     <span className="meta-tag mono">
@@ -742,8 +854,11 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                   ) : null}
                 </div>
                 {updateFeedback && !updateProgress ? (
-                  <span className="field-hint" style={{ color: 'var(--ok)' }}>
-                    {updateFeedback}
+                  <span
+                    className="field-hint"
+                    style={{ color: updateFeedback.isError ? 'var(--err)' : 'var(--ok)' }}
+                  >
+                    {updateFeedback.text}
                   </span>
                 ) : null}
               </div>
@@ -838,18 +953,18 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                 <span className="status-badge rate_limited">Ajuste adaptativo 429</span>
               ) : null}
               <h2 id="daily-quota-hero-title" className="card-title">
-                Cuota gratuita de hoy
+                Cuota gratuita ({windowPhrase})
               </h2>
               <InfoTip text="Calculada en el reloj UTC del servidor combinando los topes configurados en tus claves, cabeceras x-ratelimit-* y ajuste adaptativo ante respuestas 429." />
             </div>
 
             {summaryLoading && !summary ? (
-              <p className="field-hint">Consultando consumo diario en core/…</p>
+              <p className="field-hint">Consultando consumo en core/…</p>
             ) : pctRemaining !== null ? (
               <p style={{ color: 'var(--sub)', fontSize: '0.88rem' }}>
-                Consumidos hoy:{' '}
+                Consumidos ({windowPhrase}):{' '}
                 <strong className="mono" style={{ color: 'var(--fg)' }}>
-                  {usedToday.toLocaleString('es-ES')} tokens
+                  {usedToday.toLocaleString('es-ES')} {unitLabel}
                 </strong>
                 {totalLimit ? (
                   <>
@@ -865,12 +980,12 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             ) : (
               <p style={{ color: 'var(--sub)', fontSize: '0.88rem' }}>
                 {effectiveProvidersCount === 0 ? (
-                  'Aún no hay proveedores ni topes diarios configurados. Instala tu primer proveedor y define un tope estimado por cuenta para visualizar el porcentaje restante.'
+                  'Aún no hay proveedores ni topes configurados. Instala tu primer proveedor y define un tope estimado por cuenta para visualizar el porcentaje restante.'
                 ) : (
                   <>
-                    Sin tope diario numérico asignado · Consumo registrado hoy:{' '}
+                    Sin tope numérico asignado · Consumo registrado ({windowPhrase}):{' '}
                     <strong className="mono" style={{ color: 'var(--fg)' }}>
-                      {usedToday.toLocaleString('es-ES')} tokens
+                      {usedToday.toLocaleString('es-ES')} {unitLabel}
                     </strong>
                   </>
                 )}
@@ -882,7 +997,7 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             {pctRemaining !== null ? (
               <>
                 <div className="quota-hero-pct">{pctRemaining}%</div>
-                <span className="field-hint">disponible hoy</span>
+                <span className="field-hint">disponible ({windowPhrase})</span>
               </>
             ) : (
               <>

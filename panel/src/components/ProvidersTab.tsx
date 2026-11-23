@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import type {
   ExitNodeItem,
@@ -208,6 +208,21 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     key: ProviderKeyItem;
   } | null>(null);
   const [deletingBusy, setDeletingBusy] = useState(false);
+  const [deleteModalError, setDeleteModalError] = useState<string | null>(null);
+  const catalogReqIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!providerToDelete && !keyToDelete) return;
+    setDeleteModalError(null);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !deletingBusy) {
+        setProviderToDelete(null);
+        setKeyToDelete(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [providerToDelete, keyToDelete, deletingBusy]);
 
   useEffect(() => {
     if (initialSubView) {
@@ -224,13 +239,15 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     }
   }, [initialExpandedProviderId, onInitialExpandedProviderConsumed]);
 
-  const loadCatalog = useCallback(async (refresh = false) => {
+  const loadCatalog = useCallback(async (refresh = false, silentBanner = false) => {
+    const reqId = ++catalogReqIdRef.current;
     setCatalogLoading(true);
     try {
       const [stateRes, sourcesRes] = await Promise.allSettled([
         api.getMarketplace(refresh),
         api.getMarketplaceSources(),
       ]);
+      if (reqId !== catalogReqIdRef.current) return;
       if (stateRes.status === 'fulfilled') {
         setCatalog(stateRes.value);
         if (sourcesRes.status === 'fulfilled') {
@@ -238,7 +255,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         } else if (Array.isArray(stateRes.value.sources)) {
           setSources(stateRes.value.sources);
         }
-        if (refresh) {
+        if (refresh && !silentBanner) {
           const cnt = stateRes.value.updatesAvailableCount ?? 0;
           setGlobalBanner(
             cnt > 0
@@ -259,7 +276,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         });
       }
     } finally {
-      setCatalogLoading(false);
+      if (reqId === catalogReqIdRef.current) setCatalogLoading(false);
     }
   }, []);
 
@@ -292,8 +309,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
       await api.addMarketplaceSource({ name: cleanName, url: cleanUrl, enabled: true });
       setNewSourceName('');
       setNewSourceUrl('');
+      await loadCatalog(true, true);
       setGlobalBanner(`Repositorio «${cleanName}» añadido y activado.`);
-      await loadCatalog(true);
     } catch (err) {
       setGlobalError(
         err instanceof ApiError ? err.message : 'No se pudo añadir el repositorio.'
@@ -453,6 +470,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
       setLocalError('No se pudo leer el archivo seleccionado.');
     };
     reader.readAsText(file);
+    e.target.value = '';
   }
 
   async function handleInstallLocalSubmit(e: React.FormEvent) {
@@ -486,6 +504,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   async function handleConfirmDeleteProvider() {
     if (!providerToDelete) return;
     setDeletingBusy(true);
+    setDeleteModalError(null);
     setGlobalError(null);
 
     try {
@@ -495,7 +514,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
       await refreshEverything();
       setGlobalBanner(`Proveedor «${removedName}» eliminado junto con sus claves y modelos.`);
     } catch (err) {
-      setGlobalError(
+      setDeleteModalError(
         err instanceof ApiError ? err.message : 'No se pudo eliminar el proveedor.'
       );
     } finally {
@@ -506,6 +525,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   async function handleConfirmDeleteKey() {
     if (!keyToDelete) return;
     setDeletingBusy(true);
+    setDeleteModalError(null);
     setGlobalError(null);
 
     try {
@@ -515,7 +535,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
       await refreshEverything();
       setGlobalBanner(`Clave «${keyLabel}» eliminada de forma permanente.`);
     } catch (err) {
-      setGlobalError(
+      setDeleteModalError(
         err instanceof ApiError ? err.message : 'No se pudo eliminar la clave del proveedor.'
       );
     } finally {
@@ -998,7 +1018,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
             <div className="card">
               <p className="field-hint">Consultando fichas disponibles en los repositorios…</p>
             </div>
-          ) : (catalog.enabledSourcesCount ?? sources.filter((s) => s.enabled).length) === 0 ? (
+          ) : !catalog.offline &&
+            (catalog.enabledSourcesCount ?? sources.filter((s) => s.enabled).length) === 0 ? (
             (() => {
               const officialSource = sources.find((s) => s.isOfficial) ?? null;
               return (
@@ -1334,7 +1355,11 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
             </div>
 
             <div className="field">
-              <label htmlFor="local-adapter-url" className="field-label">
+              <label
+                htmlFor="local-adapter-url"
+                className="field-label"
+                style={{ display: 'block', lineHeight: 1.45 }}
+              >
                 URL local del adaptador (solo si <code className="mono">packageType</code> es{' '}
                 <code className="mono">experimental-adapter</code>)
               </label>
@@ -1349,7 +1374,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
               />
             </div>
 
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
               <button
                 type="button"
                 className="btn btn-secondary"
@@ -1390,6 +1415,11 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
               <code className="mono">{providerToDelete.id}</code>)? Se borrarán en cascada todas
               sus claves cifradas y su catálogo de modelos sincronizados en Bifrost.
             </p>
+            {deleteModalError ? (
+              <div className="alert alert-error" role="alert">
+                <span>{deleteModalError}</span>
+              </div>
+            ) : null}
             <div className="modal-actions">
               <button
                 type="button"
@@ -1439,6 +1469,11 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
               ) del proveedor <strong>{keyToDelete.provider.name}</strong>? El router dejará de
               utilizarla de inmediato.
             </p>
+            {deleteModalError ? (
+              <div className="alert alert-error" role="alert">
+                <span>{deleteModalError}</span>
+              </div>
+            ) : null}
             <div className="modal-actions">
               <button
                 type="button"

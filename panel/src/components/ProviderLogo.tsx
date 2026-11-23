@@ -17,6 +17,118 @@ function computeInitials(name: string, slug: string): string {
   return source.slice(0, 2).toUpperCase();
 }
 
+const ALLOWED_SVG_TAGS = new Set([
+  'svg',
+  'g',
+  'path',
+  'circle',
+  'ellipse',
+  'rect',
+  'line',
+  'polyline',
+  'polygon',
+  'defs',
+  'lineargradient',
+  'radialgradient',
+  'stop',
+  'clippath',
+  'mask',
+  'title',
+  'desc',
+]);
+
+const ALLOWED_SVG_ATTRS = new Set([
+  'viewbox',
+  'width',
+  'height',
+  'fill',
+  'fill-rule',
+  'fill-opacity',
+  'stroke',
+  'stroke-width',
+  'stroke-linecap',
+  'stroke-linejoin',
+  'stroke-opacity',
+  'stroke-dasharray',
+  'stroke-dashoffset',
+  'stroke-miterlimit',
+  'opacity',
+  'd',
+  'cx',
+  'cy',
+  'r',
+  'rx',
+  'ry',
+  'x',
+  'y',
+  'x1',
+  'y1',
+  'x2',
+  'y2',
+  'points',
+  'transform',
+  'id',
+  'offset',
+  'stop-color',
+  'stop-opacity',
+  'gradientunits',
+  'gradienttransform',
+  'clip-path',
+  'clip-rule',
+  'mask',
+  'preserveaspectratio',
+  'xmlns',
+  'role',
+  'aria-hidden',
+]);
+
+function sanitizeSvgMarkup(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  if (typeof DOMParser === 'undefined') return null;
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(raw, 'image/svg+xml');
+    if (doc.querySelector('parsererror')) return null;
+    const root = doc.documentElement;
+    if (!root || root.tagName.toLowerCase() !== 'svg') return null;
+
+    const cleanNode = (el: Element): boolean => {
+      const tag = el.tagName.toLowerCase();
+      if (!ALLOWED_SVG_TAGS.has(tag)) {
+        return false;
+      }
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase();
+        const val = attr.value.trim().toLowerCase();
+        if (
+          name.startsWith('on') ||
+          !ALLOWED_SVG_ATTRS.has(name) ||
+          val.includes('javascript:') ||
+          val.includes('data:') ||
+          val.includes('expression(')
+        ) {
+          el.removeAttribute(attr.name);
+        }
+      }
+      for (const child of Array.from(el.childNodes)) {
+        if (child.nodeType === Node.ELEMENT_NODE) {
+          if (!cleanNode(child as Element)) {
+            el.removeChild(child);
+          }
+        } else if (child.nodeType === Node.COMMENT_NODE) {
+          el.removeChild(child);
+        }
+      }
+      return true;
+    };
+
+    if (!cleanNode(root)) return null;
+    return new XMLSerializer().serializeToString(root);
+  } catch {
+    return null;
+  }
+}
+
 export const ProviderLogo: React.FC<ProviderLogoProps> = ({ slug, name, size = 38 }) => {
   const [logo, setLogo] = useState<ProviderLogoData | null>(null);
 
@@ -44,10 +156,8 @@ export const ProviderLogo: React.FC<ProviderLogoProps> = ({ slug, name, size = 3
   const paddingPx = Math.max(6, Math.round(size * 0.21));
   const fontSizeRem = `${Math.max(0.72, Number(((size / 38) * 0.85).toFixed(2)))}rem`;
 
-  const isSafeSvg =
-    Boolean(logo?.hasLogo && logo.svg) &&
-    !/<script/i.test(logo?.svg ?? '') &&
-    !/javascript:/i.test(logo?.svg ?? '');
+  const sanitizedSvg = logo?.hasLogo ? sanitizeSvgMarkup(logo.svg) : null;
+  const isSafeSvg = Boolean(sanitizedSvg);
 
   return (
     <span
@@ -61,7 +171,7 @@ export const ProviderLogo: React.FC<ProviderLogoProps> = ({ slug, name, size = 3
       title={`Proveedor: ${name || slug}`}
       aria-label={`Logo monocromo de ${name || slug}`}
     >
-      {isSafeSvg && logo?.svg ? (
+      {isSafeSvg && sanitizedSvg ? (
         <span
           style={{
             width: '100%',
@@ -71,7 +181,7 @@ export const ProviderLogo: React.FC<ProviderLogoProps> = ({ slug, name, size = 3
             justifyContent: 'center',
             color: 'var(--sub)',
           }}
-          dangerouslySetInnerHTML={{ __html: logo.svg }}
+          dangerouslySetInnerHTML={{ __html: sanitizedSvg }}
         />
       ) : (
         <span className="provider-logo-fallback" style={{ fontSize: fontSizeRem }}>

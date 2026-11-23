@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import type { SystemLogEntry } from '../types';
 import { InfoTip } from './InfoTip';
@@ -26,10 +26,14 @@ function formatUtcTimestamp(ts: number | string): string {
   if (typeof ts === 'number' && Number.isFinite(ts)) {
     const ms = ts < 1_000_000_000_000 ? ts * 1000 : ts;
     date = new Date(ms);
+  } else if (typeof ts === 'string' && ts.trim().length > 0) {
+    const parsed = Date.parse(ts);
+    if (Number.isNaN(parsed)) return '—';
+    date = new Date(parsed);
   } else {
-    const parsed = Date.parse(String(ts));
-    date = Number.isNaN(parsed) ? new Date() : new Date(parsed);
+    return '—';
   }
+  if (Number.isNaN(date.getTime())) return '—';
   return date.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 }
 
@@ -45,7 +49,10 @@ export const LogsTab: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [expandedMetaId, setExpandedMetaId] = useState<number | string | null>(null);
 
+  const logsReqIdRef = useRef(0);
+
   const fetchLogs = useCallback(async () => {
+    const reqId = ++logsReqIdRef.current;
     setLoading(true);
     setErrorMessage(null);
     try {
@@ -55,16 +62,18 @@ export const LogsTab: React.FC = () => {
         q: appliedQuery || undefined,
         limit: 100,
       });
+      if (reqId !== logsReqIdRef.current) return;
       setLogs(res.logs);
       setTotal(res.total);
     } catch (err) {
+      if (reqId !== logsReqIdRef.current) return;
       setErrorMessage(
         err instanceof ApiError
           ? err.message
           : 'No fue posible consultar los registros del sistema.'
       );
     } finally {
-      setLoading(false);
+      if (reqId === logsReqIdRef.current) setLoading(false);
     }
   }, [level, category, appliedQuery]);
 

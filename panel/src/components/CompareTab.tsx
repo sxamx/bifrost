@@ -90,8 +90,8 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
   );
 
   function handleAddColumn() {
-    if (selectedIds.length >= 3) return;
-    const nextCandidate = availableToAdd[0] ?? models[0];
+    if (selectedIds.length >= 3 || availableToAdd.length === 0) return;
+    const nextCandidate = availableToAdd[0];
     if (!nextCandidate) return;
     setSelectedIds((prev) => [...prev, nextCandidate.fullId]);
   }
@@ -132,7 +132,7 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
             type="button"
             className="btn btn-primary"
             onClick={handleAddColumn}
-            disabled={models.length <= selectedIds.length && models.length < 2}
+            disabled={availableToAdd.length === 0}
           >
             + Agregar modelo ({selectedIds.length}/3)
           </button>
@@ -175,7 +175,7 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
             const outputMods = model.modalities?.output ?? ['text'];
 
             return (
-              <article key={`${colIdx}-${model.fullId}`} className="compare-col-card">
+              <article key={`compare-col-${colIdx}`} className="compare-col-card">
                 <div
                   style={{
                     display: 'flex',
@@ -332,7 +332,7 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
                       <InfoTip text="Mediana real de Time to First Token registrada por tu propio router." />
                     </span>
                     <strong className="mono">
-                      {speed
+                      {speed && speed.sampleCount > 0
                         ? `${Math.round(speed.ttftMs.p50).toLocaleString('es-ES')} ms`
                         : 'Sin tráfico aún'}
                     </strong>
@@ -341,7 +341,7 @@ export const CompareTab: React.FC<CompareTabProps> = ({ onOpenModel }) => {
                   <div className="compare-spec-row">
                     <span className="compare-spec-label">Velocidad (P50)</span>
                     <strong className="mono" style={{ color: 'var(--accent)' }}>
-                      {speed
+                      {speed && speed.sampleCount > 0
                         ? `${speed.tokensPerSec.p50.toLocaleString('es-ES', {
                             minimumFractionDigits: 1,
                             maximumFractionDigits: 1,

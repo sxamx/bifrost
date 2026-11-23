@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import type {
   ArtificialWatchAxis,
@@ -160,19 +160,19 @@ const PercentileRadarChart: React.FC<RadarChartProps> = ({ axes }) => {
     );
   }
 
-  const svgW = 460;
-  const svgH = 290;
+  const svgW = 500;
+  const svgH = 310;
   const cx = svgW / 2;
   const cy = svgH / 2;
-  const maxR = 88;
+  const maxR = 86;
   const rings = [25, 50, 75, 100];
   const count = axes.length;
 
   const angleFor = (i: number) => -Math.PI / 2 + (i * 2 * Math.PI) / count;
 
-  const pointFor = (i: number, pct: number) => {
-    const clamped = Math.max(0, Math.min(100, pct));
-    const r = (clamped / 100) * maxR;
+  const pointFor = (i: number, pct: number, clamp = true) => {
+    const val = clamp ? Math.max(0, Math.min(100, pct)) : Math.max(0, pct);
+    const r = (val / 100) * maxR;
     const a = angleFor(i);
     return {
       x: cx + r * Math.cos(a),
@@ -249,7 +249,7 @@ const PercentileRadarChart: React.FC<RadarChartProps> = ({ axes }) => {
 
             {axes.map((ax, i) => {
               const outer = pointFor(i, 100);
-              const labelPt = pointFor(i, 134);
+              const labelPt = pointFor(i, 126, false);
               const isHovered = hoveredIdx === i;
               const cosA = Math.cos(angleFor(i));
               const anchor = Math.abs(cosA) < 0.2 ? 'middle' : cosA > 0 ? 'start' : 'end';
@@ -485,21 +485,34 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [methodologyModalOpen, setMethodologyModalOpen] = useState(false);
+  const benchReqIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!methodologyModalOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMethodologyModalOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [methodologyModalOpen]);
 
   const loadBenchmarks = useCallback(async () => {
+    const reqId = ++benchReqIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await api.getModelBenchmarks(fullId);
+      if (reqId !== benchReqIdRef.current) return;
       setData(res);
     } catch (err) {
+      if (reqId !== benchReqIdRef.current) return;
       setError(
         err instanceof ApiError
           ? err.message
           : 'No se pudieron cargar las capturas de benchmarks públicos para este modelo.'
       );
     } finally {
-      setLoading(false);
+      if (reqId === benchReqIdRef.current) setLoading(false);
     }
   }, [fullId]);
 
@@ -1010,7 +1023,12 @@ export const ModelBenchmarksPanel: React.FC<ModelBenchmarksPanelProps> = ({
                             <strong style={{ fontSize: '12.5px', color: 'var(--fg)' }}>
                               {run.benchmarkName}
                             </strong>
-                            <code className="key-prefix-pill">{run.harness || 'Inspect'}</code>
+                            <span
+                              className="meta-tag mono"
+                              title="Arnés de evaluación reproducible de Epoch AI"
+                            >
+                              Arnés: {run.harness || 'Inspect'}
+                            </span>
                           </div>
                           <span className="field-hint" style={{ fontSize: '11px' }}>
                             Updated {run.evaluatedAt ?? 'reciente'}

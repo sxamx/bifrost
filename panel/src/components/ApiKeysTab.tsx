@@ -115,8 +115,23 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
     }
   }
 
+  const [revokeModalError, setRevokeModalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!confirmRevokeTarget) return;
+    setRevokeModalError(null);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !revokingId) {
+        setConfirmRevokeTarget(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [confirmRevokeTarget, revokingId]);
+
   async function handleConfirmRevoke() {
     if (!confirmRevokeTarget) return;
+    setRevokeModalError(null);
     setErrorMessage(null);
     setRevokingId(confirmRevokeTarget.id);
 
@@ -126,9 +141,9 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
       await onKeysChanged();
     } catch (err) {
       if (err instanceof ApiError) {
-        setErrorMessage(err.message);
+        setRevokeModalError(err.message);
       } else {
-        setErrorMessage('Error al revocar la clave seleccionada.');
+        setRevokeModalError('Error al revocar la clave seleccionada.');
       }
     } finally {
       setRevokingId(null);
@@ -461,6 +476,11 @@ export const ApiKeysTab: React.FC<ApiKeysTabProps> = ({
               aplicaciones que la utilicen perderán acceso de inmediato y esta acción no se puede
               deshacer.
             </p>
+            {revokeModalError ? (
+              <div className="alert alert-error" role="alert">
+                <span>{revokeModalError}</span>
+              </div>
+            ) : null}
             <div className="modal-actions">
               <button
                 type="button"

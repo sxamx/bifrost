@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
 import { copyTextToClipboard } from '../clipboard';
 import type {
@@ -228,9 +228,25 @@ export const NodesTab: React.FC<NodesTabProps> = ({
     }
   }
 
+  const [deleteModalError, setDeleteModalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!addModalOpen && !createdResult && !nodeToDelete) return;
+    setDeleteModalError(null);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (nodeToDelete && !deleting) setNodeToDelete(null);
+      else if (addModalOpen && !creating) setAddModalOpen(false);
+      else if (createdResult) setCreatedResult(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [addModalOpen, createdResult, nodeToDelete, deleting, creating]);
+
   async function handleConfirmDeleteNode() {
     if (!nodeToDelete) return;
     setDeleting(true);
+    setDeleteModalError(null);
     setErrorBanner(null);
 
     try {
@@ -247,7 +263,7 @@ export const NodesTab: React.FC<NodesTabProps> = ({
           : `Nodo «${deletedName}» retirado correctamente.`
       );
     } catch (err) {
-      setErrorBanner(
+      setDeleteModalError(
         err instanceof ApiError ? err.message : 'No fue posible eliminar el nodo.'
       );
     } finally {
@@ -343,161 +359,163 @@ export const NodesTab: React.FC<NodesTabProps> = ({
             </button>
           </div>
         ) : (
-          <div className="table-wrap">
-            <table className="bf-table">
-              <thead>
-                <tr>
-                  <th>Nodo</th>
-                  <th>Estado</th>
-                  <th>Transporte</th>
-                  <th>Endpoint</th>
-                  <th>Último heartbeat</th>
-                  <th>Última rotación token</th>
-                  <th>Claves atadas</th>
-                  <th style={{ textAlign: 'right' }}>Acciones</th>
-                </tr>
-              </thead>
-              <tbody>
-                {nodes.map((node) => {
-                  const linkedKeys = assignedKeysByNode[node.id] ?? [];
-                  const keysCount = node.assignedKeysCount ?? linkedKeys.length;
-                  const elapsed = formatHeartbeatElapsed(node.lastSeenAt);
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {nodes.map((node) => {
+              const linkedKeys = assignedKeysByNode[node.id] ?? [];
+              const keysCount = node.assignedKeysCount ?? linkedKeys.length;
+              const elapsed = formatHeartbeatElapsed(node.lastSeenAt);
 
-                  return (
-                    <tr key={node.id}>
-                      <td style={{ fontWeight: 700 }}>{node.name}</td>
-                      <td>
-                        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                          <span className={`status-badge ${node.status}`}>
-                            <span
-                              className={`status-dot ${
-                                node.status === 'online'
-                                  ? 'ok'
-                                  : node.status === 'unresponsive'
-                                    ? 'err'
-                                    : 'offline'
-                              }`}
-                            />
-                            {nodeStatusLabel(node.status)}
-                          </span>
-                          {node.status === 'unresponsive' ? (
-                            <InfoTip
-                              label={`Alerta de caída en ${node.name}`}
-                              text="Más de 120 segundos sin respuesta al heartbeat. Las claves asignadas a este nodo están temporalmente marcadas sin servicio hasta que recupere conexión."
-                            />
-                          ) : null}
-                        </div>
-                      </td>
-                      <td>
-                        {node.mode === 'tailscale' ? (
-                          <span className="meta-tag verified">Tailscale</span>
-                        ) : (
-                          <span className="status-badge rate_limited">IP pública TLS</span>
-                        )}
-                      </td>
-                      <td>
-                        <code className="key-prefix-pill">{node.endpoint}</code>
-                      </td>
-                      <td style={{ fontSize: '0.85rem', color: 'var(--sub)' }}>
-                        <div>{formatDateTime(node.lastSeenAt, 'Sin señal aún')}</div>
-                        {elapsed ? (
-                          <span className="field-hint" style={{ fontSize: '0.76rem' }}>
-                            ({elapsed})
-                          </span>
-                        ) : null}
-                      </td>
-                      <td style={{ fontSize: '0.85rem', color: 'var(--sub)' }}>
-                        {formatDateTime(node.lastRotatedAt, 'Inicial')}
-                      </td>
-                      <td>
-                        <span className="meta-tag accent">
-                          {keysCount} {keysCount === 1 ? 'clave' : 'claves'}
-                        </span>
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <div
-                          style={{
-                            display: 'flex',
-                            flexDirection: 'column',
-                            alignItems: 'flex-end',
-                            gap: 4,
-                          }}
+              return (
+                <div key={node.id} className="provider-section" style={{ gap: 10 }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 12,
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        flexWrap: 'wrap',
+                        minWidth: 0,
+                      }}
+                    >
+                      <strong style={{ fontSize: '0.96rem', color: 'var(--fg)' }}>
+                        {node.name}
+                      </strong>
+                      <span className={`status-badge ${node.status}`}>
+                        <span
+                          className={`status-dot ${
+                            node.status === 'online'
+                              ? 'ok'
+                              : node.status === 'unresponsive'
+                                ? 'err'
+                                : 'offline'
+                          }`}
+                        />
+                        {nodeStatusLabel(node.status)}
+                      </span>
+                      {node.status === 'unresponsive' ? (
+                        <InfoTip
+                          label={`Alerta de caída en ${node.name}`}
+                          text="Más de 120 segundos sin respuesta al heartbeat. Las claves asignadas a este nodo están temporalmente marcadas sin servicio hasta que recupere conexión."
+                        />
+                      ) : null}
+                      {node.mode === 'tailscale' ? (
+                        <span className="meta-tag verified">Tailscale</span>
+                      ) : (
+                        <span className="status-badge rate_limited">IP pública TLS</span>
+                      )}
+                      <code className="key-prefix-pill">{node.endpoint}</code>
+                      <span className="meta-tag accent">
+                        {keysCount} {keysCount === 1 ? 'clave' : 'claves'}
+                      </span>
+                    </div>
+
+                    <div
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        disabled={testingId === node.id}
+                        onClick={() => void handleTestNode(node)}
+                      >
+                        {testingId === node.id ? 'Probando…' : 'Probar'}
+                      </button>
+                      {node.updateAvailable === true ? (
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={updatingId === node.id}
+                          onClick={() => void handleUpdateNode(node)}
                         >
-                          <div
-                            style={{
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              gap: 6,
-                              justifyContent: 'flex-end',
-                              flexWrap: 'wrap',
-                            }}
-                          >
-                            <button
-                              type="button"
-                              className="btn btn-secondary btn-sm"
-                              disabled={testingId === node.id}
-                              onClick={() => void handleTestNode(node)}
-                            >
-                              {testingId === node.id ? 'Probando…' : 'Probar'}
-                            </button>
-                            {node.updateAvailable === true ? (
-                              <button
-                                type="button"
-                                className="btn btn-primary btn-sm"
-                                disabled={updatingId === node.id}
-                                onClick={() => void handleUpdateNode(node)}
-                              >
-                                {updatingId === node.id ? 'Actualizando…' : 'Actualizar nodo'}
-                              </button>
-                            ) : node.updateAvailable === false ? (
-                              <span className="meta-tag verified">Al día</span>
-                            ) : (
-                              <button
-                                type="button"
-                                className="btn btn-secondary btn-sm"
-                                disabled={updatingId === node.id}
-                                onClick={() => void handleUpdateNode(node)}
-                                title="Versión del nodo no reportada aún"
-                              >
-                                {updatingId === node.id ? 'Actualizando…' : 'Actualizar nodo'}
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              className="btn btn-secondary btn-sm"
-                              disabled={rotatingId === node.id}
-                              onClick={() => void handleRotateToken(node)}
-                            >
-                              {rotatingId === node.id ? 'Rotando…' : 'Rotar token'}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-danger btn-sm"
-                              onClick={() => setNodeToDelete(node)}
-                            >
-                              Quitar
-                            </button>
-                          </div>
-                          {testResults[node.id] ? (
-                            <span
-                              className="mono"
-                              style={{
-                                fontSize: '0.72rem',
-                                color: testResults[node.id].ok ? 'var(--ok)' : 'var(--err)',
-                              }}
-                            >
-                              {testResults[node.id].ok
-                                ? `En línea · ${testResults[node.id].latencyMs ?? 0} ms`
-                                : testResults[node.id].error || 'Sin respuesta'}
-                            </span>
-                          ) : null}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                          {updatingId === node.id ? 'Actualizando…' : 'Actualizar nodo'}
+                        </button>
+                      ) : node.updateAvailable === false ? (
+                        <span className="meta-tag verified">Al día</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          disabled={updatingId === node.id}
+                          onClick={() => void handleUpdateNode(node)}
+                          title="Versión del nodo no reportada aún"
+                        >
+                          {updatingId === node.id ? 'Actualizando…' : 'Actualizar nodo'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        disabled={rotatingId === node.id}
+                        onClick={() => void handleRotateToken(node)}
+                      >
+                        {rotatingId === node.id ? 'Rotando…' : 'Rotar token'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        onClick={() => setNodeToDelete(node)}
+                      >
+                        Quitar
+                      </button>
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 12,
+                      flexWrap: 'wrap',
+                      fontSize: '0.8rem',
+                      color: 'var(--sub)',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+                      <span>
+                        Heartbeat:{' '}
+                        <strong style={{ color: 'var(--fg)' }}>
+                          {formatDateTime(node.lastSeenAt, 'Sin señal aún')}
+                        </strong>
+                        {elapsed ? ` (${elapsed})` : ''}
+                      </span>
+                      <span>
+                        Rotación token:{' '}
+                        <strong style={{ color: 'var(--fg)' }}>
+                          {formatDateTime(node.lastRotatedAt, 'Inicial')}
+                        </strong>
+                      </span>
+                    </div>
+                    {testResults[node.id] ? (
+                      <span
+                        className="mono"
+                        style={{
+                          fontSize: '0.76rem',
+                          color: testResults[node.id].ok ? 'var(--ok)' : 'var(--err)',
+                        }}
+                      >
+                        {testResults[node.id].ok
+                          ? `En línea · ${testResults[node.id].latencyMs ?? 0} ms`
+                          : testResults[node.id].error || 'Sin respuesta'}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </section>
@@ -780,6 +798,12 @@ export const NodesTab: React.FC<NodesTabProps> = ({
                 retirarlo de Bifrost?
               </p>
             )}
+
+            {deleteModalError ? (
+              <div className="alert alert-error" role="alert">
+                <span>{deleteModalError}</span>
+              </div>
+            ) : null}
 
             <div className="modal-actions">
               <button
