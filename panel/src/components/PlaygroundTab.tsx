@@ -1,14 +1,23 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import type {
-  AppendPlaygroundMessageInput,
   PlaygroundChatMessage,
+  PlaygroundChatSettings,
   PlaygroundChatSummary,
   PlaygroundChatTurn,
   ProviderModelItem,
   ReasoningEffort,
 } from '../types';
 import { InfoTip } from './InfoTip';
+
+const DEFAULT_SYSTEM_PROMPT = 'Eres un asistente técnico claro, conciso y preciso.';
+const DEFAULT_TEMPERATURE = 0.7;
+const DEFAULT_MAX_TOKENS = 2048;
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = 'none';
+
+interface DisplayChatTurn extends PlaygroundChatTurn {
+  error?: string | null;
+}
 
 function renderInlineMarkdown(text: string): React.ReactNode[] {
   const tokens = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
@@ -91,7 +100,7 @@ function formatRelativeTime(ts: number): string {
   return new Intl.DateTimeFormat('es-ES', { day: '2-digit', month: 'short' }).format(new Date(ms));
 }
 
-function mapStoredMessageToTurn(msg: PlaygroundChatMessage): PlaygroundChatTurn {
+function mapStoredMessageToTurn(msg: PlaygroundChatMessage): DisplayChatTurn {
   const m = msg.metrics;
   const hasUsage =
     m &&
@@ -118,6 +127,7 @@ function mapStoredMessageToTurn(msg: PlaygroundChatMessage): PlaygroundChatTurn 
           totalTokens: promptTokens + completionTokens + reasoningTokens,
         }
       : undefined,
+    error: m?.error ?? null,
     createdAt: msg.createdAt,
   };
 }
@@ -130,14 +140,27 @@ function upsertChatSummary(
   return [updated, ...rest].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const name = 'name' in err ? String((err as { name?: unknown }).name) : '';
+  return name === 'AbortError';
+}
+
+function parseClampedMaxTokens(raw: string): number {
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_MAX_TOKENS;
+  return Math.max(64, Math.min(32768, parsed));
+}
+
 export const PlaygroundTab: React.FC = () => {
   const [models, setModels] = useState<ProviderModelItem[]>([]);
   const [modelsLoading, setModelsLoading] = useState(true);
 
-  // HU-43 Encrypted Per-Account Chat History State
+  // HU-43 / HU-43b Encrypted Per-Account Chat History State
   const [chats, setChats] = useState<PlaygroundChatSummary[]>([]);
   const [chatsLoading, setChatsLoading] = useState(true);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [activeChatInProgress, setActiveChatInProgress] = useState(false);
   const [loadingChatId, setLoadingChatId] = useState<string | null>(null);
   const [creatingChat, setCreatingChat] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -154,18 +177,16 @@ export const PlaygroundTab: React.FC = () => {
   const [modalBusy, setModalBusy] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
 
-  // Configuration Panel State
+  // Configuration Panel State (persisted encrypted per chat in HU-43b)
   const [selectedModel, setSelectedModel] = useState('');
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('none');
-  const [temperature, setTemperature] = useState(0.7);
-  const [maxTokensInput, setMaxTokensInput] = useState('2048');
-  const [systemPrompt, setSystemPrompt] = useState(
-    'Eres un asistente técnico claro, conciso y preciso.'
-  );
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(DEFAULT_REASONING_EFFORT);
+  const [temperature, setTemperature] = useState(DEFAULT_TEMPERATURE);
+  const [maxTokensInput, setMaxTokensInput] = useState(String(DEFAULT_MAX_TOKENS));
+  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [paramsOpen, setParamsOpen] = useState(false);
 
   // Chat Multi-Turn State
-  const [turns, setTurns] = useState<PlaygroundChatTurn[]>([]);
+  const [turns, setTurns] = useState<DisplayChatTurn[]>([]);
   const [promptInput, setPromptInput] = useState('');
   const [streamingContent, setStreamingContent] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -175,6 +196,38 @@ export const PlaygroundTab: React.FC = () => {
   const reqIdRef = useRef(0);
   const loadChatReqIdRef = useRef(0);
   const isMountedRef = useRef(true);
+  const activeChatIdRef = useRef<string | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const settingsDebounceRef = useRef<number | null>(null);
+  const bgPollTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  const stopBackgroundPolling = useCallback(() => {
+    if (bgPollTimerRef.current !== null) {
+      window.clearInterval(bgPollTimerRef.current);
+      bgPollTimerRef.current = null;
+    }
+  }, []);
+
+  const clearSettingsDebounce = useCallback(() => {
+    if (settingsDebounceRef.current !== null) {
+      window.clearTimeout(settingsDebounceRef.current);
+      settingsDebounceRef.current = null;
+    }
+  }, []);
+
+  const abortLocalStream = useCallback(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+    reqIdRef.current += 1;
+    setStreamingContent(null);
+    setSending(false);
+  }, []);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -182,6 +235,18 @@ export const PlaygroundTab: React.FC = () => {
       isMountedRef.current = false;
       reqIdRef.current += 1;
       loadChatReqIdRef.current += 1;
+      if (streamAbortRef.current) {
+        streamAbortRef.current.abort();
+        streamAbortRef.current = null;
+      }
+      if (settingsDebounceRef.current !== null) {
+        window.clearTimeout(settingsDebounceRef.current);
+        settingsDebounceRef.current = null;
+      }
+      if (bgPollTimerRef.current !== null) {
+        window.clearInterval(bgPollTimerRef.current);
+        bgPollTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -198,8 +263,104 @@ export const PlaygroundTab: React.FC = () => {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [chatToDelete, clearModalOpen, modalBusy]);
 
+  const applyChatSettings = useCallback((settings?: PlaygroundChatSettings | null) => {
+    setReasoningEffort(settings?.reasoningEffort ?? DEFAULT_REASONING_EFFORT);
+    setTemperature(
+      typeof settings?.temperature === 'number' && Number.isFinite(settings.temperature)
+        ? settings.temperature
+        : DEFAULT_TEMPERATURE
+    );
+    setMaxTokensInput(
+      typeof settings?.maxTokens === 'number' && Number.isFinite(settings.maxTokens)
+        ? String(settings.maxTokens)
+        : String(DEFAULT_MAX_TOKENS)
+    );
+    setSystemPrompt(
+      typeof settings?.systemPrompt === 'string' ? settings.systemPrompt : DEFAULT_SYSTEM_PROMPT
+    );
+  }, []);
+
+  const persistChatConfig = useCallback(
+    (
+      chatId: string,
+      nextModelFullId: string,
+      nextSettings: PlaygroundChatSettings,
+      debounceMs = 0
+    ) => {
+      clearSettingsDebounce();
+      const execute = () => {
+        void api
+          .updatePlaygroundChat(chatId, {
+            modelFullId: nextModelFullId || null,
+            settings: nextSettings,
+          })
+          .then((updated) => {
+            if (isMountedRef.current) {
+              setChats((prev) => upsertChatSummary(prev, updated));
+            }
+          })
+          .catch(() => {
+            // Non-blocking settings sync
+          });
+      };
+
+      if (debounceMs > 0) {
+        settingsDebounceRef.current = window.setTimeout(() => {
+          settingsDebounceRef.current = null;
+          execute();
+        }, debounceMs);
+      } else {
+        execute();
+      }
+    },
+    [clearSettingsDebounce]
+  );
+
+  const startBackgroundPolling = useCallback(
+    (chatId: string) => {
+      stopBackgroundPolling();
+      let polling = false;
+
+      const tick = async () => {
+        if (!isMountedRef.current || polling || activeChatIdRef.current !== chatId) return;
+        polling = true;
+        try {
+          const detail = await api.getPlaygroundChat(chatId);
+          if (!isMountedRef.current || activeChatIdRef.current !== chatId) return;
+          const stillRunning = Boolean(detail.inProgress ?? detail.chat.inProgress);
+          setActiveChatInProgress(stillRunning);
+          setChats((prev) => upsertChatSummary(prev, { ...detail.chat, inProgress: stillRunning }));
+          setTurns(
+            detail.messages
+              .filter((m) => m.role === 'user' || m.role === 'assistant')
+              .map(mapStoredMessageToTurn)
+          );
+          if (!stillRunning) {
+            stopBackgroundPolling();
+          }
+        } catch {
+          // Keep polling quietly on transient errors
+        } finally {
+          polling = false;
+        }
+      };
+
+      bgPollTimerRef.current = window.setInterval(() => {
+        void tick();
+      }, 2000);
+    },
+    [stopBackgroundPolling]
+  );
+
   const loadChatDetail = useCallback(
     async (chatId: string, activeModels?: ProviderModelItem[]) => {
+      // Allow switching away freely while another chat streams; backend continues persisting it
+      if (activeChatIdRef.current !== chatId) {
+        abortLocalStream();
+      }
+      stopBackgroundPolling();
+      clearSettingsDebounce();
+
       const reqId = ++loadChatReqIdRef.current;
       setLoadingChatId(chatId);
       setChatError(null);
@@ -207,8 +368,11 @@ export const PlaygroundTab: React.FC = () => {
       try {
         const detail = await api.getPlaygroundChat(chatId);
         if (!isMountedRef.current || reqId !== loadChatReqIdRef.current) return;
+        const inProgress = Boolean(detail.inProgress ?? detail.chat.inProgress);
         setActiveChatId(detail.chat.id);
-        setChats((prev) => upsertChatSummary(prev, detail.chat));
+        activeChatIdRef.current = detail.chat.id;
+        setActiveChatInProgress(inProgress);
+        setChats((prev) => upsertChatSummary(prev, { ...detail.chat, inProgress }));
         setTurns(
           detail.messages
             .filter((m) => m.role === 'user' || m.role === 'assistant')
@@ -217,6 +381,10 @@ export const PlaygroundTab: React.FC = () => {
         const list = activeModels ?? models;
         if (detail.chat.modelFullId && list.some((m) => m.fullId === detail.chat.modelFullId)) {
           setSelectedModel(detail.chat.modelFullId);
+        }
+        applyChatSettings(detail.settings ?? detail.chat.settings ?? null);
+        if (inProgress) {
+          startBackgroundPolling(detail.chat.id);
         }
         if (typeof window !== 'undefined' && window.innerWidth <= 940) {
           setHistoryOpen(false);
@@ -232,7 +400,14 @@ export const PlaygroundTab: React.FC = () => {
         }
       }
     },
-    [models]
+    [
+      abortLocalStream,
+      applyChatSettings,
+      clearSettingsDebounce,
+      models,
+      startBackgroundPolling,
+      stopBackgroundPolling,
+    ]
   );
 
   useEffect(() => {
@@ -279,30 +454,114 @@ export const PlaygroundTab: React.FC = () => {
     if (scrollBoxRef.current) {
       scrollBoxRef.current.scrollTop = scrollBoxRef.current.scrollHeight;
     }
-  }, [turns, streamingContent]);
+  }, [turns, streamingContent, activeChatInProgress]);
 
   const currentModelObj = models.find((m) => m.fullId === selectedModel) ?? null;
   const supportsReasoning = Boolean(currentModelObj?.capabilities?.reasoning);
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
 
-  function parseClampedMaxTokens(raw: string): number {
-    const parsed = Number.parseInt(raw, 10);
-    if (!Number.isFinite(parsed)) return 2048;
-    return Math.max(64, Math.min(32768, parsed));
+  function buildCurrentSettings(overrides?: Partial<PlaygroundChatSettings>): PlaygroundChatSettings {
+    return {
+      reasoningEffort: overrides?.reasoningEffort ?? reasoningEffort,
+      temperature: overrides?.temperature !== undefined ? overrides.temperature : temperature,
+      maxTokens:
+        overrides?.maxTokens !== undefined
+          ? overrides.maxTokens
+          : parseClampedMaxTokens(maxTokensInput),
+      systemPrompt:
+        overrides?.systemPrompt !== undefined ? overrides.systemPrompt : systemPrompt,
+    };
+  }
+
+  function handleModelChange(nextModel: string) {
+    setSelectedModel(nextModel);
+    if (activeChatId) {
+      persistChatConfig(activeChatId, nextModel, buildCurrentSettings(), 0);
+    }
+  }
+
+  function handleReasoningChange(nextEffort: ReasoningEffort) {
+    setReasoningEffort(nextEffort);
+    if (activeChatId) {
+      persistChatConfig(
+        activeChatId,
+        selectedModel,
+        buildCurrentSettings({ reasoningEffort: nextEffort }),
+        0
+      );
+    }
+  }
+
+  function handleTemperatureChange(nextTemp: number) {
+    setTemperature(nextTemp);
+    if (activeChatId) {
+      persistChatConfig(
+        activeChatId,
+        selectedModel,
+        buildCurrentSettings({ temperature: nextTemp }),
+        350
+      );
+    }
+  }
+
+  function handleMaxTokensChange(rawVal: string) {
+    setMaxTokensInput(rawVal);
+    if (activeChatId) {
+      const parsed = Number.parseInt(rawVal, 10);
+      if (Number.isFinite(parsed) && parsed >= 64 && parsed <= 32768) {
+        persistChatConfig(
+          activeChatId,
+          selectedModel,
+          buildCurrentSettings({ maxTokens: parsed }),
+          450
+        );
+      }
+    }
+  }
+
+  function handleMaxTokensBlur() {
+    const clamped = parseClampedMaxTokens(maxTokensInput);
+    setMaxTokensInput(String(clamped));
+    if (activeChatId) {
+      persistChatConfig(
+        activeChatId,
+        selectedModel,
+        buildCurrentSettings({ maxTokens: clamped }),
+        0
+      );
+    }
+  }
+
+  function handleSystemPromptChange(nextPrompt: string) {
+    setSystemPrompt(nextPrompt);
+    if (activeChatId) {
+      persistChatConfig(
+        activeChatId,
+        selectedModel,
+        buildCurrentSettings({ systemPrompt: nextPrompt }),
+        500
+      );
+    }
   }
 
   async function handleCreateNewChat() {
-    if (sending || creatingChat) return;
+    if (creatingChat) return;
+    abortLocalStream();
+    stopBackgroundPolling();
+    clearSettingsDebounce();
     setCreatingChat(true);
     setHistoryError(null);
     setChatError(null);
     try {
       const created = await api.createPlaygroundChat({
         modelFullId: selectedModel || null,
+        settings: buildCurrentSettings(),
       });
       if (!isMountedRef.current) return;
       setChats((prev) => upsertChatSummary(prev, created));
       setActiveChatId(created.id);
+      activeChatIdRef.current = created.id;
+      setActiveChatInProgress(false);
       setTurns([]);
       setPromptInput('');
       setRenamingChatId(null);
@@ -361,10 +620,14 @@ export const PlaygroundTab: React.FC = () => {
       setChats(remaining);
       setChatToDelete(null);
       if (activeChatId === deletedId) {
+        abortLocalStream();
+        stopBackgroundPolling();
         if (remaining.length > 0) {
           void loadChatDetail(remaining[0].id);
         } else {
           setActiveChatId(null);
+          activeChatIdRef.current = null;
+          setActiveChatInProgress(false);
           setTurns([]);
         }
       }
@@ -384,8 +647,12 @@ export const PlaygroundTab: React.FC = () => {
     try {
       await api.clearPlaygroundChats();
       if (!isMountedRef.current) return;
+      abortLocalStream();
+      stopBackgroundPolling();
       setChats([]);
       setActiveChatId(null);
+      activeChatIdRef.current = null;
+      setActiveChatInProgress(false);
       setTurns([]);
       setClearModalOpen(false);
     } catch (err) {
@@ -404,13 +671,19 @@ export const PlaygroundTab: React.FC = () => {
     setHistoryError(null);
 
     const cleanPrompt = promptInput.trim();
-    if (!cleanPrompt || !selectedModel || sending) return;
+    if (!cleanPrompt || !selectedModel || sending || activeChatInProgress) return;
 
+    clearSettingsDebounce();
     const effectiveMaxTokens = parseClampedMaxTokens(maxTokensInput);
     setMaxTokensInput(String(effectiveMaxTokens));
+    const effectiveReasoning: ReasoningEffort = supportsReasoning ? reasoningEffort : 'none';
+    const currentSettings = buildCurrentSettings({
+      maxTokens: effectiveMaxTokens,
+      reasoningEffort: effectiveReasoning,
+    });
 
     const reqId = ++reqIdRef.current;
-    const userTurn: PlaygroundChatTurn = {
+    const userTurn: DisplayChatTurn = {
       id: `u-${Date.now()}`,
       role: 'user',
       content: cleanPrompt,
@@ -428,94 +701,148 @@ export const PlaygroundTab: React.FC = () => {
       apiMessages.push({ role: 'system', content: systemPrompt.trim() });
     }
     for (const t of nextHistory) {
+      if (t.role === 'assistant' && t.error && !t.content) continue;
       apiMessages.push({ role: t.role, content: t.content });
     }
 
+    let targetChatId = activeChatId;
     try {
-      let targetChatId = activeChatId;
       if (!targetChatId) {
-        try {
-          const created = await api.createPlaygroundChat({ modelFullId: selectedModel });
-          if (isMountedRef.current && reqId === reqIdRef.current) {
-            targetChatId = created.id;
-            setActiveChatId(created.id);
-            setChats((prev) => upsertChatSummary(prev, created));
-          }
-        } catch {
-          // Allow chatting even if history persistence endpoint is temporarily unavailable
-        }
+        const created = await api.createPlaygroundChat({
+          modelFullId: selectedModel,
+          settings: currentSettings,
+        });
+        if (!isMountedRef.current || reqId !== reqIdRef.current) return;
+        targetChatId = created.id;
+        setActiveChatId(created.id);
+        activeChatIdRef.current = created.id;
+        setChats((prev) => upsertChatSummary(prev, { ...created, inProgress: true }));
+      } else {
+        setChats((prev) =>
+          prev.map((c) => (c.id === targetChatId ? { ...c, inProgress: true } : c))
+        );
       }
 
-      const response = await api.sendPlaygroundChat(
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
+
+      // HU-43b: Pass chatId directly; backend persists user turn + assistant/error & auto-title
+      const response = await api.streamPlaygroundChat(
         {
           model: selectedModel,
           messages: apiMessages,
           temperature,
           maxTokens: effectiveMaxTokens,
-          reasoningEffort: supportsReasoning ? reasoningEffort : 'none',
+          reasoningEffort: effectiveReasoning,
+          systemPrompt,
+          chatId: targetChatId,
+          stream: true,
         },
         (partial) => {
           if (isMountedRef.current && reqId === reqIdRef.current) {
             setStreamingContent(partial);
           }
-        }
+        },
+        { signal: controller.signal }
       );
 
-      if (!isMountedRef.current || reqId !== reqIdRef.current) return;
+      if (streamAbortRef.current === controller) {
+        streamAbortRef.current = null;
+      }
+      if (!isMountedRef.current) return;
 
-      const assistantTurn: PlaygroundChatTurn = {
-        id: `a-${Date.now()}`,
-        role: 'assistant',
-        content: response.content || '(Respuesta vacía)',
-        reasoningContent: response.reasoningContent,
-        model: response.model ?? selectedModel,
-        ttftMs: response.ttftMs,
-        tokensPerSec: response.tokensPerSec,
-        usage: response.usage,
-        createdAt: Date.now(),
-      };
-      setTurns((prev) => [...prev, assistantTurn]);
+      if (reqId === reqIdRef.current && activeChatIdRef.current === targetChatId) {
+        const assistantTurn: DisplayChatTurn = {
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          content: response.content || '(Respuesta vacía)',
+          reasoningContent: response.reasoningContent,
+          model: response.model ?? selectedModel,
+          ttftMs: response.ttftMs,
+          tokensPerSec: response.tokensPerSec,
+          usage: response.usage,
+          createdAt: Date.now(),
+        };
+        setTurns((prev) => [...prev, assistantTurn]);
+        setStreamingContent(null);
+        setSending(false);
+        setActiveChatInProgress(false);
 
-      if (targetChatId) {
-        const toPersist: AppendPlaygroundMessageInput[] = [
-          {
-            role: 'user',
-            content: cleanPrompt,
-            modelFullId: selectedModel,
-          },
-          {
-            role: 'assistant',
-            content: assistantTurn.content,
-            reasoningContent: assistantTurn.reasoningContent ?? null,
-            modelFullId: assistantTurn.model ?? selectedModel,
-            metrics: {
-              ttftMs: assistantTurn.ttftMs ?? null,
-              tokensPerSec: assistantTurn.tokensPerSec ?? null,
-              promptTokens: assistantTurn.usage?.promptTokens ?? null,
-              completionTokens: assistantTurn.usage?.completionTokens ?? null,
-              reasoningTokens: assistantTurn.usage?.reasoningTokens ?? null,
-            },
-          },
-        ];
-        try {
-          const persisted = await api.appendPlaygroundMessage(targetChatId, {
-            messages: toPersist,
-          });
-          if (isMountedRef.current && persisted?.chat) {
-            setChats((prev) => upsertChatSummary(prev, persisted.chat));
-          }
-        } catch (persistErr) {
-          if (isMountedRef.current) {
-            setHistoryError(
-              persistErr instanceof ApiError
-                ? `Respuesta recibida, pero no se pudo guardar en historial: ${persistErr.message}`
-                : 'Respuesta recibida, pero no se pudo guardar en el historial cifrado.'
-            );
-          }
+        // Sync authoritative chat summary (auto-title, messageCount, persisted IDs)
+        if (targetChatId) {
+          void api
+            .getPlaygroundChat(targetChatId)
+            .then((detail) => {
+              if (!isMountedRef.current || activeChatIdRef.current !== targetChatId) return;
+              const running = Boolean(detail.inProgress ?? detail.chat.inProgress);
+              setActiveChatInProgress(running);
+              setChats((prev) => upsertChatSummary(prev, { ...detail.chat, inProgress: running }));
+              setTurns(
+                detail.messages
+                  .filter((m) => m.role === 'user' || m.role === 'assistant')
+                  .map(mapStoredMessageToTurn)
+              );
+            })
+            .catch(() => {
+              // Keep optimistic turns if detail refresh fails
+            });
         }
+      } else {
+        // User switched away before completion; refresh sidebar list
+        void api
+          .getPlaygroundChats()
+          .then((list) => {
+            if (isMountedRef.current) {
+              setChats([...list].sort((a, b) => b.updatedAt - a.updatedAt));
+            }
+          })
+          .catch(() => {
+            // ignore
+          });
       }
     } catch (err) {
+      if (isAbortError(err)) {
+        // User switched chats locally; server continues generating in background
+        return;
+      }
       if (!isMountedRef.current || reqId !== reqIdRef.current) return;
+
+      streamAbortRef.current = null;
+      setStreamingContent(null);
+      setSending(false);
+      setActiveChatInProgress(false);
+
+      if (targetChatId) {
+        // Check if backend already persisted the user turn + error message (HU-43b)
+        try {
+          const detail = await api.getPlaygroundChat(targetChatId);
+          if (!isMountedRef.current || activeChatIdRef.current !== targetChatId) return;
+          const running = Boolean(detail.inProgress ?? detail.chat.inProgress);
+          setActiveChatInProgress(running);
+          setChats((prev) => upsertChatSummary(prev, { ...detail.chat, inProgress: running }));
+          const restored = detail.messages
+            .filter((m) => m.role === 'user' || m.role === 'assistant')
+            .map(mapStoredMessageToTurn);
+          if (restored.length > 0) {
+            setTurns(restored);
+            const hasPersistedError = restored.some((t) => Boolean(t.error));
+            if (!hasPersistedError && !running) {
+              setChatError(
+                err instanceof ApiError
+                  ? err.message
+                  : 'Error al completar la petición en el Playground.'
+              );
+            }
+            if (running) {
+              startBackgroundPolling(targetChatId);
+            }
+            return;
+          }
+        } catch {
+          // Fall back to local error display below
+        }
+      }
+
       setTurns((prev) => prev.filter((t) => t.id !== userTurn.id));
       setPromptInput(cleanPrompt);
       setChatError(
@@ -523,11 +850,6 @@ export const PlaygroundTab: React.FC = () => {
           ? err.message
           : 'Error al completar la petición en el Playground.'
       );
-    } finally {
-      if (isMountedRef.current && reqId === reqIdRef.current) {
-        setStreamingContent(null);
-        setSending(false);
-      }
     }
   }
 
@@ -538,8 +860,8 @@ export const PlaygroundTab: React.FC = () => {
           <h1 className="page-title">Playground interactivo</h1>
           <p className="page-subtitle">
             Prueba tus modelos en vivo con failover real, medición instantánea de{' '}
-            <code className="mono">TTFT</code> / <code className="mono">tok/s</code> e historial
-            cifrado privado por cuenta.
+            <code className="mono">TTFT</code> / <code className="mono">tok/s</code>, configuración
+            por chat y persistencia cifrada en segundo plano.
           </p>
         </div>
 
@@ -555,7 +877,7 @@ export const PlaygroundTab: React.FC = () => {
           <button
             type="button"
             className="btn btn-primary btn-sm"
-            disabled={sending || creatingChat}
+            disabled={creatingChat}
             onClick={() => void handleCreateNewChat()}
           >
             {creatingChat ? 'Creando…' : '+ Nuevo chat'}
@@ -564,7 +886,7 @@ export const PlaygroundTab: React.FC = () => {
       </header>
 
       <div className="pg-workspace-layout">
-        {/* HU-43 Encrypted Per-Account Chat History Sidebar */}
+        {/* HU-43 / HU-43b Encrypted Per-Account Chat History Sidebar */}
         <aside
           className={`card pg-history-sidebar${historyOpen ? '' : ' collapsed'}`}
           aria-label="Historial de chats cifrados"
@@ -579,7 +901,6 @@ export const PlaygroundTab: React.FC = () => {
                 type="button"
                 className="btn btn-ghost btn-sm"
                 style={{ fontSize: '0.75rem', padding: '2px 7px', color: 'var(--err)' }}
-                disabled={sending}
                 onClick={() => setClearModalOpen(true)}
                 title="Borrar todo tu historial de conversaciones"
               >
@@ -589,7 +910,11 @@ export const PlaygroundTab: React.FC = () => {
           </div>
 
           {historyError ? (
-            <div className="alert alert-error" role="alert" style={{ padding: '8px 10px', fontSize: '0.78rem' }}>
+            <div
+              className="alert alert-error"
+              role="alert"
+              style={{ padding: '8px 10px', fontSize: '0.78rem' }}
+            >
               <span>{historyError}</span>
             </div>
           ) : null}
@@ -611,6 +936,9 @@ export const PlaygroundTab: React.FC = () => {
                 const isActive = chat.id === activeChatId;
                 const isRenaming = renamingChatId === chat.id;
                 const isLoadingThis = loadingChatId === chat.id;
+                const isChatGenerating = Boolean(
+                  chat.inProgress || (isActive && (sending || activeChatInProgress))
+                );
 
                 return (
                   <div
@@ -619,12 +947,12 @@ export const PlaygroundTab: React.FC = () => {
                     role="button"
                     tabIndex={0}
                     onClick={() => {
-                      if (!isRenaming && !sending) {
+                      if (!isRenaming) {
                         void loadChatDetail(chat.id);
                       }
                     }}
                     onKeyDown={(e) => {
-                      if (!isRenaming && !sending && (e.key === 'Enter' || e.key === ' ')) {
+                      if (!isRenaming && (e.key === 'Enter' || e.key === ' ')) {
                         e.preventDefault();
                         void loadChatDetail(chat.id);
                       }
@@ -685,12 +1013,22 @@ export const PlaygroundTab: React.FC = () => {
                               className="pg-chat-icon-btn"
                               aria-label={`Renombrar ${chat.title}`}
                               title="Renombrar conversación"
-                              disabled={sending}
                               onClick={(e) => startRename(chat, e)}
                             >
-                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                              <svg
+                                width="13"
+                                height="13"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                aria-hidden="true"
+                              >
                                 <path d="M12 20h9" strokeLinecap="round" />
-                                <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" strokeLinejoin="round" />
+                                <path
+                                  d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"
+                                  strokeLinejoin="round"
+                                />
                               </svg>
                             </button>
                             <button
@@ -698,11 +1036,22 @@ export const PlaygroundTab: React.FC = () => {
                               className="pg-chat-icon-btn danger"
                               aria-label={`Eliminar ${chat.title}`}
                               title="Eliminar conversación"
-                              disabled={sending}
                               onClick={() => setChatToDelete(chat)}
                             >
-                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                                <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" strokeLinecap="round" strokeLinejoin="round" />
+                              <svg
+                                width="13"
+                                height="13"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                aria-hidden="true"
+                              >
+                                <path
+                                  d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
                               </svg>
                             </button>
                           </div>
@@ -711,10 +1060,20 @@ export const PlaygroundTab: React.FC = () => {
                           <span className="mono pg-chat-model" title={chat.modelFullId ?? undefined}>
                             {chat.modelFullId ? chat.modelFullId.split('/').pop() : 'Sin modelo'}
                           </span>
-                          <span>
-                            {chat.messageCount} msg
-                            {chat.updatedAt ? ` · ${formatRelativeTime(chat.updatedAt)}` : ''}
-                          </span>
+                          {isChatGenerating ? (
+                            <span
+                              className="pg-inprogress-pill"
+                              title="Generando respuesta en segundo plano"
+                            >
+                              <span className="pg-pulse-dot" aria-hidden="true" />
+                              Generando…
+                            </span>
+                          ) : (
+                            <span>
+                              {chat.messageCount} msg
+                              {chat.updatedAt ? ` · ${formatRelativeTime(chat.updatedAt)}` : ''}
+                            </span>
+                          )}
                         </div>
                       </>
                     )}
@@ -724,18 +1083,29 @@ export const PlaygroundTab: React.FC = () => {
             )}
           </div>
 
-          {/* Privacy & Encryption Notice (HU-43) */}
+          {/* Privacy & Encryption Notice (HU-43 / HU-43b) */}
           <div className="pg-privacy-box" role="note" aria-label="Privacidad y cifrado del historial">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, color: 'var(--fg)' }}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--ok)" strokeWidth="2.1" aria-hidden="true">
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, color: 'var(--fg)' }}
+            >
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="var(--ok)"
+                strokeWidth="2.1"
+                aria-hidden="true"
+              >
                 <rect x="5" y="11" width="14" height="10" rx="2" />
                 <path d="M8 11V7a4 4 0 0 1 8 0v4" strokeLinecap="round" />
               </svg>
               <span>Historial cifrado (AES-256-GCM)</span>
             </div>
             <p style={{ margin: 0, fontSize: '0.73rem', color: 'var(--sub)', lineHeight: 1.45 }}>
-              Estrictamente privado por cuenta: ningún otro usuario ni administrador puede leer tus
-              chats y quedan excluidos de los backups <code className="mono">.bifrost.enc</code>.
+              Estrictamente privado por cuenta: tus chats y ajustes quedan cifrados en reposo,
+              inaccesibles incluso para administradores y excluidos de backups{' '}
+              <code className="mono">.bifrost.enc</code>.
             </p>
           </div>
         </aside>
@@ -759,23 +1129,8 @@ export const PlaygroundTab: React.FC = () => {
                     className="input"
                     style={{ padding: '6px 32px 6px 10px', fontSize: '0.83rem' }}
                     value={selectedModel}
-                    onChange={(e) => {
-                      const nextModel = e.target.value;
-                      setSelectedModel(nextModel);
-                      if (activeChatId) {
-                        void api
-                          .updatePlaygroundChat(activeChatId, { modelFullId: nextModel })
-                          .then((updated) => {
-                            if (isMountedRef.current) {
-                              setChats((prev) => upsertChatSummary(prev, updated));
-                            }
-                          })
-                          .catch(() => {
-                            // non-blocking metadata sync
-                          });
-                      }
-                    }}
-                    disabled={sending}
+                    onChange={(e) => handleModelChange(e.target.value)}
+                    disabled={sending || activeChatInProgress}
                   >
                     {models.map((m) => (
                       <option key={m.fullId} value={m.fullId}>
@@ -804,10 +1159,7 @@ export const PlaygroundTab: React.FC = () => {
             {paramsOpen ? (
               <div className="pg-params-drawer">
                 <div className="pg-params-grid">
-                  <div
-                    className="field"
-                    style={!supportsReasoning ? { opacity: 0.56 } : undefined}
-                  >
+                  <div className="field" style={!supportsReasoning ? { opacity: 0.56 } : undefined}>
                     <label htmlFor="pg-reasoning-select" className="field-label">
                       Esfuerzo de razonamiento
                       <InfoTip
@@ -823,8 +1175,8 @@ export const PlaygroundTab: React.FC = () => {
                       className="input"
                       style={!supportsReasoning ? { cursor: 'not-allowed' } : undefined}
                       value={supportsReasoning ? reasoningEffort : 'none'}
-                      disabled={sending || !supportsReasoning}
-                      onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+                      disabled={sending || activeChatInProgress || !supportsReasoning}
+                      onChange={(e) => handleReasoningChange(e.target.value as ReasoningEffort)}
                     >
                       {!supportsReasoning ? (
                         <option value="none">No soportado por este modelo</option>
@@ -857,8 +1209,8 @@ export const PlaygroundTab: React.FC = () => {
                       max={2}
                       step={0.1}
                       value={temperature}
-                      disabled={sending}
-                      onChange={(e) => setTemperature(Number(e.target.value))}
+                      disabled={sending || activeChatInProgress}
+                      onChange={(e) => handleTemperatureChange(Number(e.target.value))}
                       style={{ accentColor: 'var(--accent)', cursor: 'pointer', marginTop: 6 }}
                     />
                   </div>
@@ -875,9 +1227,9 @@ export const PlaygroundTab: React.FC = () => {
                       step={64}
                       className="input mono"
                       value={maxTokensInput}
-                      disabled={sending}
-                      onChange={(e) => setMaxTokensInput(e.target.value)}
-                      onBlur={() => setMaxTokensInput(String(parseClampedMaxTokens(maxTokensInput)))}
+                      disabled={sending || activeChatInProgress}
+                      onChange={(e) => handleMaxTokensChange(e.target.value)}
+                      onBlur={handleMaxTokensBlur}
                     />
                   </div>
                 </div>
@@ -892,8 +1244,8 @@ export const PlaygroundTab: React.FC = () => {
                     className="input"
                     style={{ resize: 'vertical' }}
                     value={systemPrompt}
-                    disabled={sending}
-                    onChange={(e) => setSystemPrompt(e.target.value)}
+                    disabled={sending || activeChatInProgress}
+                    onChange={(e) => handleSystemPromptChange(e.target.value)}
                   />
                 </div>
               </div>
@@ -915,9 +1267,16 @@ export const PlaygroundTab: React.FC = () => {
               >
                 {activeChat.title}
               </span>
-              <span className="field-hint" style={{ fontSize: '0.75rem', flexShrink: 0 }}>
-                Guardado cifrado automáticamente
-              </span>
+              {activeChatInProgress || sending ? (
+                <span className="pg-inprogress-pill" role="status" aria-live="polite">
+                  <span className="pg-pulse-dot" aria-hidden="true" />
+                  Generando en segundo plano…
+                </span>
+              ) : (
+                <span className="field-hint" style={{ fontSize: '0.75rem', flexShrink: 0 }}>
+                  Guardado cifrado automáticamente
+                </span>
+              )}
             </div>
           ) : null}
 
@@ -927,20 +1286,23 @@ export const PlaygroundTab: React.FC = () => {
                 <div className="spinner" aria-hidden="true" />
                 <p className="field-hint">Descifrando conversación…</p>
               </div>
-            ) : turns.length === 0 && streamingContent === null ? (
+            ) : turns.length === 0 && streamingContent === null && !activeChatInProgress ? (
               <div className="empty-state" style={{ margin: 'auto 0' }}>
                 <h3 style={{ fontSize: '1.06rem' }}>Listo para conversar</h3>
                 <p className="field-hint" style={{ maxWidth: 440 }}>
                   Envía un mensaje abajo para medir en tiempo real el{' '}
                   <code className="mono">TTFT (ms)</code>, los{' '}
-                  <code className="mono">tokens/s</code> y guardar la conversación cifrada en tu
-                  historial privado.
+                  <code className="mono">tokens/s</code> y guardar la conversación cifrada junto con
+                  sus parámetros.
                 </p>
               </div>
             ) : (
               <>
                 {turns.map((turn) => (
-                  <div key={turn.id} className={`chat-bubble ${turn.role}`}>
+                  <div
+                    key={turn.id}
+                    className={`chat-bubble ${turn.role}${turn.error ? ' has-error' : ''}`}
+                  >
                     {turn.reasoningContent ? (
                       <details
                         style={{
@@ -961,15 +1323,26 @@ export const PlaygroundTab: React.FC = () => {
                       </details>
                     ) : null}
 
-                    {turn.role === 'assistant' ? (
-                      <SimpleMarkdown text={turn.content} />
-                    ) : (
-                      <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                        {turn.content}
+                    {turn.error ? (
+                      <div className="pg-turn-error" role="alert">
+                        <strong style={{ fontSize: '0.8rem' }}>
+                          Error al generar respuesta:
+                        </strong>
+                        <span>{turn.error}</span>
                       </div>
-                    )}
+                    ) : null}
 
-                    {turn.role === 'assistant' ? (
+                    {turn.content ? (
+                      turn.role === 'assistant' ? (
+                        <SimpleMarkdown text={turn.content} />
+                      ) : (
+                        <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                          {turn.content}
+                        </div>
+                      )
+                    ) : null}
+
+                    {turn.role === 'assistant' && !turn.error ? (
                       <div className="chat-telemetry-bar">
                         {turn.model ? <span>{turn.model}</span> : null}
                         {turn.ttftMs !== null && turn.ttftMs !== undefined ? (
@@ -1002,6 +1375,20 @@ export const PlaygroundTab: React.FC = () => {
                       {streamingContent || 'Generando respuesta…'}
                     </div>
                   </div>
+                ) : activeChatInProgress ? (
+                  <div className="chat-bubble assistant" role="status" aria-live="polite">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <div
+                        className="spinner"
+                        style={{ width: 16, height: 16, borderWidth: 2, flexShrink: 0 }}
+                        aria-hidden="true"
+                      />
+                      <span style={{ fontSize: '0.85rem', color: 'var(--sub)' }}>
+                        Generando en segundo plano… Puedes cambiar de conversación y la respuesta se
+                        guardará automáticamente al terminar.
+                      </span>
+                    </div>
+                  </div>
                 ) : null}
               </>
             )}
@@ -1021,10 +1408,12 @@ export const PlaygroundTab: React.FC = () => {
               placeholder={
                 models.length === 0
                   ? 'Instala y detecta al menos un modelo para enviar mensajes…'
-                  : 'Escribe tu prompt aquí (Ctrl+Enter o botón Enviar)…'
+                  : activeChatInProgress
+                    ? 'Esperando a que termine la respuesta en segundo plano…'
+                    : 'Escribe tu prompt aquí (Ctrl+Enter o botón Enviar)…'
               }
               value={promptInput}
-              disabled={sending || models.length === 0}
+              disabled={sending || activeChatInProgress || models.length === 0}
               onChange={(e) => setPromptInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
@@ -1035,9 +1424,11 @@ export const PlaygroundTab: React.FC = () => {
             <button
               type="submit"
               className="btn btn-primary"
-              disabled={sending || models.length === 0 || !promptInput.trim()}
+              disabled={
+                sending || activeChatInProgress || models.length === 0 || !promptInput.trim()
+              }
             >
-              {sending ? 'Generando…' : 'Enviar'}
+              {sending || activeChatInProgress ? 'Generando…' : 'Enviar'}
             </button>
           </form>
         </section>
