@@ -1,7 +1,7 @@
 # Guía de Handoff UI — Bifrost V2
 
 Documento técnico para implementar los cambios de interfaz de la V2 en el panel (`panel/src/`).  
-Refleja las historias `HU-27` a `HU-43` descritas en [`HISTORIAS-V2.md`](HISTORIAS-V2.md).
+Refleja las historias `HU-27` a `HU-44` descritas en [`HISTORIAS-V2.md`](HISTORIAS-V2.md).
 
 ---
 
@@ -101,11 +101,13 @@ Refleja las historias `HU-27` a `HU-43` descritas en [`HISTORIAS-V2.md`](HISTORI
 
 ---
 
-### 2.4 `UsersTab.tsx` (`HU-31`, `HU-33`, `HU-35`)
+### 2.4 `UsersTab.tsx` (`HU-31`, `HU-33`, `HU-35`, `HU-44`)
 
 **Propiedades ya disponibles en `types.ts`:**
 - `ManagedUserItem.enforceStrictQuota?: boolean`
 - `InvitationItem.enforceStrictQuota?: boolean`
+- `InvitationItem.usedByUserId?: string | null` *(HU-44 — ID de la cuenta que canjeó la invitación, `null` si sigue pendiente o si la cuenta fue eliminada)*
+- `InvitationItem.usedByUsername?: string | null` *(HU-44 — nombre de usuario que canjeó la invitación; se conserva incluso si la cuenta se elimina después)*
 - `CreateInvitationInput.enforceStrictQuota?: boolean`
 - `ManagedUserItem.allowedModels: string[]` / `InvitationItem.allowedModels: string[]`
 
@@ -119,6 +121,7 @@ Refleja las historias `HU-27` a `HU-43` descritas en [`HISTORIAS-V2.md`](HISTORI
 - **Eliminar invitaciones:** botón de borrado/revocación en cada invitación pendiente (`usedAt === null`) que llame a `api.deleteInvitation(inv.id)` y actualice la lista.
 - **Buscador de modelos:** dentro de los modales **Nueva invitación** y **Editar usuario**, añadir un input de búsqueda local sobre la lista de modelos cuando no esté activo el comodín `*`, filtrando por `fullId`, `name` o `providerId` sin perder las selecciones previas.
 - **Interruptor de cuota estricta:** añadir switch/checkbox **Cuota estricta** (`enforceStrictQuota`, `true` por defecto al crear invitación) tanto en **Nueva invitación** como en **Editar usuario**, y mostrar un badge/indicador en la tabla.
+- **Historial de invitaciones (`HU-44`):** cuando `inv.usedAt !== null` y `inv.usedByUsername` esté presente, mostrar **`@{inv.usedByUsername}`** en la tabla de historial de invitaciones para identificar qué cuenta canjeó cada enlace.
 
 ---
 
@@ -388,11 +391,30 @@ export interface MarketplaceUpdateResult {
 
 ---
 
-### 2.11 `PlaygroundTab.tsx` — Historial de chats cifrado y estrictamente privado por cuenta (`HU-43`)
+### 2.11 `PlaygroundTab.tsx` — Historial de chats cifrado, persistencia resiliente y configuración por conversación (`HU-43`, `HU-43b`)
 
-**Contrato TypeScript en `panel/src/types.ts` (añadido por Backend):**
+**Contrato TypeScript exacto en `panel/src/types.ts` (añadido por Backend):**
 ```ts
+export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high';
 export type PlaygroundMessageRole = 'user' | 'assistant' | 'system';
+
+export interface PlaygroundChatRequest {
+  model: string;
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+  temperature?: number;
+  maxTokens?: number;
+  reasoningEffort?: ReasoningEffort;
+  systemPrompt?: string;
+  chatId?: string;
+  stream?: boolean;
+}
+
+export interface PlaygroundChatSettings {
+  reasoningEffort?: ReasoningEffort;
+  temperature?: number | null;
+  maxTokens?: number | null;
+  systemPrompt?: string | null;
+}
 
 export interface PlaygroundMessageMetrics {
   ttftMs?: number | null;
@@ -400,12 +422,15 @@ export interface PlaygroundMessageMetrics {
   promptTokens?: number | null;
   completionTokens?: number | null;
   reasoningTokens?: number | null;
+  error?: string | null;
 }
 
 export interface PlaygroundChatSummary {
   id: string;
   title: string;
   modelFullId: string | null;
+  settings?: PlaygroundChatSettings | null;
+  inProgress?: boolean;
   messageCount: number;
   createdAt: number;
   updatedAt: number;
@@ -424,6 +449,8 @@ export interface PlaygroundChatMessage {
 
 export interface PlaygroundChatDetail {
   chat: PlaygroundChatSummary;
+  settings?: PlaygroundChatSettings | null;
+  inProgress?: boolean;
   messages: PlaygroundChatMessage[];
 }
 
@@ -442,35 +469,39 @@ export interface AppendPlaygroundMessagesResult {
 }
 ```
 
-**Métodos en `api` (`panel/src/api.ts`):**
+**Métodos exactos en `api` (`panel/src/api.ts`):**
+- `api.streamPlaygroundChat(input: PlaygroundChatRequest, onDelta?: (partialText: string) => void, options?: { signal?: AbortSignal }): Promise<PlaygroundChatResponse>`  
+  Llama a `POST /api/playground/chat` con `stream: true` y reenvía `chatId`, `systemPrompt`, `reasoningEffort`, `temperature`, `maxTokens` y `signal`. Cuando se pasa `chatId`, el servidor guarda el mensaje del usuario **antes** de contactar al upstream, cifra `settings` por usuario y continúa leyendo/persistiendo la respuesta (o el error en `metrics.error`) en segundo plano aunque el cliente aborte o recargue la pestaña.
+- `api.sendPlaygroundChat(input: PlaygroundChatRequest, onDelta?: (partialText: string) => void, options?: { signal?: AbortSignal }): Promise<PlaygroundChatResponse>`  
+  Mismo contrato (soporta tanto streaming como `stream: false` con persistencia automática cuando se envía `chatId`).
 - `api.getPlaygroundChats(): Promise<PlaygroundChatSummary[]>`  
-  Llama a `GET /api/playground/chats` (lista los chats propios del usuario autenticado ordenados por `updatedAt DESC`).
-- `api.createPlaygroundChat(input?: { title?: string; modelFullId?: string | null }): Promise<PlaygroundChatSummary>`  
-  Llama a `POST /api/playground/chats` (crea un chat nuevo; si se omite `title`, el backend asigna `"Nuevo chat"`).
+  Llama a `GET /api/playground/chats` (lista los chats propios ordenados por `updatedAt DESC`, incluyendo `settings` e `inProgress`).
+- `api.createPlaygroundChat(input?: { title?: string; modelFullId?: string | null; settings?: PlaygroundChatSettings | null }): Promise<PlaygroundChatSummary>`  
+  Llama a `POST /api/playground/chats` (crea un chat nuevo con título por defecto `"Nuevo chat"` y `settings` cifrados opcionales).
 - `api.getPlaygroundChat(chatId: string): Promise<PlaygroundChatDetail>`  
-  Llama a `GET /api/playground/chats/:id` (devuelve `{ chat, messages }` solo si pertenece a la cuenta autenticada; `404` en caso contrario).
-- `api.updatePlaygroundChat(chatId: string, input: { title?: string; modelFullId?: string | null }): Promise<PlaygroundChatSummary>`  
-  Llama a `PATCH /api/playground/chats/:id` (renombra el título y/o actualiza `modelFullId`).
+  Llama a `GET /api/playground/chats/:id` (devuelve `{ chat, settings, inProgress, messages }` solo si pertenece a la cuenta autenticada; `404` en caso contrario).
+- `api.updatePlaygroundChat(chatId: string, input: { title?: string; modelFullId?: string | null; settings?: PlaygroundChatSettings | null }): Promise<PlaygroundChatSummary>`  
+  Llama a `PATCH /api/playground/chats/:id` (renombra `title`, actualiza `modelFullId` y/o actualiza `settings` cifrados en reposo).
 - `api.appendPlaygroundMessage(chatId: string, input: AppendPlaygroundMessageInput | { messages: AppendPlaygroundMessageInput[] }): Promise<AppendPlaygroundMessagesResult>`  
-  Llama a `POST /api/playground/chats/:id/messages` (persiste uno o varios mensajes; si el título era `"Nuevo chat"`, el backend autogenera un título corto desde el primer mensaje `user` y devuelve el `chat` actualizado).
+  Llama a `POST /api/playground/chats/:id/messages` (útil solo si se requiere guardado manual; **no debe llamarse** para duplicar mensajes cuando ya se pasó `chatId` en `streamPlaygroundChat` / `sendPlaygroundChat`).
 - `api.deletePlaygroundChat(chatId: string): Promise<{ ok: boolean }>`  
-  Llama a `DELETE /api/playground/chats/:id` (elimina el chat y todos sus mensajes).
+  Llama a `DELETE /api/playground/chats/:id`.
 - `api.clearPlaygroundChats(): Promise<{ ok: boolean; deletedCount: number }>`  
-  Llama a `DELETE /api/playground/chats` (elimina todo el historial propio del usuario autenticado).
+  Llama a `DELETE /api/playground/chats`.
 
 **Requisitos UI (`PlaygroundTab.tsx`):**
-1. **Barra lateral de conversaciones:**
-   - Mostrar una barra lateral colapsable/responsiva con la lista de chats propios (`api.getPlaygroundChats()`), indicando título, último modelo (`modelFullId`), número de mensajes (`messageCount`) y fecha relativa (`updatedAt`).
-   - Botón destacado **«Nuevo chat»** (`api.createPlaygroundChat({ modelFullId })`) que abre una conversación limpia y la selecciona como activa.
-2. **Acciones por chat y limpieza global:**
-   - Permitir **renombrar** un chat inline o mediante diálogo (`api.updatePlaygroundChat(chat.id, { title })`).
-   - Permitir **eliminar** un chat individual (`api.deletePlaygroundChat(chat.id)`) con confirmación clara.
-   - Incluir botón **«Limpiar historial»** (`api.clearPlaygroundChats()`) con confirmación explícita para borrar todas las conversaciones propias.
-3. **Persistencia transparente al chatear:**
-   - Al seleccionar un chat en la barra lateral, cargar su historial con `api.getPlaygroundChat(chatId)` y restaurar los turnos (`messages`, incluyendo `reasoningContent` y `metrics`) y el `modelFullId` si está disponible en la lista de modelos activos.
-   - Al enviar un prompt y recibir la respuesta en el Playground, crear el chat si aún no existe y guardar el turno (`user` + `assistant`, incluyendo `reasoningContent`, `modelFullId` y `metrics`) con `api.appendPlaygroundMessage(...)`, actualizando en la barra lateral el título autogenerado y `updatedAt`.
-4. **Aviso de cifrado privado por cuenta:**
-   - Mostrar un aviso/distintivo discreto pero claro en la barra lateral o cabecera del historial indicando que las conversaciones están **cifradas en reposo por cuenta (AES-256-GCM)**, son **estrictamente privadas** (ningún otro usuario ni administrador puede leerlas) y **no se incluyen en los backups `.bifrost.enc`**.
+1. **Barra lateral de conversaciones (`HU-43`):**
+   - Lista de chats propios (`api.getPlaygroundChats()`), botón **«Nuevo chat»**, renombrar, eliminar chat individual, **«Limpiar historial»** con confirmación, y aviso visible de cifrado privado por cuenta (**AES-256-GCM**, inaccesible incluso para administradores, excluido de backups `.bifrost.enc`).
+2. **Persistencia resiliente sin duplicados (`HU-43b`):**
+   - Al enviar un prompt: si aún no existe un chat activo, crearlo primero con `api.createPlaygroundChat({ modelFullId, settings })` y pasar su `chatId` en `api.streamPlaygroundChat({ ..., chatId })`.
+   - **NO duplicar** llamadas a `api.appendPlaygroundMessage(...)` desde frontend cuando ya se pasó `chatId` a `streamPlaygroundChat` / `sendPlaygroundChat`, porque el backend ya guarda el turno `user` antes de llamar al upstream y persiste automáticamente la respuesta del asistente (o el error seguro con `metrics.error`) al finalizar.
+   - Si un mensaje recuperado del servidor tiene `msg.metrics?.error`, renderizarlo visualmente como estado de error del turno en la conversación (conservando el prompt del usuario para que nunca se pierda al recargar o cambiar de chat).
+3. **Configuración cifrada por conversación (`HU-43b`):**
+   - Al seleccionar un chat en la barra lateral (`api.getPlaygroundChat(chatId)`), restaurar `chat.modelFullId` (si está activo) y `settings` (`reasoningEffort`, `temperature`, `maxTokens`, `systemPrompt`) en los controles del Playground.
+   - Cuando el usuario modifique `modelFullId` o cualquiera de los controles de `settings` sobre un chat existente, persistir el cambio con `api.updatePlaygroundChat(chatId, { modelFullId, settings })` (con debounce razonable para `systemPrompt` / inputs numéricos).
+4. **Indicador de generación en segundo plano (`inProgress === true`):**
+   - Mostrar un indicador/badge discreto en la barra lateral y en la cabecera/pie del chat activo (*«Generando en segundo plano…»*) cuando `chat.inProgress === true` o `detail.inProgress === true`.
+   - Si el usuario abre o vuelve a un chat con `inProgress === true`, activar un polling suave (p. ej. cada `2s`–`3s` a `api.getPlaygroundChat(chatId)`) que se detenga automáticamente en cuanto `inProgress === false` o al cambiar de chat/desmontar el componente, actualizando la conversación con la respuesta completa o error persistido.
 
 ---
 
@@ -479,42 +510,30 @@ export interface AppendPlaygroundMessagesResult {
 - [x] **`ProviderVaultCard.tsx`**: switch **Activar / Desactivar** (`status === 'disabled'`), badge `no_node`, botón **Probar clave** (`ProviderKeyTestResult`) y badge/tooltip de advertencia de privacidad (`HU-40`).
 - [x] **`NodesTab.tsx`**: botón **Probar nodo** (`ExitNodeTestResult`) con estado de carga/latencia, botón **Actualizar nodo** (`api.updateNode`) con manejo de `updateAvailable === true | false | null` y feedback de carga/reinicio (`HU-41`), y advertencia de claves afectadas al eliminar nodo.
 - [x] **`ModelsTab.tsx`**: interruptor de visibilidad admin (`api.setModelVisibility`), soporte y filtro para modelos deshabilitados y no-texto (`embeddings`), badge `hasCatalogInfo`, saneamiento de `formatReleaseDate` (`>= 2018` o `'No reportada'`) e indicador `providerPrivacy` (`HU-40`).
-- [x] **`UsersTab.tsx`**: botón **Eliminar** en invitaciones pendientes (`api.deleteInvitation`), buscador de modelos en modales sin perder selección e interruptor/badge `enforceStrictQuota` *(ver ajustes menores pendientes en Sección 4)*.
+- [x] **`UsersTab.tsx`**: botón **Eliminar** en invitaciones pendientes (`api.deleteInvitation`), buscador de modelos en modales, interruptor/badge `enforceStrictQuota` (`Estricta`/`Flexible`), estado `Expirada`, y consumo diario/histórico (`usedTokensToday / dailyTokenLimit`, `usedTokens`, `requestsCount`) — resueltos en PR #53 y PR #56. *(Pendiente `HU-44` en Sección 4)*.
 - [x] **`ApiKeysTab.tsx`**: selector de expiración (`expiresInDays`), columna/badge de expiración y estado **Expirada**, y métricas compactas por clave (`usedTokens` / `requestsCount`).
-- [x] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`), `requestsCount` en tooltip de actividad y opción **Por API key** en `ActivityGroupBy`.
-- [x] **`MarketplaceTab.tsx` / `ProvidersTab.tsx` (`HU-38`, `HU-40`)**: badges ZDR/retención (`zero`, `transient`, `retained`, `variable`), enlace a `policyUrl`, nota contextual para agregadores (`variable` como OpenRouter), detalle de `training` y badge de clasificación de límites (`rateLimitKind` / `rateLimitWindows`, incluyendo `concurrency`).
-- [ ] **`MarketplaceTab.tsx` / `ProvidersTab.tsx` / `ProviderVaultCard.tsx` (`HU-42`)**: gestor de repositorios multi-fuente opt-in (`api.getMarketplaceSources` / `addMarketplaceSource` / `updateMarketplaceSource` / `deleteMarketplaceSource`), badges de versión (`catalogVersion`, `manifestVersion`, `manifestHash`) y origen (`sourceName`, `isOfficial`, `sourceId`), botón **«Comprobar actualizaciones»** (`api.getMarketplace(true)`) y botones **«Actualizar» / «Actualizar todos»** (`api.updateInstalledMarketplaceProviders`).
-- [ ] **`PlaygroundTab.tsx` (`HU-43`)**: barra lateral de historial de chats cifrados por cuenta (`api.getPlaygroundChats` / `createPlaygroundChat` / `getPlaygroundChat` / `updatePlaygroundChat` / `appendPlaygroundMessage` / `deletePlaygroundChat` / `clearPlaygroundChats`), crear/renombrar/borrar/limpiar historial y aviso de cifrado privado por cuenta.
-- [x] **`OverviewTab.tsx` (Cuota gratuita, `HU-39`)**: mostrar ventana activa (`hora` / `día` / `semana`), indicador de confianza (`Exacto por cabecera`, `Configurado`, `Inferido por 429`), `effectiveLimit`, estado `adaptiveAdjusted` y detalle por proveedor (`providerQuotas` / `FreeQuotaStatus.providers`). *(Pendiente replicar resumen en `MetricsTab.tsx` y mostrar `usableKeysCount`, ver Sección 4)*.
-- [x] **`OverviewTab.tsx` / Topbar (`HU-41`)**: implementado y completado en PR #48, PR #51 y PR #52 (botón **«Comprobar ahora»** siempre accesible, versión visible en sidebar y progreso real por fases con auto-recarga).
+- [x] **`MetricsTab.tsx`**: separación visual y formato `es-ES` con `tabular-nums` en tabla/chips de percentiles (`P50`–`P99`, `tok/s` y `ms`), `requestsCount` en tooltip de actividad, opción **Por API key** en `ActivityGroupBy` y bloque de cuota adaptativa por proveedor (`HU-39`).
+- [x] **`MarketplaceTab.tsx` / `ProvidersTab.tsx` / `ProviderVaultCard.tsx` (`HU-38`, `HU-40`, `HU-42`)**: badges ZDR/retención, límites (`rateLimitKind`/`rateLimitWindows`), gestor multi-fuente opt-in, badges de versión/origen, **«Comprobar actualizaciones»** y **«Actualizar» / «Actualizar todos»** en sitio (PR #53).
+- [x] **`PlaygroundTab.tsx` (`HU-43`)**: barra lateral de historial de chats cifrados por cuenta, crear/renombrar/borrar/limpiar historial y aviso de cifrado privado (PR #56). *(Pendiente `HU-43b` en Sección 4)*.
+- [x] **`OverviewTab.tsx` (`HU-39`, `HU-41`)**: cuota gratuita adaptativa con `usableKeysCount`, progreso real del autoupdater compatible con `202 Accepted` y auto-recarga resiliente (PR #51, PR #52, PR #53, PR #56).
+- [ ] **`UsersTab.tsx` (`HU-44`)**: mostrar `@usedByUsername` en la tabla de **Historial de invitaciones** para invitaciones canjeadas.
+- [ ] **`PlaygroundTab.tsx` (`HU-43b`)**: pasar `chatId` en `api.streamPlaygroundChat`, eliminar guardado duplicado en frontend, restaurar/persistir `modelFullId` + `settings` cifrados por chat y mostrar indicador *«Generando en segundo plano…»* + polling suave si `inProgress === true`.
 
 ---
 
-## 4. Pendientes UI acumulados (Ronda 3 — para próxima PR de diseño)
+## 4. Pendientes UI acumulados (Ronda 4 — `HU-43b` y `HU-44`)
 
-Lista viva de ajustes, añadidos y correcciones que debe implementar la IA de diseño en la siguiente PR (sin tocar `panel/src/api.ts`, `panel/src/types.ts`, `core/`, `nodes/` ni `tests/`):
+Lista viva de añadidos que debe implementar la IA de diseño en la siguiente PR (sin tocar `panel/src/api.ts`, `panel/src/types.ts`, `core/`, `nodes/` ni `tests/`):
 
-> **Resueltos en PR #50, PR #51 y PR #52:** progreso en tiempo real y auto-recarga del autoupdater + versión visible en sidebar (`App.tsx` / `OverviewTab.tsx`), botón «Comprobar ahora» siempre accesible (`OverviewTab.tsx`), manejo de `node.updateAvailable === null` (`NodesTab.tsx`), `requestsCount` en actividad (`MetricsTab.tsx`), `usedTokens` y `requestsCount` en `ApiKeysTab.tsx`, desglose `providerQuotas` en `OverviewTab.tsx`, formato `es-ES` con `tabular-nums` en percentiles de `MetricsTab.tsx`, filtrado de `disabledByAdmin` en `PlaygroundTab.tsx` y selector de `reasoning_effort` con opción `'none'` (`Desactivado / Estándar`).
+> **Resueltos en PR #53 y PR #56:** Marketplace multi-repo y actualizaciones en sitio (`HU-42`), `UsersTab.tsx` (`inviteEnforceStrict=true`, badge `Flexible`, estado `Expirada`, consumo diario `usedTokensToday / dailyTokenLimit` e histórico `usedTokens` + `requestsCount`), `usableKeysCount` en `OverviewTab.tsx` y bloque adaptativo en `MetricsTab.tsx` (`HU-39`), `CompareTab.tsx` (`disabledByAdmin` + formato `es-ES`), historial de chats del Playground (`HU-43`), autoupdater resiliente compatible con `202 Accepted` y auditoría QA de 44 hallazgos.
 
-1. **`UsersTab.tsx` (`HU-31`, `HU-35`, `HU-37`)** — *Corregir + Añadir*:
-   - Cambiar el estado inicial de `inviteEnforceStrict` de `false` a **`true`** (activado por defecto al crear invitaciones).
-   - Mostrar etiqueta visual **«Flexible»** cuando `enforceStrictQuota === false` en las tablas de usuarios e invitaciones (actualmente solo muestra «Estricta» si es `true`).
-   - *(Menor, `HU-31`)*: En invitaciones no usadas pero ya expiradas (`!inv.usedAt && inv.expiresAt <= now`), mostrar **«Expirada»** en vez de «Pendiente».
-   - **Consumo diario e histórico en tabla de usuarios:** mostrar en la tabla de usuarios `usedTokensToday / dailyTokenLimit` (consumo diario frente al límite configurado, o `Sin límite` si `dailyTokenLimit === null`) y `usedTokens` + `requestsCount` (consumo histórico acumulado de toda la vida), campos que ya devuelve `GET /api/users` y están tipados en `ManagedUserItem` (usar `tabular-nums` / `.mono`).
-2. **`OverviewTab.tsx` y `MetricsTab.tsx` (`HU-39`)** — *Completar*:
-   - En `OverviewTab.tsx`: mostrar también **`usableKeysCount`** (claves `active` + `rate_limited`) dentro de cada tarjeta del desglose `providerQuotasList`.
-   - En `MetricsTab.tsx`: añadir el bloque/indicador de ventana activa (`windowLabel` o `hora`/`día`/`semana`), confianza (`Exacto por cabecera` / `Configurado` / `Inferido por 429`) y el desglose por proveedor (`freeQuota.providers`) con `unit`, `windowLabel`, `usableKeysCount` y `confidence`.
-3. **`CompareTab.tsx` (`HU-30` y `HU-34`)** — *Corregir*:
-   - Filtrar modelos con `disabledByAdmin === true` en `CompareTab.tsx` igual que en `PlaygroundTab.tsx` (`m.active !== false && !m.disabledByAdmin`).
-   - Formatear el valor de velocidad `P50` (`tokensPerSec.p50`) y `TTFT P50` en `CompareTab.tsx` con `toLocaleString('es-ES', { minimumFractionDigits: 1, maximumFractionDigits: 1 })` (en lugar de `.toFixed(1)` crudo).
-4. **`ProvidersTab.tsx` / `MarketplaceTab.tsx` y `ProviderVaultCard.tsx` (`HU-42`)** — *Nuevo*:
-   - **Panel gestor de repositorios (`MarketplaceSourceItem`):** añadir UI para listar fuentes (`api.getMarketplaceSources()`), activar/desactivar con toggle el repositorio oficial recomendado (`sxamx/bifrost-providers`, `isOfficial: true`, `enabled = false` por defecto opt-in) y añadir/habilitar/deshabilitar/eliminar repositorios HTTPS personalizados (`api.addMarketplaceSource({ name, url, enabled? })`, `api.updateMarketplaceSource(id, { name?, enabled? })`, `api.deleteMarketplaceSource(id)`), mostrando `url`, `catalogVersion`, `lastCheckedAt`, `lastError` y `enabledSourcesCount`.
-   - **Badges de versión y origen:** mostrar `catalogVersion` y `checkedAt` en la cabecera del catálogo (`MarketplaceCatalogState`), y `manifestVersion` (junto con `manifestHash` abreviado) + badge de repositorio origen (`sourceName` / `isOfficial` / `sourceId`) en cada tarjeta del catálogo (`MarketplaceProviderEntry`) y en los proveedores instalados (`ProviderSummary.sourceId`, `ProviderSummary.manifestHash`).
-   - **Botón «Comprobar actualizaciones»:** añadir botón en el Marketplace (y/o cabecera de Proveedores) que invoque `api.getMarketplace(true)` (`?refresh=1`) con estado de carga y feedback de actualizaciones detectadas (`updatesAvailableCount`).
-   - **Botones «Actualizar» y «Actualizar todos» en sitio (`MarketplaceUpdateResult`):** determinar `updateAvailable` para proveedores instalados emparejando `provider.id` contra `MarketplaceCatalogState.manifests` (p. ej. `catalog.manifests.find(m => m.id === p.id)?.updateAvailable`); cuando `updateAvailable === true` (tanto en `ProviderVaultCard.tsx` como en tarjetas del catálogo con `installed === true`), mostrar el hash/versión instalada (`installedHash` / `provider.manifestHash`) frente a la disponible (`manifestVersion` / `manifestHash`) y botón **«Actualizar»** (`api.updateInstalledMarketplaceProviders(provider.id)`), más botón global **«Actualizar todos»** (`api.updateInstalledMarketplaceProviders()`) cuando `updatesAvailableCount > 0`, procesando `updated` / `skipped` / `providers` y refrescando el estado sin perder claves ni modelos.
-5. **`PlaygroundTab.tsx` (`HU-43`)** — *Nuevo*:
-   - **Barra lateral de historial de chats:** listar chats propios (`api.getPlaygroundChats()`), botón **«Nuevo chat»** (`api.createPlaygroundChat`), cargar historial completo al seleccionar (`api.getPlaygroundChat`), renombrar (`api.updatePlaygroundChat`), eliminar chat individual (`api.deletePlaygroundChat`) y limpiar todo el historial (`api.clearPlaygroundChats`) con confirmación.
-   - **Persistencia automática:** al enviar prompts y recibir respuestas en el Playground, persistir los mensajes (`api.appendPlaygroundMessage`) incluyendo `reasoningContent`, `modelFullId` y `metrics`, actualizando el título autogenerado en la barra lateral.
-   - **Aviso de privacidad y cifrado:** mostrar indicador claro de que el historial está cifrado en reposo por cuenta (AES-256-GCM), es estrictamente privado (inaccesible incluso para administradores) y queda excluido de los backups `.bifrost.enc`.
+1. **`UsersTab.tsx` (`HU-44` — Historial de invitaciones vinculado a cuenta):**
+   - En la tabla de **Historial de invitaciones**, cuando `inv.usedAt !== null` y `inv.usedByUsername` esté definido, mostrar **`@{inv.usedByUsername}`** (usando `.mono` o chip discreto junto al estado «Canjeada» o en una columna «Canjeada por») para que el admin vea qué cuenta usó cada invitación. Si `inv.usedByUsername` es `null` (invitaciones antiguas previas a `HU-44` o pendientes), mostrar `—` sin romper el layout.
+2. **`PlaygroundTab.tsx` (`HU-43b` — Persistencia resiliente en servidor + configuración cifrada por chat):**
+   - **Pasar `chatId` en `api.streamPlaygroundChat(...)`:** al enviar un prompt, crear el chat si no existe (`api.createPlaygroundChat({ modelFullId, settings })`) y llamar a `api.streamPlaygroundChat({ model, messages, temperature, maxTokens, reasoningEffort, systemPrompt, chatId }, onDelta, { signal })`. **Eliminar** la llamada redundante a `api.appendPlaygroundMessage(...)` tras recibir la respuesta, ya que el backend persiste tanto el mensaje `user` (antes de llamar al upstream) como la respuesta del asistente (o el error seguro con `metrics.error`) y actualiza el título autogenerado automáticamente.
+   - **Restaurar y guardar `modelFullId` + `settings` por chat:** al seleccionar un chat (`api.getPlaygroundChat(chatId)`), restaurar `chat.modelFullId` y `settings` (`reasoningEffort`, `temperature`, `maxTokens`, `systemPrompt`) en el estado local del Playground; al cambiar estos controles sobre un chat activo, guardarlos con `api.updatePlaygroundChat(chatId, { modelFullId, settings })` (con debounce en campos de texto/número).
+   - **Generación en segundo plano (`inProgress === true`):** si un chat tiene `inProgress === true` (tanto en el listado `PlaygroundChatSummary.inProgress` como en `PlaygroundChatDetail.inProgress`), mostrar un indicador visible *«Generando en segundo plano…»* en la barra lateral y en la conversación activa, y activar un polling suave cada `2s`–`3s` a `api.getPlaygroundChat(chatId)` hasta que `inProgress === false`, refrescando entonces los mensajes (incluyendo errores persistidos con `msg.metrics?.error`) y la lista lateral.
+   - **Cambio de chat sin perder respuestas:** al cambiar de conversación mientras hay un stream activo en el cliente, cancelar únicamente el `AbortController` local del `fetch` (el servidor sigue leyendo el upstream en segundo plano y persiste la respuesta completa para cuando el usuario vuelva).
+
 
 

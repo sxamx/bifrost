@@ -1740,4 +1740,88 @@ describe('Bifrost v1.1 Features (P0-P2)', () => {
       }
     });
   });
+
+  describe('HU-44: Invitation History Linked to Redeeming Account', () => {
+    it('records usedByUserId and usedByUsername upon acceptInvitation and preserves usedByUsername if user is deleted', async () => {
+      const { db, app, adminCookie } = await setupAdminAndProvider({});
+      try {
+        const createInvRes = await app.request('http://localhost/api/invitations', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dailyTokenLimit: 50000,
+            quotaResetMode: 'utc_midnight',
+            allowedModels: ['*'],
+          }),
+        });
+        assert.equal(createInvRes.status, 201);
+        const createdInv = (await createInvRes.json()) as {
+          invitation: { id: string; usedByUserId: string | null; usedByUsername: string | null };
+          token: string;
+        };
+        assert.equal(createdInv.invitation.usedByUserId, null);
+        assert.equal(createdInv.invitation.usedByUsername, null);
+
+        // Redeem invitation as guest_hu44
+        const acceptRes = await app.request(
+          `http://localhost/api/invitations/${createdInv.token}/accept`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: 'guest_hu44', password: 'guestPassword123!' }),
+          },
+        );
+        assert.equal(acceptRes.status, 201);
+        const accepted = (await acceptRes.json()) as { user: { id: string; username: string } };
+
+        // GET /api/invitations returns usedByUserId and usedByUsername
+        const listRes = await app.request('http://localhost/api/invitations', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(listRes.status, 200);
+        const listJson = (await listRes.json()) as {
+          invitations: Array<{
+            id: string;
+            status: string;
+            usedAt: number | null;
+            usedByUserId: string | null;
+            usedByUsername: string | null;
+          }>;
+        };
+        const found = listJson.invitations.find((inv) => inv.id === createdInv.invitation.id);
+        assert.ok(found);
+        assert.equal(found.status, 'used');
+        assert.ok(found.usedAt !== null);
+        assert.equal(found.usedByUserId, accepted.user.id);
+        assert.equal(found.usedByUsername, 'guest_hu44');
+
+        // Delete guest_hu44 -> ON DELETE SET NULL clears usedByUserId while preserving usedByUsername
+        const delRes = await app.request(`http://localhost/api/users/${accepted.user.id}`, {
+          method: 'DELETE',
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(delRes.status, 200);
+
+        const listAfterDelRes = await app.request('http://localhost/api/invitations', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(listAfterDelRes.status, 200);
+        const listAfterDel = (await listAfterDelRes.json()) as {
+          invitations: Array<{
+            id: string;
+            usedByUserId: string | null;
+            usedByUsername: string | null;
+          }>;
+        };
+        const afterDelFound = listAfterDel.invitations.find(
+          (inv) => inv.id === createdInv.invitation.id,
+        );
+        assert.ok(afterDelFound);
+        assert.equal(afterDelFound.usedByUserId, null);
+        assert.equal(afterDelFound.usedByUsername, 'guest_hu44');
+      } finally {
+        db.close();
+      }
+    });
+  });
 });

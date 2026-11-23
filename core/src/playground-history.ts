@@ -1,16 +1,29 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { decryptSecret, encryptSecret } from './crypto.js';
+import { redactSecretsInText } from './db.js';
 
 export const DEFAULT_PLAYGROUND_CHAT_TITLE = 'Nuevo chat';
 export const MAX_PLAYGROUND_TITLE_LENGTH = 160;
 export const AUTO_PLAYGROUND_TITLE_MAX_LENGTH = 60;
 export const MAX_PLAYGROUND_MESSAGE_CONTENT_LENGTH = 200_000;
 export const MAX_PLAYGROUND_MESSAGE_REASONING_LENGTH = 200_000;
+export const MAX_PLAYGROUND_SYSTEM_PROMPT_LENGTH = 100_000;
+export const MAX_PLAYGROUND_METRIC_ERROR_LENGTH = 2_000;
 export const MAX_PLAYGROUND_BATCH_MESSAGES = 50;
 export const MAX_PLAYGROUND_MODEL_ID_LENGTH = 256;
 
 export type PlaygroundMessageRole = 'user' | 'assistant' | 'system';
+export type PlaygroundReasoningEffort = 'none' | 'low' | 'medium' | 'high';
+
+const VALID_REASONING_EFFORTS = new Set<string>(['none', 'low', 'medium', 'high']);
+
+export interface PlaygroundChatSettings {
+  reasoningEffort?: PlaygroundReasoningEffort;
+  temperature?: number | null;
+  maxTokens?: number | null;
+  systemPrompt?: string | null;
+}
 
 export interface PlaygroundMessageMetrics {
   ttftMs?: number | null;
@@ -18,12 +31,15 @@ export interface PlaygroundMessageMetrics {
   promptTokens?: number | null;
   completionTokens?: number | null;
   reasoningTokens?: number | null;
+  error?: string | null;
 }
 
 export interface PlaygroundChatSummary {
   id: string;
   title: string;
   modelFullId: string | null;
+  settings: PlaygroundChatSettings | null;
+  inProgress: boolean;
   messageCount: number;
   createdAt: number;
   updatedAt: number;
@@ -42,6 +58,8 @@ export interface PlaygroundChatMessage {
 
 export interface PlaygroundChatDetail {
   chat: PlaygroundChatSummary;
+  settings: PlaygroundChatSettings | null;
+  inProgress: boolean;
   messages: PlaygroundChatMessage[];
 }
 
@@ -73,6 +91,7 @@ interface RawChatRow {
   id: string;
   user_id: string;
   encrypted_title: Uint8Array | Buffer;
+  encrypted_settings: Uint8Array | Buffer | null;
   model_full_id: string | null;
   created_at: number | bigint;
   updated_at: number | bigint;
@@ -91,6 +110,25 @@ interface RawMessageRow {
   created_at: number | bigint;
 }
 
+const activeGeneratingChats = new Set<string>();
+
+export function markChatGenerating(chatId: string, active: boolean): void {
+  if (!chatId) return;
+  if (active) {
+    activeGeneratingChats.add(chatId);
+  } else {
+    activeGeneratingChats.delete(chatId);
+  }
+}
+
+export function isChatGenerating(chatId: string): boolean {
+  return activeGeneratingChats.has(chatId);
+}
+
+export function resetGeneratingChatsForTests(): void {
+  activeGeneratingChats.clear();
+}
+
 /**
  * Derives a unique 32-byte per-user AES-256-GCM subkey from the server masterKey.
  * Guarantees cryptographic separation between accounts at rest in SQLite.
@@ -99,6 +137,19 @@ export function deriveUserPlaygroundKey(masterKey: Buffer, userId: string): Buff
   return createHmac('sha256', masterKey)
     .update(`bifrost-playground-chat:${userId}`)
     .digest();
+}
+
+export function assertPlaygroundChatOwned(
+  db: DatabaseSync,
+  userId: string,
+  chatId: string,
+): void {
+  const row = db
+    .prepare(`SELECT id FROM playground_chats WHERE id = ? AND user_id = ?`)
+    .get(chatId, userId) as { id: string } | undefined;
+  if (!row) {
+    throw new PlaygroundHistoryError(404, 'Playground chat not found.');
+  }
 }
 
 function validateModelFullId(raw: unknown): string | null {
@@ -154,6 +205,116 @@ function buildAutoTitleFromContent(content: string): string {
   return `${collapsed.slice(0, AUTO_PLAYGROUND_TITLE_MAX_LENGTH - 3).trimEnd()}...`;
 }
 
+export function sanitizePlaygroundChatSettings(raw: unknown): PlaygroundChatSettings | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new PlaygroundHistoryError(400, 'settings must be an object or null.');
+  }
+  const obj = raw as Record<string, unknown>;
+  const out: PlaygroundChatSettings = {};
+  let hasAny = false;
+
+  if ('reasoningEffort' in obj && obj.reasoningEffort !== undefined) {
+    if (
+      typeof obj.reasoningEffort !== 'string' ||
+      !VALID_REASONING_EFFORTS.has(obj.reasoningEffort.trim().toLowerCase())
+    ) {
+      throw new PlaygroundHistoryError(
+        400,
+        'settings.reasoningEffort must be one of "none", "low", "medium", or "high".',
+      );
+    }
+    out.reasoningEffort = obj.reasoningEffort.trim().toLowerCase() as PlaygroundReasoningEffort;
+    hasAny = true;
+  }
+
+  if ('temperature' in obj && obj.temperature !== undefined) {
+    if (obj.temperature === null) {
+      out.temperature = null;
+      hasAny = true;
+    } else if (
+      typeof obj.temperature === 'number' &&
+      Number.isFinite(obj.temperature) &&
+      obj.temperature >= 0 &&
+      obj.temperature <= 2
+    ) {
+      out.temperature = obj.temperature;
+      hasAny = true;
+    } else {
+      throw new PlaygroundHistoryError(
+        400,
+        'settings.temperature must be a finite number between 0 and 2, or null.',
+      );
+    }
+  }
+
+  if ('maxTokens' in obj && obj.maxTokens !== undefined) {
+    if (obj.maxTokens === null) {
+      out.maxTokens = null;
+      hasAny = true;
+    } else if (
+      typeof obj.maxTokens === 'number' &&
+      Number.isInteger(obj.maxTokens) &&
+      obj.maxTokens >= 1
+    ) {
+      out.maxTokens = obj.maxTokens;
+      hasAny = true;
+    } else {
+      throw new PlaygroundHistoryError(
+        400,
+        'settings.maxTokens must be a positive integer or null.',
+      );
+    }
+  }
+
+  if ('systemPrompt' in obj && obj.systemPrompt !== undefined) {
+    if (obj.systemPrompt === null) {
+      out.systemPrompt = null;
+      hasAny = true;
+    } else if (typeof obj.systemPrompt === 'string') {
+      if (obj.systemPrompt.length > MAX_PLAYGROUND_SYSTEM_PROMPT_LENGTH) {
+        throw new PlaygroundHistoryError(
+          400,
+          `settings.systemPrompt must not exceed ${MAX_PLAYGROUND_SYSTEM_PROMPT_LENGTH} characters.`,
+        );
+      }
+      out.systemPrompt = obj.systemPrompt.length > 0 ? obj.systemPrompt : null;
+      hasAny = true;
+    } else {
+      throw new PlaygroundHistoryError(
+        400,
+        'settings.systemPrompt must be a string or null.',
+      );
+    }
+  }
+
+  return hasAny ? out : null;
+}
+
+function encryptChatSettings(
+  settings: PlaygroundChatSettings | null,
+  userKey: Buffer,
+): Buffer | null {
+  if (!settings) return null;
+  return encryptSecret(JSON.stringify(settings), userKey);
+}
+
+function decryptChatSettings(
+  blob: Uint8Array | Buffer | null | undefined,
+  userKey: Buffer,
+): PlaygroundChatSettings | null {
+  if (blob === null || blob === undefined) return null;
+  try {
+    const rawText = decryptSecret(blob, userKey);
+    const parsed = JSON.parse(rawText) as unknown;
+    return sanitizePlaygroundChatSettings(parsed);
+  } catch {
+    return null;
+  }
+}
+
 function sanitizeMetrics(raw: unknown): PlaygroundMessageMetrics | null {
   if (raw === undefined || raw === null) {
     return null;
@@ -165,13 +326,13 @@ function sanitizeMetrics(raw: unknown): PlaygroundMessageMetrics | null {
   const out: PlaygroundMessageMetrics = {};
   let hasAny = false;
 
-  const numericKeys: ReadonlyArray<keyof PlaygroundMessageMetrics> = [
+  const numericKeys = [
     'ttftMs',
     'tokensPerSec',
     'promptTokens',
     'completionTokens',
     'reasoningTokens',
-  ];
+  ] as const;
 
   for (const key of numericKeys) {
     if (!(key in obj)) continue;
@@ -190,6 +351,19 @@ function sanitizeMetrics(raw: unknown): PlaygroundMessageMetrics | null {
     }
   }
 
+  if ('error' in obj && obj.error !== undefined) {
+    if (obj.error === null) {
+      out.error = null;
+      hasAny = true;
+    } else if (typeof obj.error === 'string') {
+      const safe = redactSecretsInText(obj.error).slice(0, MAX_PLAYGROUND_METRIC_ERROR_LENGTH);
+      out.error = safe.length > 0 ? safe : null;
+      hasAny = true;
+    } else {
+      throw new PlaygroundHistoryError(400, 'metrics.error must be a string or null.');
+    }
+  }
+
   return hasAny ? out : null;
 }
 
@@ -203,13 +377,13 @@ function parseMetricsJson(rawJson: string | null): PlaygroundMessageMetrics | nu
     const obj = parsed as Record<string, unknown>;
     const out: PlaygroundMessageMetrics = {};
     let hasAny = false;
-    const keys: ReadonlyArray<keyof PlaygroundMessageMetrics> = [
+    const keys = [
       'ttftMs',
       'tokensPerSec',
       'promptTokens',
       'completionTokens',
       'reasoningTokens',
-    ];
+    ] as const;
     for (const key of keys) {
       const val = obj[key];
       if (val === null) {
@@ -217,6 +391,15 @@ function parseMetricsJson(rawJson: string | null): PlaygroundMessageMetrics | nu
         hasAny = true;
       } else if (typeof val === 'number' && Number.isFinite(val)) {
         out[key] = val;
+        hasAny = true;
+      }
+    }
+    if ('error' in obj) {
+      if (obj.error === null) {
+        out.error = null;
+        hasAny = true;
+      } else if (typeof obj.error === 'string' && obj.error.length > 0) {
+        out.error = obj.error;
         hasAny = true;
       }
     }
@@ -271,12 +454,12 @@ function validateSingleMessageInput(raw: unknown): {
     }
   }
 
-  if (obj.content.length === 0 && reasoningContent === null) {
-    throw new PlaygroundHistoryError(400, 'Message content must not be empty.');
-  }
-
   const modelFullId = validateModelFullId(obj.modelFullId);
   const metrics = sanitizeMetrics(obj.metrics);
+
+  if (obj.content.length === 0 && reasoningContent === null && !metrics?.error) {
+    throw new PlaygroundHistoryError(400, 'Message content must not be empty.');
+  }
 
   return {
     role,
@@ -292,6 +475,8 @@ function mapChatRow(row: RawChatRow, userKey: Buffer): PlaygroundChatSummary {
     id: row.id,
     title: decryptSecret(row.encrypted_title, userKey),
     modelFullId: row.model_full_id ?? null,
+    settings: decryptChatSettings(row.encrypted_settings, userKey),
+    inProgress: isChatGenerating(row.id),
     messageCount: Number(row.message_count ?? 0),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
@@ -325,6 +510,7 @@ export function listPlaygroundChats(
       `SELECT pc.id,
               pc.user_id,
               pc.encrypted_title,
+              pc.encrypted_settings,
               pc.model_full_id,
               pc.created_at,
               pc.updated_at,
@@ -348,19 +534,23 @@ export function createPlaygroundChat(
 ): PlaygroundChatSummary {
   const title = validateChatTitle(rawBody.title, true);
   const modelFullId = validateModelFullId(rawBody.modelFullId);
+  const settings = sanitizePlaygroundChatSettings(rawBody.settings);
   const userKey = deriveUserPlaygroundKey(masterKey, userId);
   const encryptedTitle = encryptSecret(title, userKey);
+  const encryptedSettings = encryptChatSettings(settings, userKey);
   const id = randomUUID();
 
   db.prepare(
-    `INSERT INTO playground_chats (id, user_id, encrypted_title, model_full_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(id, userId, encryptedTitle, modelFullId, nowSec, nowSec);
+    `INSERT INTO playground_chats (id, user_id, encrypted_title, encrypted_settings, model_full_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, userId, encryptedTitle, encryptedSettings, modelFullId, nowSec, nowSec);
 
   return {
     id,
     title,
     modelFullId,
+    settings,
+    inProgress: isChatGenerating(id),
     messageCount: 0,
     createdAt: nowSec,
     updatedAt: nowSec,
@@ -379,6 +569,7 @@ export function getPlaygroundChatDetail(
       `SELECT pc.id,
               pc.user_id,
               pc.encrypted_title,
+              pc.encrypted_settings,
               pc.model_full_id,
               pc.created_at,
               pc.updated_at,
@@ -403,8 +594,11 @@ export function getPlaygroundChatDetail(
     )
     .all(chatId, userId) as unknown as RawMessageRow[];
 
+  const chat = mapChatRow(chatRow, userKey);
   return {
-    chat: mapChatRow(chatRow, userKey),
+    chat,
+    settings: chat.settings,
+    inProgress: chat.inProgress,
     messages: messageRows.map((row) => mapMessageRow(row, userKey)),
   };
 }
@@ -419,11 +613,12 @@ export function updatePlaygroundChat(
 ): PlaygroundChatSummary {
   const hasTitle = 'title' in rawBody && rawBody.title !== undefined;
   const hasModel = 'modelFullId' in rawBody && rawBody.modelFullId !== undefined;
+  const hasSettings = 'settings' in rawBody && rawBody.settings !== undefined;
 
-  if (!hasTitle && !hasModel) {
+  if (!hasTitle && !hasModel && !hasSettings) {
     throw new PlaygroundHistoryError(
       400,
-      'At least one of "title" or "modelFullId" must be provided.',
+      'At least one of "title", "modelFullId", or "settings" must be provided.',
     );
   }
 
@@ -432,6 +627,7 @@ export function updatePlaygroundChat(
       `SELECT pc.id,
               pc.user_id,
               pc.encrypted_title,
+              pc.encrypted_settings,
               pc.model_full_id,
               pc.created_at,
               pc.updated_at,
@@ -456,17 +652,25 @@ export function updatePlaygroundChat(
   const nextModelFullId = hasModel
     ? validateModelFullId(rawBody.modelFullId)
     : (existing.model_full_id ?? null);
+  const nextSettings = hasSettings
+    ? sanitizePlaygroundChatSettings(rawBody.settings)
+    : decryptChatSettings(existing.encrypted_settings, userKey);
+  const nextEncryptedSettings = hasSettings
+    ? encryptChatSettings(nextSettings, userKey)
+    : existing.encrypted_settings;
 
   db.prepare(
     `UPDATE playground_chats
-     SET encrypted_title = ?, model_full_id = ?, updated_at = ?
+     SET encrypted_title = ?, encrypted_settings = ?, model_full_id = ?, updated_at = ?
      WHERE id = ? AND user_id = ?`,
-  ).run(nextEncryptedTitle, nextModelFullId, nowSec, chatId, userId);
+  ).run(nextEncryptedTitle, nextEncryptedSettings, nextModelFullId, nowSec, chatId, userId);
 
   return {
     id: existing.id,
     title: nextTitle,
     modelFullId: nextModelFullId,
+    settings: nextSettings,
+    inProgress: isChatGenerating(existing.id),
     messageCount: Number(existing.message_count ?? 0),
     createdAt: Number(existing.created_at),
     updatedAt: nowSec,
@@ -486,6 +690,7 @@ export function appendPlaygroundMessages(
       `SELECT pc.id,
               pc.user_id,
               pc.encrypted_title,
+              pc.encrypted_settings,
               pc.model_full_id,
               pc.created_at,
               pc.updated_at,
@@ -599,6 +804,8 @@ export function appendPlaygroundMessages(
     id: existing.id,
     title: nextTitle,
     modelFullId: nextModelFullId,
+    settings: decryptChatSettings(existing.encrypted_settings, userKey),
+    inProgress: isChatGenerating(existing.id),
     messageCount: Number(existing.message_count ?? 0) + insertedMessages.length,
     createdAt: Number(existing.created_at),
     updatedAt: nowSec,
@@ -623,15 +830,23 @@ export function deletePlaygroundChat(
   if (Number(result.changes) === 0) {
     throw new PlaygroundHistoryError(404, 'Playground chat not found.');
   }
+  markChatGenerating(chatId, false);
 }
 
 export function clearPlaygroundChats(
   db: DatabaseSync,
   userId: string,
 ): { ok: true; deletedCount: number } {
+  const ids = db
+    .prepare(`SELECT id FROM playground_chats WHERE user_id = ?`)
+    .all(userId) as Array<{ id: string }>;
   const result = db
     .prepare(`DELETE FROM playground_chats WHERE user_id = ?`)
     .run(userId);
+
+  for (const row of ids) {
+    markChatGenerating(row.id, false);
+  }
 
   return {
     ok: true,

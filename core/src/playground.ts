@@ -2,6 +2,15 @@ import type { DatabaseSync } from 'node:sqlite';
 import { redactSecretsInText, writeSystemLog } from './db.js';
 import type { UpstreamTlsOptions } from './nodes.js';
 import {
+  PlaygroundHistoryError,
+  appendPlaygroundMessages,
+  assertPlaygroundChatOwned,
+  markChatGenerating,
+  updatePlaygroundChat,
+  type PlaygroundChatSettings,
+  type PlaygroundMessageMetrics,
+} from './playground-history.js';
+import {
   executeChatCompletions,
   type DrainingRegistry,
 } from './router.js';
@@ -9,6 +18,14 @@ import {
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high';
 
 const VALID_REASONING_EFFORTS = new Set<string>(['none', 'low', 'medium', 'high']);
+
+const pendingStreamTasks = new Set<Promise<void>>();
+
+export async function waitForPendingPlaygroundStreamsForTests(): Promise<void> {
+  while (pendingStreamTasks.size > 0) {
+    await Promise.allSettled(Array.from(pendingStreamTasks));
+  }
+}
 
 export interface PlaygroundUserContext {
   id: string;
@@ -106,10 +123,11 @@ async function normalizeRouterErrorResponse(res: Response): Promise<Response> {
 }
 
 /**
- * HU-21 & HU-22: Executes a session-authenticated Playground chat request through
+ * HU-21, HU-22 & HU-43b: Executes a session-authenticated Playground chat request through
  * the exact same Bifrost routing engine (`executeChatCompletions`) used by `/v1/chat/completions`,
  * preserving exit-node tunnels, key failover, mid-stream SSE resumption, server-UTC daily
- * quota enforcement, and automatic `usage_logs` telemetry.
+ * quota enforcement, automatic `usage_logs` telemetry, and optional resilient server-side
+ * encrypted chat persistence decoupled from client socket disconnects.
  */
 export async function handlePlaygroundChat(
   opts: HandlePlaygroundChatOptions,
@@ -141,6 +159,27 @@ export async function handlePlaygroundChat(
         400,
       );
     }
+  }
+
+  // Validate optional chatId (HU-43b) — strictly bound to session user.id (no admin override)
+  let boundChatId: string | null = null;
+  if (rawBody.chatId !== undefined && rawBody.chatId !== null) {
+    if (typeof rawBody.chatId !== 'string' || rawBody.chatId.trim().length === 0) {
+      return jsonResponse(
+        { error: 'Field "chatId" must be a non-empty string.', code: 'invalid_chat_id' },
+        400,
+      );
+    }
+    const candidateChatId = rawBody.chatId.trim();
+    try {
+      assertPlaygroundChatOwned(db, user.id, candidateChatId);
+    } catch (err) {
+      if (err instanceof PlaygroundHistoryError) {
+        return jsonResponse({ error: err.message, code: 'chat_not_found' }, err.status);
+      }
+      throw err;
+    }
+    boundChatId = candidateChatId;
   }
 
   // Validate reasoning_effort / reasoningEffort ('none' | 'low' | 'medium' | 'high')
@@ -242,12 +281,98 @@ export async function handlePlaygroundChat(
   const messages: Array<Record<string, unknown>> = rawBody.messages.map((m) => ({
     ...asRecord(m),
   }));
-  const systemPrompt = typeof rawBody.systemPrompt === 'string' ? rawBody.systemPrompt.trim() : '';
-  if (systemPrompt) {
+  const rawSystemPrompt = typeof rawBody.systemPrompt === 'string' ? rawBody.systemPrompt.trim() : '';
+  if (rawSystemPrompt) {
     const first = messages[0];
-    if (!first || first.role !== 'system' || first.content !== systemPrompt) {
-      messages.unshift({ role: 'system', content: systemPrompt });
+    if (!first || first.role !== 'system' || first.content !== rawSystemPrompt) {
+      messages.unshift({ role: 'system', content: rawSystemPrompt });
     }
+  }
+  const effectiveSystemPrompt =
+    rawSystemPrompt ||
+    (messages[0]?.role === 'system' && typeof messages[0].content === 'string'
+      ? messages[0].content.trim()
+      : '');
+
+  const persistAssistantMessageSafe = (
+    content: string,
+    reasoningContent: string | null,
+    metrics: PlaygroundMessageMetrics | null,
+  ) => {
+    if (!boundChatId) return;
+    try {
+      appendPlaygroundMessages(
+        db,
+        masterKey,
+        user.id,
+        boundChatId,
+        {
+          role: 'assistant',
+          content,
+          reasoningContent,
+          modelFullId: modelRow.full_id,
+          metrics,
+        },
+        Math.floor(nowFn() / 1000),
+      );
+    } catch {
+      // Chat may have been deleted concurrently while generating
+    }
+  };
+
+  // HU-43b: Persist latest user message, model & encrypted settings BEFORE calling upstream
+  if (boundChatId) {
+    const nowSec = Math.floor(nowFn() / 1000);
+    const chatSettings: PlaygroundChatSettings = {
+      reasoningEffort,
+      temperature: temperature ?? null,
+      maxTokens: maxTokens ?? null,
+      systemPrompt: effectiveSystemPrompt.length > 0 ? effectiveSystemPrompt : null,
+    };
+
+    try {
+      updatePlaygroundChat(
+        db,
+        masterKey,
+        user.id,
+        boundChatId,
+        {
+          modelFullId: modelRow.full_id,
+          settings: chatSettings,
+        },
+        nowSec,
+      );
+
+      let lastUserContent = '';
+      for (let i = rawBody.messages.length - 1; i >= 0; i--) {
+        const m = asRecord(rawBody.messages[i]);
+        if (m.role === 'user' && typeof m.content === 'string' && m.content.length > 0) {
+          lastUserContent = m.content;
+          break;
+        }
+      }
+      if (lastUserContent.length > 0) {
+        appendPlaygroundMessages(
+          db,
+          masterKey,
+          user.id,
+          boundChatId,
+          {
+            role: 'user',
+            content: lastUserContent,
+            modelFullId: modelRow.full_id,
+          },
+          nowSec,
+        );
+      }
+    } catch (err) {
+      if (err instanceof PlaygroundHistoryError) {
+        return jsonResponse({ error: err.message, code: 'chat_persistence_error' }, err.status);
+      }
+      throw err;
+    }
+
+    markChatGenerating(boundChatId, true);
   }
 
   const accept = opts.acceptHeader ?? '';
@@ -316,6 +441,10 @@ export async function handlePlaygroundChat(
       { userId: user.id, modelFullId: modelRow.full_id, providerId: modelRow.provider_id },
       Math.floor(nowFn() / 1000),
     );
+    if (boundChatId) {
+      persistAssistantMessageSafe(errMsg, null, { error: errMsg });
+      markChatGenerating(boundChatId, false);
+    }
     return jsonResponse({ error: errMsg, code: 'upstream_error' }, 502);
   }
 
@@ -344,10 +473,16 @@ export async function handlePlaygroundChat(
       },
       Math.floor(nowFn() / 1000),
     );
+    if (boundChatId) {
+      persistAssistantMessageSafe(errDetail, null, { error: errDetail });
+      markChatGenerating(boundChatId, false);
+    }
     return normalized;
   }
 
-  // Streaming SSE response: pipe upstream SSE frames directly and inject telemetry summary before [DONE]
+  // Streaming SSE response: pipe upstream SSE frames directly and inject telemetry summary before [DONE].
+  // When boundChatId is set (HU-43b), reading from upstream is decoupled from the client socket so
+  // browser disconnects/tab switches never abort upstream reading or server-side persistence.
   if (wantsStream && routerRes.body) {
     const reader = routerRes.body.getReader();
     const decoder = new TextDecoder();
@@ -359,6 +494,8 @@ export async function handlePlaygroundChat(
     let reasoningTokens = 0;
     let cachedTokens = 0;
     let generatedChars = 0;
+    let assistantContentAcc = '';
+    let assistantReasoningAcc = '';
 
     const estimatedPromptTokens = Math.max(
       1,
@@ -375,14 +512,45 @@ export async function handlePlaygroundChat(
       ),
     );
 
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
+    let clientOpen = true;
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+
+    const safeEnqueue = (chunk: Uint8Array) => {
+      if (!clientOpen || !streamController) return;
+      try {
+        streamController.enqueue(chunk);
+      } catch {
+        clientOpen = false;
+      }
+    };
+
+    const safeClose = () => {
+      if (!clientOpen || !streamController) return;
+      clientOpen = false;
+      try {
+        streamController.close();
+      } catch {
+        // Client already disconnected
+      }
+    };
+
+    const safeError = (err: unknown) => {
+      if (!clientOpen || !streamController) return;
+      clientOpen = false;
+      try {
+        streamController.error(err);
+      } catch {
+        // Client already disconnected
+      }
+    };
+
+    const startUpstreamPump = () => {
+      const pumpTask = (async () => {
         let buffer = '';
         let emittedDone = false;
+        let finalMetrics: PlaygroundMessageMetrics | null = null;
 
-        const emitMetricsAndDone = () => {
-          if (emittedDone) return;
-          emittedDone = true;
+        const computeFinalMetrics = () => {
           const durationMs = Math.max(1, nowFn() - startedAtMs);
           const ttftMs = firstTokenMs ?? durationMs;
           const effectivePrompt = promptTokens > 0 ? promptTokens : estimatedPromptTokens;
@@ -398,6 +566,35 @@ export async function handlePlaygroundChat(
               ? round2((totalOutTokens / durationMs) * 1000)
               : null;
           const totalTokens = effectivePrompt + effectiveCompletion + reasoningTokens;
+          return {
+            durationMs,
+            ttftMs,
+            effectivePrompt,
+            effectiveCompletion,
+            tokensPerSec,
+            totalTokens,
+          };
+        };
+
+        const emitMetricsAndDone = () => {
+          if (emittedDone) return;
+          emittedDone = true;
+          const {
+            durationMs,
+            ttftMs,
+            effectivePrompt,
+            effectiveCompletion,
+            tokensPerSec,
+            totalTokens,
+          } = computeFinalMetrics();
+
+          finalMetrics = {
+            ttftMs,
+            tokensPerSec,
+            promptTokens: effectivePrompt,
+            completionTokens: effectiveCompletion,
+            reasoningTokens,
+          };
 
           const summaryEvt = {
             object: 'bifrost.playground.metrics',
@@ -425,15 +622,15 @@ export async function handlePlaygroundChat(
             },
           };
 
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(summaryEvt)}\n\n`));
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify(summaryEvt)}\n\n`));
+          safeEnqueue(encoder.encode('data: [DONE]\n\n'));
         };
 
         const processLine = (rawLine: string) => {
           const trimmed = rawLine.trim();
           if (!trimmed) return;
           if (!trimmed.startsWith('data:')) {
-            controller.enqueue(encoder.encode(`${rawLine}\n`));
+            safeEnqueue(encoder.encode(`${rawLine}\n`));
             return;
           }
           const payload = trimmed.slice(5).trim();
@@ -459,6 +656,8 @@ export async function handlePlaygroundChat(
                 if (firstTokenMs === null) {
                   firstTokenMs = Math.max(1, nowFn() - startedAtMs);
                 }
+                assistantContentAcc += contentDelta;
+                assistantReasoningAcc += reasoningDelta;
                 generatedChars += contentDelta.length + reasoningDelta.length;
               }
             }
@@ -482,7 +681,7 @@ export async function handlePlaygroundChat(
             // Forward non-JSON data frame unchanged
           }
 
-          controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
+          safeEnqueue(encoder.encode(`data: ${payload}\n\n`));
         };
 
         try {
@@ -503,12 +702,68 @@ export async function handlePlaygroundChat(
             }
           }
           emitMetricsAndDone();
-          controller.close();
+          safeClose();
+
+          if (boundChatId) {
+            const hasContent = assistantContentAcc.length > 0 || assistantReasoningAcc.length > 0;
+            if (hasContent) {
+              persistAssistantMessageSafe(
+                assistantContentAcc,
+                assistantReasoningAcc.length > 0 ? assistantReasoningAcc : null,
+                finalMetrics,
+              );
+            } else {
+              const emptyErr = 'Upstream closed stream without returning content.';
+              persistAssistantMessageSafe(emptyErr, null, {
+                ...(finalMetrics ?? {}),
+                error: emptyErr,
+              });
+            }
+          }
         } catch (err) {
-          controller.error(err);
+          const safeErrMsg = redactSecretsInText(
+            err instanceof Error ? err.message : 'Playground stream interrupted.',
+          );
+          if (boundChatId) {
+            const { ttftMs, effectivePrompt, effectiveCompletion, tokensPerSec } =
+              computeFinalMetrics();
+            persistAssistantMessageSafe(
+              assistantContentAcc.length > 0 ? assistantContentAcc : safeErrMsg,
+              assistantReasoningAcc.length > 0 ? assistantReasoningAcc : null,
+              {
+                ttftMs,
+                tokensPerSec,
+                promptTokens: effectivePrompt,
+                completionTokens: effectiveCompletion,
+                reasoningTokens,
+                error: safeErrMsg,
+              },
+            );
+          }
+          safeError(err);
         } finally {
           reader.releaseLock();
+          if (boundChatId) {
+            markChatGenerating(boundChatId, false);
+          }
         }
+      })();
+
+      pendingStreamTasks.add(pumpTask);
+      void pumpTask.finally(() => {
+        pendingStreamTasks.delete(pumpTask);
+      });
+    };
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        startUpstreamPump();
+      },
+      cancel() {
+        // Client disconnected / navigated away: stop enqueueing to client,
+        // but NEVER abort the upstream reader so HU-43b finishes persisting in background.
+        clientOpen = false;
       },
     });
 
@@ -526,93 +781,124 @@ export async function handlePlaygroundChat(
   }
 
   // Non-streaming JSON response
-  const durationMs = Math.max(1, nowFn() - startedAtMs);
-  const rawJson = asRecord(await routerRes.json());
-  const choices = Array.isArray(rawJson.choices) ? rawJson.choices : [];
-  const firstMessage = choices.length > 0 ? asRecord(asRecord(choices[0]).message) : {};
+  try {
+    const durationMs = Math.max(1, nowFn() - startedAtMs);
+    const rawJson = asRecord(await routerRes.json());
+    const choices = Array.isArray(rawJson.choices) ? rawJson.choices : [];
+    const firstMessage = choices.length > 0 ? asRecord(asRecord(choices[0]).message) : {};
 
-  const content = typeof firstMessage.content === 'string' ? firstMessage.content : '';
-  const reasoningContent =
-    typeof firstMessage.reasoning_content === 'string'
-      ? firstMessage.reasoning_content
-      : typeof firstMessage.reasoning === 'string'
-        ? firstMessage.reasoning
-        : undefined;
+    const content = typeof firstMessage.content === 'string' ? firstMessage.content : '';
+    const reasoningContent =
+      typeof firstMessage.reasoning_content === 'string'
+        ? firstMessage.reasoning_content
+        : typeof firstMessage.reasoning === 'string'
+          ? firstMessage.reasoning
+          : undefined;
 
-  const u = asRecord(rawJson.usage);
-  const compDetails = asRecord(u.completion_tokens_details);
-  const promptDetails = asRecord(u.prompt_tokens_details);
+    const u = asRecord(rawJson.usage);
+    const compDetails = asRecord(u.completion_tokens_details);
+    const promptDetails = asRecord(u.prompt_tokens_details);
 
-  const estimatedNonStreamPrompt = Math.max(
-    1,
-    Math.ceil(
-      messages.reduce((acc, m) => {
-        const msgContent =
-          typeof m.content === 'string'
-            ? m.content
-            : Array.isArray(m.content)
-              ? JSON.stringify(m.content)
-              : '';
-        return acc + msgContent.length + 12;
-      }, 0) / 4,
-    ),
-  );
-  const promptTokens =
-    toSafeNonNegInt(u.prompt_tokens ?? u.promptTokens) || estimatedNonStreamPrompt;
-  const completionTokens =
-    toSafeNonNegInt(u.completion_tokens ?? u.completionTokens) ||
-    (content.length > 0 ? Math.max(1, Math.ceil(content.length / 4)) : 0);
-  const reasoningTokens = toSafeNonNegInt(
-    u.reasoning_tokens ?? u.reasoningTokens ?? compDetails.reasoning_tokens,
-  );
-  const cachedTokens = toSafeNonNegInt(
-    u.cached_tokens ?? u.cachedTokens ?? promptDetails.cached_tokens,
-  );
-  const totalTokens =
-    toSafeNonNegInt(u.total_tokens ?? u.totalTokens) ||
-    promptTokens + completionTokens + reasoningTokens;
+    const estimatedNonStreamPrompt = Math.max(
+      1,
+      Math.ceil(
+        messages.reduce((acc, m) => {
+          const msgContent =
+            typeof m.content === 'string'
+              ? m.content
+              : Array.isArray(m.content)
+                ? JSON.stringify(m.content)
+                : '';
+          return acc + msgContent.length + 12;
+        }, 0) / 4,
+      ),
+    );
+    const promptTokens =
+      toSafeNonNegInt(u.prompt_tokens ?? u.promptTokens) || estimatedNonStreamPrompt;
+    const completionTokens =
+      toSafeNonNegInt(u.completion_tokens ?? u.completionTokens) ||
+      (content.length > 0 ? Math.max(1, Math.ceil(content.length / 4)) : 0);
+    const reasoningTokens = toSafeNonNegInt(
+      u.reasoning_tokens ?? u.reasoningTokens ?? compDetails.reasoning_tokens,
+    );
+    const cachedTokens = toSafeNonNegInt(
+      u.cached_tokens ?? u.cachedTokens ?? promptDetails.cached_tokens,
+    );
+    const totalTokens =
+      toSafeNonNegInt(u.total_tokens ?? u.totalTokens) ||
+      promptTokens + completionTokens + reasoningTokens;
 
-  const headerTtft = Number(routerRes.headers.get('x-bifrost-ttft-ms'));
-  const headerTps = Number(routerRes.headers.get('x-bifrost-tokens-per-sec'));
+    const headerTtft = Number(routerRes.headers.get('x-bifrost-ttft-ms'));
+    const headerTps = Number(routerRes.headers.get('x-bifrost-tokens-per-sec'));
 
-  const ttftMs =
-    Number.isFinite(headerTtft) && headerTtft > 0 ? Math.round(headerTtft) : durationMs;
-  const totalOutTokens = completionTokens + reasoningTokens;
-  const tokensPerSec =
-    Number.isFinite(headerTps) && headerTps > 0
-      ? round2(headerTps)
-      : totalOutTokens > 0 && durationMs > 0
-        ? round2((totalOutTokens / durationMs) * 1000)
-        : null;
+    const ttftMs =
+      Number.isFinite(headerTtft) && headerTtft > 0 ? Math.round(headerTtft) : durationMs;
+    const totalOutTokens = completionTokens + reasoningTokens;
+    const tokensPerSec =
+      Number.isFinite(headerTps) && headerTps > 0
+        ? round2(headerTps)
+        : totalOutTokens > 0 && durationMs > 0
+          ? round2((totalOutTokens / durationMs) * 1000)
+          : null;
 
-  return jsonResponse({
-    ...rawJson,
-    model: typeof rawJson.model === 'string' ? rawJson.model : model,
-    choices,
-    content,
-    ...(reasoningContent !== undefined ? { reasoningContent } : {}),
-    reasoningEffort,
-    ttftMs,
-    ttft_ms: ttftMs,
-    tokensPerSec,
-    tokens_per_sec: tokensPerSec,
-    durationMs,
-    usage: {
-      ...u,
-      promptTokens,
-      completionTokens,
-      reasoningTokens,
-      cachedTokens,
-      totalTokens,
-      prompt_tokens: promptTokens,
-      completion_tokens: completionTokens,
-      reasoning_tokens: reasoningTokens,
-      cached_tokens: cachedTokens,
-      total_tokens: totalTokens,
-      completion_tokens_details: {
-        ...compDetails,
+    if (boundChatId) {
+      const hasContent = content.length > 0 || (reasoningContent !== undefined && reasoningContent.length > 0);
+      const metrics: PlaygroundMessageMetrics = {
+        ttftMs,
+        tokensPerSec,
+        promptTokens,
+        completionTokens,
+        reasoningTokens,
+      };
+      if (hasContent) {
+        persistAssistantMessageSafe(content, reasoningContent ?? null, metrics);
+      } else {
+        const emptyErr = 'Upstream returned an empty response.';
+        persistAssistantMessageSafe(emptyErr, null, { ...metrics, error: emptyErr });
+      }
+    }
+
+    return jsonResponse({
+      ...rawJson,
+      model: typeof rawJson.model === 'string' ? rawJson.model : model,
+      choices,
+      content,
+      ...(reasoningContent !== undefined ? { reasoningContent } : {}),
+      reasoningEffort,
+      ttftMs,
+      ttft_ms: ttftMs,
+      tokensPerSec,
+      tokens_per_sec: tokensPerSec,
+      durationMs,
+      usage: {
+        ...u,
+        promptTokens,
+        completionTokens,
+        reasoningTokens,
+        cachedTokens,
+        totalTokens,
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
         reasoning_tokens: reasoningTokens,
+        cached_tokens: cachedTokens,
+        total_tokens: totalTokens,
+        completion_tokens_details: {
+          ...compDetails,
+          reasoning_tokens: reasoningTokens,
+        },
       },
-    },
-  });
+    });
+  } catch (err) {
+    const errMsg = redactSecretsInText(
+      err instanceof Error ? err.message : 'Failed to read upstream Playground response.',
+    );
+    if (boundChatId) {
+      persistAssistantMessageSafe(errMsg, null, { error: errMsg });
+    }
+    return jsonResponse({ error: errMsg, code: 'upstream_error' }, 502);
+  } finally {
+    if (boundChatId) {
+      markChatGenerating(boundChatId, false);
+    }
+  }
 }

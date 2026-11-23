@@ -7,9 +7,13 @@ import { afterEach, describe, it } from 'node:test';
 
 import { createApp } from '../core/src/app.js';
 import { exportEncryptedBackup, unpackBifrostEnvelopeRaw } from '../core/src/backup.js';
-import { decryptSecret } from '../core/src/crypto.js';
+import { decryptSecret, encryptSecret } from '../core/src/crypto.js';
 import { openDatabase } from '../core/src/db.js';
-import { deriveUserPlaygroundKey } from '../core/src/playground-history.js';
+import { waitForPendingPlaygroundStreamsForTests } from '../core/src/playground.js';
+import {
+  deriveUserPlaygroundKey,
+  resetGeneratingChatsForTests,
+} from '../core/src/playground-history.js';
 
 const tempDirs: string[] = [];
 
@@ -571,6 +575,408 @@ describe('HU-43: Encrypted Per-Account Playground Chat History', () => {
       ).cnt;
       assert.equal(Number(g2ChatsCount), 1);
     } finally {
+      db.close();
+    }
+  });
+
+  it('HU-43b: encrypts per-chat settings (including systemPrompt) with per-user AES-256-GCM key and restores them on GET/PATCH', async () => {
+    resetGeneratingChatsForTests();
+    const dir = makeTempDir();
+    const db = openDatabase(path.join(dir, 'bifrost.db'));
+    const masterKey = randomBytes(32);
+    const app = createApp({ db, masterKey });
+
+    const secretSystemPrompt = 'SUPER-CONFIDENTIAL-SYSTEM-PROMPT-HU43B-887766';
+
+    try {
+      const { admin, guest1 } = await createAdminAndGuests(app);
+
+      // Create chat with encrypted settings
+      const createRes = await app.request('/api/playground/chats', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: guest1.cookie },
+        body: JSON.stringify({
+          title: 'Chat con settings cifrados',
+          modelFullId: 'mock-prov/mock-model',
+          settings: {
+            reasoningEffort: 'high',
+            temperature: 0.4,
+            maxTokens: 2048,
+            systemPrompt: secretSystemPrompt,
+          },
+        }),
+      });
+      assert.equal(createRes.status, 201);
+      const createBody = (await createRes.json()) as {
+        chat: {
+          id: string;
+          inProgress: boolean;
+          settings: {
+            reasoningEffort?: string;
+            temperature?: number | null;
+            maxTokens?: number | null;
+            systemPrompt?: string | null;
+          } | null;
+        };
+      };
+      assert.equal(createBody.chat.inProgress, false);
+      assert.deepEqual(createBody.chat.settings, {
+        reasoningEffort: 'high',
+        temperature: 0.4,
+        maxTokens: 2048,
+        systemPrompt: secretSystemPrompt,
+      });
+
+      // Raw SQLite inspection: encrypted_settings must NOT contain plaintext systemPrompt
+      const rawRow = db
+        .prepare(`SELECT encrypted_settings FROM playground_chats WHERE id = ?`)
+        .get(createBody.chat.id) as { encrypted_settings: Uint8Array };
+      assert.ok(rawRow.encrypted_settings instanceof Uint8Array);
+      const rawSettingsBuf = Buffer.from(rawRow.encrypted_settings);
+      assert.equal(rawSettingsBuf.includes(Buffer.from(secretSystemPrompt, 'utf8')), false);
+
+      // Per-user cryptographic separation: admin key cannot decrypt guest1's settings
+      const adminSubkey = deriveUserPlaygroundKey(masterKey, admin.id);
+      const guest1Subkey = deriveUserPlaygroundKey(masterKey, guest1.id);
+      assert.throws(() => decryptSecret(rawSettingsBuf, adminSubkey));
+      assert.ok(decryptSecret(rawSettingsBuf, guest1Subkey).includes(secretSystemPrompt));
+
+      // Update settings via PATCH and verify GET detail & list return updated settings
+      const updatedPrompt = 'UPDATED-SECRET-SYSTEM-PROMPT-332211';
+      const patchRes = await app.request(`/api/playground/chats/${createBody.chat.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: guest1.cookie },
+        body: JSON.stringify({
+          settings: {
+            reasoningEffort: 'low',
+            temperature: 0.9,
+            maxTokens: 1024,
+            systemPrompt: updatedPrompt,
+          },
+        }),
+      });
+      assert.equal(patchRes.status, 200);
+
+      const detailRes = await app.request(`/api/playground/chats/${createBody.chat.id}`, {
+        headers: { Cookie: guest1.cookie },
+      });
+      assert.equal(detailRes.status, 200);
+      const detailBody = (await detailRes.json()) as {
+        chat: { settings: Record<string, unknown> | null; inProgress: boolean };
+        settings: Record<string, unknown> | null;
+        inProgress: boolean;
+      };
+      assert.equal(detailBody.inProgress, false);
+      assert.equal(detailBody.chat.inProgress, false);
+      assert.deepEqual(detailBody.settings, {
+        reasoningEffort: 'low',
+        temperature: 0.9,
+        maxTokens: 1024,
+        systemPrompt: updatedPrompt,
+      });
+      assert.deepEqual(detailBody.chat.settings, detailBody.settings);
+
+      // Ensure backup & system_logs never leak systemPrompt
+      const backupPassword = 'backup-hu43b-password';
+      const envelope = await exportEncryptedBackup({
+        db,
+        masterKey,
+        password: backupPassword,
+        actingUserId: admin.id,
+        includeProvidersAndConfig: true,
+        includeUsersAndQuotas: true,
+        includeSystemLogs: true,
+      });
+      const rawBackupJson = await unpackBifrostEnvelopeRaw(envelope, backupPassword);
+      assert.equal(rawBackupJson.includes(updatedPrompt), false);
+      assert.equal(rawBackupJson.includes(secretSystemPrompt), false);
+
+      const logsDump = JSON.stringify(db.prepare(`SELECT message, meta_json FROM system_logs`).all());
+      assert.equal(logsDump.includes(updatedPrompt), false);
+      assert.equal(logsDump.includes(secretSystemPrompt), false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('HU-43b: finishes upstream SSE reading & persists complete turn in SQLite even when client cancels stream mid-read, persists errors, supports non-streaming, and blocks foreign chatId for admin', async () => {
+    resetGeneratingChatsForTests();
+    const dir = makeTempDir();
+    const db = openDatabase(path.join(dir, 'bifrost.db'));
+    const masterKey = randomBytes(32);
+
+    let mode: 'stream_disconnect' | 'upstream_error' | 'non_stream' = 'stream_disconnect';
+    let releaseSecondChunk!: () => void;
+    const secondChunkGate = new Promise<void>((resolve) => {
+      releaseSecondChunk = resolve;
+    });
+
+    const mockFetch: typeof fetch = async () => {
+      if (mode === 'upstream_error') {
+        return new Response(
+          JSON.stringify({ error: { message: 'Upstream overloaded 503', type: 'server_error' } }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (mode === 'non_stream') {
+        return new Response(
+          JSON.stringify({
+            id: 'chatcmpl-nonstream-1',
+            object: 'chat.completion',
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: 'Respuesta completa en modo JSON no-streaming.',
+                  reasoning_content: 'Razonamiento no-streaming.',
+                },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: { prompt_tokens: 14, completion_tokens: 9, total_tokens: 23 },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+
+      // Controlled SSE stream that pauses between chunk 1 and chunk 2 so client can cancel mid-read
+      const encoder = new TextEncoder();
+      const upstreamStream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                choices: [{ delta: { reasoning_content: 'Pensando paso 1. ', content: 'Primera parte ' } }],
+              })}\n\n`,
+            ),
+          );
+          await secondChunkGate;
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                choices: [{ delta: { reasoning_content: 'Paso 2.', content: 'y segunda parte completa.' } }],
+                usage: {
+                  prompt_tokens: 20,
+                  completion_tokens: 12,
+                  completion_tokens_details: { reasoning_tokens: 7 },
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(upstreamStream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream; charset=utf-8' },
+      });
+    };
+
+    const app = createApp({ db, masterKey, fetchImpl: mockFetch });
+
+    try {
+      const { admin, guest1 } = await createAdminAndGuests(app);
+
+      // Seed active provider + encrypted key + model
+      const nowSec = Math.floor(Date.now() / 1000);
+      const manifest = {
+        schemaVersion: '1.0',
+        id: 'mock-pg',
+        name: 'Mock Playground Provider',
+        packageType: 'official-json',
+        baseUrl: 'https://mock-pg.example.com/v1',
+        auth: { type: 'bearer', header: 'Authorization', prefix: 'Bearer ' },
+        modelsSource: 'static',
+        staticModels: [{ id: 'demo-model', name: 'Demo Model' }],
+      };
+      db.prepare(
+        `INSERT INTO providers (id, name, package_type, models_source, schema_json, enabled, created_at)
+         VALUES ('mock-pg', 'Mock Playground Provider', 'official-json', 'static', ?, 1, ?)`,
+      ).run(JSON.stringify(manifest), nowSec);
+      db.prepare(
+        `INSERT INTO provider_keys (id, provider_id, label, encrypted_secret, last4, status, created_at)
+         VALUES ('key-mock-pg-1', 'mock-pg', 'Primary', ?, '9999', 'active', ?)`,
+      ).run(encryptSecret('sk-mock-secret-9999', masterKey), nowSec);
+      db.prepare(
+        `INSERT INTO models (full_id, provider_id, model_id, name, modalities_json, capabilities_json, is_free, first_seen_at, active, disabled_by_admin)
+         VALUES ('mock-pg/demo-model', 'mock-pg', 'demo-model', 'Demo Model', '{"input":["text"],"output":["text"]}', '{"tools":false,"reasoning":true,"structuredOutput":false}', 1, ?, 1, 0)`,
+      ).run(nowSec);
+
+      // Guest1 creates a fresh chat ("Nuevo chat")
+      const guestChatRes = await app.request('/api/playground/chats', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: guest1.cookie },
+        body: JSON.stringify({}),
+      });
+      assert.equal(guestChatRes.status, 201);
+      const guestChatId = ((await guestChatRes.json()) as { chat: { id: string } }).chat.id;
+
+      // 1. Privacy isolation: Admin CANNOT use Guest1's chatId in POST /api/playground/chat -> 404
+      const hijackRes = await app.request('/api/playground/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: admin.cookie },
+        body: JSON.stringify({
+          model: 'mock-pg/demo-model',
+          chatId: guestChatId,
+          stream: false,
+          messages: [{ role: 'user', content: 'Admin intentando escribir en chat de guest' }],
+        }),
+      });
+      assert.equal(hijackRes.status, 404);
+
+      // 2. Resilient streaming persistence: Guest1 starts SSE chat and CANCELS mid-stream
+      mode = 'stream_disconnect';
+      const streamRes = await app.request('/api/playground/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          Cookie: guest1.cookie,
+        },
+        body: JSON.stringify({
+          model: 'mock-pg/demo-model',
+          chatId: guestChatId,
+          stream: true,
+          reasoningEffort: 'medium',
+          temperature: 0.6,
+          maxTokens: 512,
+          systemPrompt: 'SYSTEM-PROMPT-CIFRADO-STREAM',
+          messages: [{ role: 'user', content: 'Explícame la resiliencia en streams SSE' }],
+        }),
+      });
+      assert.equal(streamRes.status, 200);
+      assert.ok(streamRes.body);
+
+      // Read only the first chunk, verify inProgress === true while generating, then cancel client reader!
+      const reader = streamRes.body.getReader();
+      const firstChunk = await reader.read();
+      assert.equal(firstChunk.done, false);
+
+      const midDetailRes = await app.request(`/api/playground/chats/${guestChatId}`, {
+        headers: { Cookie: guest1.cookie },
+      });
+      assert.equal(midDetailRes.status, 200);
+      const midDetail = (await midDetailRes.json()) as {
+        chat: { title: string; inProgress: boolean };
+        inProgress: boolean;
+        messages: Array<{ role: string; content: string }>;
+      };
+      assert.equal(midDetail.inProgress, true);
+      assert.equal(midDetail.chat.inProgress, true);
+      assert.equal(midDetail.chat.title, 'Explícame la resiliencia en streams SSE');
+      assert.equal(midDetail.messages.length, 1);
+      assert.equal(midDetail.messages[0]!.role, 'user');
+
+      // Simulate browser reload / tab switch canceling the client stream
+      await reader.cancel();
+
+      // Release remaining upstream chunk and wait for server background pump to finish persisting
+      releaseSecondChunk();
+      await waitForPendingPlaygroundStreamsForTests();
+
+      // Re-open chat: full assistant reply + reasoning + metrics + encrypted settings persisted, inProgress === false!
+      const afterDetailRes = await app.request(`/api/playground/chats/${guestChatId}`, {
+        headers: { Cookie: guest1.cookie },
+      });
+      assert.equal(afterDetailRes.status, 200);
+      const afterDetail = (await afterDetailRes.json()) as {
+        chat: {
+          title: string;
+          modelFullId: string | null;
+          inProgress: boolean;
+          settings: Record<string, unknown> | null;
+        };
+        inProgress: boolean;
+        settings: Record<string, unknown> | null;
+        messages: Array<{
+          role: string;
+          content: string;
+          reasoningContent: string | null;
+          metrics: Record<string, unknown> | null;
+        }>;
+      };
+      assert.equal(afterDetail.inProgress, false);
+      assert.equal(afterDetail.chat.inProgress, false);
+      assert.equal(afterDetail.chat.modelFullId, 'mock-pg/demo-model');
+      assert.deepEqual(afterDetail.settings, {
+        reasoningEffort: 'medium',
+        temperature: 0.6,
+        maxTokens: 512,
+        systemPrompt: 'SYSTEM-PROMPT-CIFRADO-STREAM',
+      });
+      assert.equal(afterDetail.messages.length, 2);
+      assert.equal(afterDetail.messages[1]!.role, 'assistant');
+      assert.equal(afterDetail.messages[1]!.content, 'Primera parte y segunda parte completa.');
+      assert.equal(afterDetail.messages[1]!.reasoningContent, 'Pensando paso 1. Paso 2.');
+      assert.equal(afterDetail.messages[1]!.metrics?.promptTokens, 20);
+      assert.equal(afterDetail.messages[1]!.metrics?.completionTokens, 12);
+      assert.equal(afterDetail.messages[1]!.metrics?.reasoningTokens, 7);
+
+      // 3. Upstream error with chatId persists user prompt AND error message with metrics.error
+      mode = 'upstream_error';
+      const errRes = await app.request('/api/playground/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: guest1.cookie },
+        body: JSON.stringify({
+          model: 'mock-pg/demo-model',
+          chatId: guestChatId,
+          stream: false,
+          messages: [{ role: 'user', content: 'Prompt que provoca error 503' }],
+        }),
+      });
+      assert.equal(errRes.status, 503);
+
+      const errDetailRes = await app.request(`/api/playground/chats/${guestChatId}`, {
+        headers: { Cookie: guest1.cookie },
+      });
+      const errDetail = (await errDetailRes.json()) as {
+        inProgress: boolean;
+        messages: Array<{
+          role: string;
+          content: string;
+          metrics: { error?: string | null } | null;
+        }>;
+      };
+      assert.equal(errDetail.inProgress, false);
+      assert.equal(errDetail.messages.length, 4);
+      assert.equal(errDetail.messages[2]!.role, 'user');
+      assert.equal(errDetail.messages[2]!.content, 'Prompt que provoca error 503');
+      assert.equal(errDetail.messages[3]!.role, 'assistant');
+      assert.match(errDetail.messages[3]!.metrics?.error ?? '', /503|overloaded/i);
+
+      // 4. Non-streaming (stream: false) with chatId persists user + assistant messages automatically
+      mode = 'non_stream';
+      const nonStreamRes = await app.request('/api/playground/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: guest1.cookie },
+        body: JSON.stringify({
+          model: 'mock-pg/demo-model',
+          chatId: guestChatId,
+          stream: false,
+          messages: [{ role: 'user', content: 'Consulta en modo no-streaming' }],
+        }),
+      });
+      assert.equal(nonStreamRes.status, 200);
+
+      const finalDetailRes = await app.request(`/api/playground/chats/${guestChatId}`, {
+        headers: { Cookie: guest1.cookie },
+      });
+      const finalDetail = (await finalDetailRes.json()) as {
+        inProgress: boolean;
+        messages: Array<{ role: string; content: string; reasoningContent: string | null }>;
+      };
+      assert.equal(finalDetail.inProgress, false);
+      assert.equal(finalDetail.messages.length, 6);
+      assert.equal(finalDetail.messages[4]!.content, 'Consulta en modo no-streaming');
+      assert.equal(
+        finalDetail.messages[5]!.content,
+        'Respuesta completa en modo JSON no-streaming.',
+      );
+      assert.equal(finalDetail.messages[5]!.reasoningContent, 'Razonamiento no-streaming.');
+    } finally {
+      resetGeneratingChatsForTests();
       db.close();
     }
   });
