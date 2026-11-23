@@ -21,6 +21,8 @@ export interface SystemUpdatePhaseState {
 
 let currentUpdatePhase: SystemUpdatePhase = 'idle';
 let currentUpdatePhaseMessage: string | null = null;
+let updateInFlight = false;
+let pendingBackgroundUpdate: Promise<void> | null = null;
 
 function setUpdatePhase(phase: SystemUpdatePhase, message: string | null = null): void {
   currentUpdatePhase = phase;
@@ -34,9 +36,17 @@ export function getCurrentUpdatePhase(): SystemUpdatePhaseState {
   };
 }
 
+export async function waitForBackgroundUpdateForTests(): Promise<void> {
+  if (pendingBackgroundUpdate) {
+    await pendingBackgroundUpdate;
+  }
+}
+
 export function resetUpdatePhaseForTests(): void {
   currentUpdatePhase = 'idle';
   currentUpdatePhaseMessage = null;
+  updateInFlight = false;
+  pendingBackgroundUpdate = null;
 }
 
 export interface SystemUpdateStatus {
@@ -362,17 +372,29 @@ export async function triggerSystemUpdate(
     );
   }
 
+  if (updateInFlight) {
+    throw new SystemUpdateError('A system update is already in progress.', 409);
+  }
+  updateInFlight = true;
+
   if (options.db) {
-    const status = await checkSystemUpdate({
-      db: options.db,
-      fetchImpl,
-      forceRefresh: true,
-      runtimeMode,
-      repoDir,
-      watchtowerUrl,
-      currentCommit: options.currentCommit,
-    });
+    let status: SystemUpdateStatus;
+    try {
+      status = await checkSystemUpdate({
+        db: options.db,
+        fetchImpl,
+        forceRefresh: true,
+        runtimeMode,
+        repoDir,
+        watchtowerUrl,
+        currentCommit: options.currentCommit,
+      });
+    } catch (err) {
+      updateInFlight = false;
+      throw err;
+    }
     if (status.currentCommit && status.latestCommit && !status.updateAvailable) {
+      updateInFlight = false;
       return {
         ok: true,
         upToDate: true,
@@ -393,39 +415,39 @@ export async function triggerSystemUpdate(
 
     setUpdatePhase('restarting', 'Watchtower update triggered. Container is restarting…');
 
-    let response: Response;
-    try {
-      response = await fetchImpl(endpoint, {
-        method: 'POST',
-        headers,
-        signal: AbortSignal.timeout(45_000),
-      });
-    } catch (err) {
-      const name = err instanceof Error ? err.name : '';
-      const msg = err instanceof Error ? err.message : String(err);
-      const isExpectedRestartInterrupt =
-        name === 'TimeoutError' ||
-        name === 'AbortError' ||
-        /timeout|aborted|ECONNRESET|socket|closed/i.test(msg);
-      if (isExpectedRestartInterrupt) {
-        return {
-          ok: true,
-          upToDate: false,
-          mode: 'watchtower',
-          message: 'Watchtower update triggered. Container is restarting with the latest image.',
-          restarting: true,
-        };
+    const task = (async () => {
+      try {
+        const response = await fetchImpl(endpoint, {
+          method: 'POST',
+          headers,
+          signal: AbortSignal.timeout(45_000),
+        });
+        if (!response.ok) {
+          const errMsg = `Watchtower returned HTTP ${response.status}`;
+          setUpdatePhase('error', errMsg);
+        }
+      } catch (err) {
+        const name = err instanceof Error ? err.name : '';
+        const msg = err instanceof Error ? err.message : String(err);
+        const isExpectedRestartInterrupt =
+          name === 'TimeoutError' ||
+          name === 'AbortError' ||
+          /timeout|aborted|ECONNRESET|socket|closed/i.test(msg);
+        if (!isExpectedRestartInterrupt) {
+          const errMsg = `Failed to reach Watchtower at ${endpoint}: ${msg}`;
+          setUpdatePhase('error', errMsg);
+        }
+      } finally {
+        updateInFlight = false;
       }
-      const errMsg = `Failed to reach Watchtower at ${endpoint}: ${msg}`;
-      setUpdatePhase('error', errMsg);
-      throw new SystemUpdateError(errMsg, 502);
-    }
+    })();
 
-    if (!response.ok) {
-      const errMsg = `Watchtower returned HTTP ${response.status}`;
-      setUpdatePhase('error', errMsg);
-      throw new SystemUpdateError(errMsg, 502);
-    }
+    pendingBackgroundUpdate = task;
+    void task.finally(() => {
+      if (pendingBackgroundUpdate === task) {
+        pendingBackgroundUpdate = null;
+      }
+    });
 
     return {
       ok: true,
@@ -436,34 +458,44 @@ export async function triggerSystemUpdate(
     };
   }
 
-  // Native mode: git pull --ff-only && npm run build + systemd restart
+  // Native mode: git pull --ff-only && npm run build + systemd restart (in background)
   const runCmd = options.runCommand ?? defaultRunCommand;
-  try {
-    setUpdatePhase('pulling', 'Pulling latest changes from GitHub…');
-    await runCmd('git', ['pull', '--ff-only'], repoDir);
-    setUpdatePhase('building', 'Building Core and Panel…');
-    await runCmd('npm', ['run', 'build'], repoDir);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const errMsg = `Native update failed: ${msg}`;
-    setUpdatePhase('error', errMsg);
-    throw new SystemUpdateError(errMsg, 500);
-  }
+  setUpdatePhase('pulling', 'Pulling latest changes from GitHub…');
 
-  setUpdatePhase('restarting', 'Updated repository and rebuilt Core. Restarting service…');
+  const task = (async () => {
+    try {
+      await runCmd('git', ['pull', '--ff-only'], repoDir);
+      setUpdatePhase('building', 'Building Core and Panel…');
+      await runCmd('npm', ['run', 'build'], repoDir);
+      setUpdatePhase('restarting', 'Updated repository and rebuilt Core. Restarting service…');
 
-  if (options.onRestart) {
-    options.onRestart();
-  } else {
-    const timer = setTimeout(() => process.exit(0), 500);
-    timer.unref();
-  }
+      if (options.onRestart) {
+        options.onRestart();
+      } else {
+        const timer = setTimeout(() => process.exit(0), 500);
+        timer.unref();
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const errMsg = `Native update failed: ${msg}`;
+      setUpdatePhase('error', errMsg);
+    } finally {
+      updateInFlight = false;
+    }
+  })();
+
+  pendingBackgroundUpdate = task;
+  void task.finally(() => {
+    if (pendingBackgroundUpdate === task) {
+      pendingBackgroundUpdate = null;
+    }
+  });
 
   return {
     ok: true,
     upToDate: false,
     mode: 'native',
-    message: 'Updated repository and rebuilt Core. Restarting service...',
+    message: 'Update started in background. Pulling latest changes and rebuilding Core…',
     restarting: true,
   };
 }

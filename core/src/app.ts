@@ -735,7 +735,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         { mode: result.mode, upToDate: Boolean(result.upToDate), triggeredBy: user.username },
         nowSeconds(),
       );
-      return c.json(result);
+      return c.json(result, result.upToDate ? 200 : 202);
     } catch (err) {
       if (err instanceof SystemUpdateError) {
         writeSystemLog(

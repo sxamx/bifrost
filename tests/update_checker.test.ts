@@ -17,6 +17,7 @@ import {
   isCommitUpToDate,
   resetUpdatePhaseForTests,
   triggerSystemUpdate,
+  waitForBackgroundUpdateForTests,
   type SystemUpdatePhase,
   type SystemUpdateStatus,
 } from '../core/src/update-checker.js';
@@ -312,13 +313,15 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
       },
     });
-    assert.equal(wtCalledUrl, 'http://watchtower:8080/v1/update');
-    assert.equal(wtAuthHeader, 'Bearer wt-secret-token');
     assert.equal(wtRes.ok, true);
     assert.equal(wtRes.mode, 'watchtower');
     assert.equal(wtRes.restarting, true);
+    await waitForBackgroundUpdateForTests();
+    assert.equal(wtCalledUrl, 'http://watchtower:8080/v1/update');
+    assert.equal(wtAuthHeader, 'Bearer wt-secret-token');
 
     // Unconfigured Docker throws 409
+    resetUpdatePhaseForTests();
     await assert.rejects(
       () =>
         triggerSystemUpdate({
@@ -328,7 +331,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       (err: unknown) => err instanceof SystemUpdateError && err.status === 409,
     );
 
-    // Native mode runs git pull --ff-only && npm run build and schedules restart
+    // Native mode runs git pull --ff-only && npm run build and schedules restart in background
     const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-core-update-'));
     fs.mkdirSync(path.join(tmpRepo, '.git'));
     const ran: Array<{ cmd: string; args: string[]; cwd: string }> = [];
@@ -348,6 +351,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       assert.equal(nativeRes.ok, true);
       assert.equal(nativeRes.mode, 'native');
       assert.equal(nativeRes.restarting, true);
+      await waitForBackgroundUpdateForTests();
       assert.equal(restarted, true);
       assert.deepEqual(
         ran.map((r) => [r.cmd, ...r.args]),
@@ -433,7 +437,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       });
       assert.equal(unconfiguredRes.status, 409);
 
-      // Docker with Watchtower -> 200
+      // Docker with Watchtower -> 202 Accepted (non-blocking background update)
       process.env.BIFROST_WATCHTOWER_URL = 'http://watchtower.internal:8080';
       process.env.BIFROST_WATCHTOWER_TOKEN = 'wt-token-123';
 
@@ -441,7 +445,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
         method: 'POST',
         headers: { Cookie: adminCookie },
       });
-      assert.equal(okRes.status, 200);
+      assert.equal(okRes.status, 202);
       const okJson = (await okRes.json()) as {
         ok: boolean;
         mode: string;
@@ -451,6 +455,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       assert.equal(okJson.ok, true);
       assert.equal(okJson.mode, 'watchtower');
       assert.equal(okJson.restarting, true);
+      await waitForBackgroundUpdateForTests();
       assert.equal(watchtowerCalls.length, 1);
       assert.equal(watchtowerCalls[0]!.url, 'http://watchtower.internal:8080/v1/update');
       assert.equal(watchtowerCalls[0]!.auth, 'Bearer wt-token-123');
@@ -845,7 +850,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
     const observedPhases: SystemUpdatePhase[] = [];
 
     try {
-      await triggerSystemUpdate({
+      const nativeStart = await triggerSystemUpdate({
         runtimeMode: 'native',
         watchtowerUrl: '',
         repoDir: tmpRepo,
@@ -869,34 +874,36 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
           observedPhases.push(getCurrentUpdatePhase().phase);
         },
       });
+      assert.equal(nativeStart.ok, true);
+      assert.equal(nativeStart.restarting, true);
+      await waitForBackgroundUpdateForTests();
       assert.deepEqual(observedPhases, ['pulling', 'building', 'restarting']);
       assert.equal(getCurrentUpdatePhase().phase, 'restarting');
 
-      // Native failure -> error phase
+      // Native failure in background -> transitions to error phase and releases lock
       resetUpdatePhaseForTests();
-      await assert.rejects(
-        () =>
-          triggerSystemUpdate({
-            runtimeMode: 'native',
-            watchtowerUrl: '',
-            repoDir: tmpRepo,
-            runCommand: async () => {
-              throw new Error('merge conflict');
-            },
-          }),
-        (err: unknown) => err instanceof SystemUpdateError && err.status === 500,
-      );
+      const nativeFailStart = await triggerSystemUpdate({
+        runtimeMode: 'native',
+        watchtowerUrl: '',
+        repoDir: tmpRepo,
+        runCommand: async () => {
+          throw new Error('merge conflict');
+        },
+      });
+      assert.equal(nativeFailStart.ok, true);
+      assert.equal(nativeFailStart.restarting, true);
+      await waitForBackgroundUpdateForTests();
       assert.equal(getCurrentUpdatePhase().phase, 'error');
       assert.match(getCurrentUpdatePhase().message ?? '', /merge conflict/);
     } finally {
       fs.rmSync(tmpRepo, { recursive: true, force: true });
     }
 
-    // Watchtower mode: sets restarting while triggering
+    // Watchtower mode: sets restarting immediately while triggering in background
     resetUpdatePhaseForTests();
     let phaseDuringWtFetch: SystemUpdatePhase | null = null;
     let messageDuringWtFetch: string | null = null;
-    await triggerSystemUpdate({
+    const wtStart = await triggerSystemUpdate({
       runtimeMode: 'docker',
       watchtowerUrl: 'http://watchtower:8080',
       fetchImpl: async () => {
@@ -906,23 +913,202 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
       },
     });
+    assert.equal(wtStart.ok, true);
+    assert.equal(wtStart.restarting, true);
+    await waitForBackgroundUpdateForTests();
     assert.equal(phaseDuringWtFetch, 'restarting');
     assert.equal(messageDuringWtFetch, 'Watchtower update triggered. Container is restarting…');
     assert.equal(getCurrentUpdatePhase().phase, 'restarting');
 
-    // Watchtower unexpected error -> error phase
+    // Watchtower unexpected error in background -> transitions to error phase and releases lock
     resetUpdatePhaseForTests();
-    await assert.rejects(
-      () =>
-        triggerSystemUpdate({
-          runtimeMode: 'docker',
-          watchtowerUrl: 'http://watchtower:8080',
-          fetchImpl: async () => new Response('bad gateway', { status: 502 }),
-        }),
-      (err: unknown) => err instanceof SystemUpdateError && err.status === 502,
-    );
+    const wtFailStart = await triggerSystemUpdate({
+      runtimeMode: 'docker',
+      watchtowerUrl: 'http://watchtower:8080',
+      fetchImpl: async () => new Response('bad gateway', { status: 502 }),
+    });
+    assert.equal(wtFailStart.ok, true);
+    assert.equal(wtFailStart.restarting, true);
+    await waitForBackgroundUpdateForTests();
     assert.equal(getCurrentUpdatePhase().phase, 'error');
     assert.match(getCurrentUpdatePhase().message ?? '', /502/);
+  });
+
+  it('returns 202 immediately without blocking, rejects concurrent triggers with 409, releases lock on background error, and returns 200 when upToDate', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+
+    let resolveWatchtower!: (res: Response) => void;
+    let rejectWatchtower!: (err: Error) => void;
+    let watchtowerAttempt = 0;
+
+    const app = createApp({
+      db,
+      masterKey,
+      currentCommit: '1111111',
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url === GITHUB_COMMITS_MAIN_URL) {
+          return makeGitHubCommitResponse('2222222222222222222222222222222222222222');
+        }
+        watchtowerAttempt += 1;
+        if (watchtowerAttempt === 1) {
+          return new Promise<Response>((resolve, reject) => {
+            resolveWatchtower = resolve;
+            rejectWatchtower = reject;
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+
+    const setupRes = await app.request('http://localhost/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'adminPassword123!' }),
+    });
+    assert.equal(setupRes.status, 201);
+    const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+    const prevRuntime = process.env.BIFROST_RUNTIME;
+    const prevWtUrl = process.env.BIFROST_WATCHTOWER_URL;
+    const prevCommit = process.env.BIFROST_BUILD_COMMIT;
+
+    try {
+      process.env.BIFROST_RUNTIME = 'docker';
+      process.env.BIFROST_WATCHTOWER_URL = 'http://watchtower.internal:8080';
+      process.env.BIFROST_BUILD_COMMIT = '1111111';
+
+      // 1. First trigger returns 202 immediately even though Watchtower fetch is still pending
+      const t0 = Date.now();
+      const firstRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      const elapsedMs = Date.now() - t0;
+      assert.equal(firstRes.status, 202);
+      assert.ok(elapsedMs < 1000, `Expected non-blocking 202 response, took ${elapsedMs}ms`);
+      const firstJson = (await firstRes.json()) as {
+        ok: boolean;
+        upToDate: boolean;
+        mode: string;
+        restarting: boolean;
+      };
+      assert.equal(firstJson.ok, true);
+      assert.equal(firstJson.upToDate, false);
+      assert.equal(firstJson.mode, 'watchtower');
+      assert.equal(firstJson.restarting, true);
+
+      // 2. Concurrent second trigger while update is in flight -> 409 Conflict
+      const secondRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(secondRes.status, 409);
+
+      // 3. Background Watchtower call fails with real network error -> phase becomes 'error' and lock is released
+      rejectWatchtower(new Error('ENOTFOUND watchtower.internal'));
+      await waitForBackgroundUpdateForTests();
+      assert.equal(getCurrentUpdatePhase().phase, 'error');
+      assert.match(getCurrentUpdatePhase().message ?? '', /ENOTFOUND/);
+
+      // Because lock was released on error, a retry is now accepted with 202
+      const retryRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(retryRes.status, 202);
+      await waitForBackgroundUpdateForTests();
+      assert.equal(getCurrentUpdatePhase().phase, 'restarting');
+
+      // 4. When already up-to-date -> returns 200 OK with upToDate: true (no background restart)
+      resetUpdatePhaseForTests();
+      process.env.BIFROST_BUILD_COMMIT = '2222222';
+      const upToDateRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(upToDateRes.status, 200);
+      const upToDateJson = (await upToDateRes.json()) as {
+        ok: boolean;
+        upToDate: boolean;
+        restarting: boolean;
+      };
+      assert.equal(upToDateJson.ok, true);
+      assert.equal(upToDateJson.upToDate, true);
+      assert.equal(upToDateJson.restarting, false);
+
+      // Silence unused variable lint if resolveWatchtower wasn't invoked
+      assert.equal(typeof resolveWatchtower, 'function');
+    } finally {
+      if (prevRuntime === undefined) delete process.env.BIFROST_RUNTIME;
+      else process.env.BIFROST_RUNTIME = prevRuntime;
+      if (prevWtUrl === undefined) delete process.env.BIFROST_WATCHTOWER_URL;
+      else process.env.BIFROST_WATCHTOWER_URL = prevWtUrl;
+      if (prevCommit === undefined) delete process.env.BIFROST_BUILD_COMMIT;
+      else process.env.BIFROST_BUILD_COMMIT = prevCommit;
+    }
+  });
+
+  it('releases updateInFlight lock after Watchtower 200 OK if container survives so a new POST /api/system/update does not 409', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+    let wtCalls = 0;
+
+    const app = createApp({
+      db,
+      masterKey,
+      fetchImpl: async (input) => {
+        if (String(input) === GITHUB_COMMITS_MAIN_URL) {
+          return makeGitHubCommitResponse('2222222222222222222222222222222222222222');
+        }
+        wtCalls += 1;
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+
+    const setupRes = await app.request('http://localhost/api/setup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'adminPassword123!' }),
+    });
+    assert.equal(setupRes.status, 201);
+    const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+    const prevRuntime = process.env.BIFROST_RUNTIME;
+    const prevWtUrl = process.env.BIFROST_WATCHTOWER_URL;
+    const prevCommit = process.env.BIFROST_BUILD_COMMIT;
+
+    try {
+      process.env.BIFROST_RUNTIME = 'docker';
+      process.env.BIFROST_WATCHTOWER_URL = 'http://watchtower.internal:8080';
+      process.env.BIFROST_BUILD_COMMIT = '1111111';
+
+      // First Watchtower trigger completes with 200 OK without killing the process
+      const firstRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(firstRes.status, 202);
+      await waitForBackgroundUpdateForTests();
+      assert.equal(wtCalls, 1);
+
+      // Without calling resetUpdatePhaseForTests(), a subsequent POST must NOT return 409
+      const secondRes = await app.request('http://localhost/api/system/update', {
+        method: 'POST',
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(secondRes.status, 202);
+      await waitForBackgroundUpdateForTests();
+      assert.equal(wtCalls, 2);
+    } finally {
+      if (prevRuntime === undefined) delete process.env.BIFROST_RUNTIME;
+      else process.env.BIFROST_RUNTIME = prevRuntime;
+      if (prevWtUrl === undefined) delete process.env.BIFROST_WATCHTOWER_URL;
+      else process.env.BIFROST_WATCHTOWER_URL = prevWtUrl;
+      if (prevCommit === undefined) delete process.env.BIFROST_BUILD_COMMIT;
+      else process.env.BIFROST_BUILD_COMMIT = prevCommit;
+    }
   });
 });
 
