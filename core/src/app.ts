@@ -72,6 +72,16 @@ import {
 } from './models-sync.js';
 import { handlePlaygroundChat } from './playground.js';
 import {
+  PlaygroundHistoryError,
+  appendPlaygroundMessages,
+  clearPlaygroundChats,
+  createPlaygroundChat,
+  deletePlaygroundChat,
+  getPlaygroundChatDetail,
+  listPlaygroundChats,
+  updatePlaygroundChat,
+} from './playground-history.js';
+import {
   NodeOperationError,
   PUBLIC_IP_WARNING_MESSAGE,
   type UpstreamTlsOptions,
@@ -3279,6 +3289,138 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       isGuestModelAllowed: (userId, modelFullId) => isGuestModelAllowed(userId, modelFullId),
       isProviderOrAllKeysDraining,
     });
+  });
+
+  // --- HU-43: Encrypted Per-Account Playground Chat History (strictly isolated by user.id, no admin override) ---
+
+  app.get('/api/playground/chats', (c) => {
+    const user = c.get('user');
+    const chats = listPlaygroundChats(db, masterKey, user.id);
+    return c.json({ chats });
+  });
+
+  app.post('/api/playground/chats', async (c) => {
+    const user = c.get('user');
+
+    let rawBody: Record<string, unknown> = {};
+    const rawText = await c.req.text();
+    if (rawText.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(rawText) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return c.json({ error: 'Request body must be a JSON object.' }, 400);
+        }
+        rawBody = parsed as Record<string, unknown>;
+      } catch {
+        return c.json({ error: 'Invalid JSON request body.' }, 400);
+      }
+    }
+
+    try {
+      const chat = createPlaygroundChat(db, masterKey, user.id, rawBody, nowSeconds());
+      return c.json({ chat }, 201);
+    } catch (err) {
+      if (err instanceof PlaygroundHistoryError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.get('/api/playground/chats/:id', (c) => {
+    const user = c.get('user');
+    try {
+      const detail = getPlaygroundChatDetail(db, masterKey, user.id, c.req.param('id'));
+      return c.json(detail);
+    } catch (err) {
+      if (err instanceof PlaygroundHistoryError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.patch('/api/playground/chats/:id', async (c) => {
+    const user = c.get('user');
+
+    let rawBody: Record<string, unknown>;
+    try {
+      const parsed = (await c.req.json()) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return c.json({ error: 'Request body must be a JSON object.' }, 400);
+      }
+      rawBody = parsed as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    try {
+      const chat = updatePlaygroundChat(
+        db,
+        masterKey,
+        user.id,
+        c.req.param('id'),
+        rawBody,
+        nowSeconds(),
+      );
+      return c.json({ chat });
+    } catch (err) {
+      if (err instanceof PlaygroundHistoryError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.post('/api/playground/chats/:id/messages', async (c) => {
+    const user = c.get('user');
+
+    let rawBody: Record<string, unknown>;
+    try {
+      const parsed = (await c.req.json()) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return c.json({ error: 'Request body must be a JSON object.' }, 400);
+      }
+      rawBody = parsed as Record<string, unknown>;
+    } catch {
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    }
+
+    try {
+      const result = appendPlaygroundMessages(
+        db,
+        masterKey,
+        user.id,
+        c.req.param('id'),
+        rawBody,
+        nowSeconds(),
+      );
+      return c.json(result, 201);
+    } catch (err) {
+      if (err instanceof PlaygroundHistoryError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.delete('/api/playground/chats/:id', (c) => {
+    const user = c.get('user');
+    try {
+      deletePlaygroundChat(db, user.id, c.req.param('id'));
+      return c.json({ ok: true });
+    } catch (err) {
+      if (err instanceof PlaygroundHistoryError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      throw err;
+    }
+  });
+
+  app.delete('/api/playground/chats', (c) => {
+    const user = c.get('user');
+    const result = clearPlaygroundChats(db, user.id);
+    return c.json(result);
   });
 
   // --- Phase 8: Users, Single-Use Invitations & Encrypted .bifrost.enc Backups (HU-04, HU-05, HU-25, HU-25b) ---

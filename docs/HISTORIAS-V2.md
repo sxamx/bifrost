@@ -1,4 +1,4 @@
-# Historias de Usuario — V2 (`HU-27` a `HU-42`)
+# Historias de Usuario — V2 (`HU-27` a `HU-43`)
 
 Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`). Todas las historias siguen el formato de criterios de aceptación verificables y mantienen las garantías de seguridad y arquitectura descritas en [`DECISIONS.md`](DECISIONS.md) y [`ARQUITECTURA.md`](ARQUITECTURA.md).
 
@@ -214,6 +214,32 @@ Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`
 4. **Resolución determinista de colisiones de ID:**
    - Cuando dos o más fuentes activas exponen un proveedor con el mismo `id`, la resolución es determinista: tiene prioridad el repositorio oficial (`isOfficial = true`) y, en caso de empate entre repositorios personalizados, prevalece el registrado más tempranamente (`createdAt` / orden de registro más antiguo).
    - Cada tarjeta del catálogo muestra un distintivo (*badge*) con el origen (`sourceName` / `sourceId` o indicador oficial) del repositorio que aporta ese manifiesto.
+
+---
+
+### HU-43 — Historial de chats del Playground cifrado y estrictamente privado por cuenta
+
+**Como** usuario o administrador de Bifrost que utiliza el Playground,  
+**quiero** que mis conversaciones del Playground se guarden automáticamente de forma cifrada en reposo y estrictamente aislada a mi propia cuenta,  
+**para** poder retomar, renombrar o limpiar mis chats en cualquier momento con la garantía de que ninguna otra cuenta —ni siquiera un administrador— puede leer, listar, modificar ni exportar mis conversaciones.
+
+**Criterios de aceptación:**
+1. **Aislamiento absoluto por cuenta (`user_id`):**
+   - Cada operación autenticada (`GET`, `POST`, `PATCH`, `DELETE`) sobre `/api/playground/chats` y `/api/playground/chats/:id[/messages]` filtra estrictamente por el `user.id` de la sesión activa (`WHERE id = ? AND user_id = ?`).
+   - No existen overrides de rol `admin` ni parámetros `?userId=`. Ni un `admin` puede acceder a chats de un `guest` ni viceversa; cualquier intento sobre un `chatId` ajeno devuelve HTTP `404`.
+2. **Cifrado en reposo por usuario (AES-256-GCM):**
+   - El servidor deriva una subclave única de 32 bytes por usuario (`HMAC-SHA256(masterKey, "bifrost-playground-chat:" + userId)`) y cifra con AES-256-GCM (`encryptSecret` / `decryptSecret`) el título (`encrypted_title`), el contenido del mensaje (`encrypted_content`) y el razonamiento (`encrypted_reasoning`).
+   - En SQLite (`playground_chats` y `playground_messages`) nunca se persiste texto plano de títulos, prompts, razonamientos ni respuestas; `metrics_json` almacena únicamente métricas numéricas (`ttftMs`, `tokensPerSec`, `promptTokens`, `completionTokens`, `reasoningTokens`).
+3. **Gestión completa de conversaciones y auto-título:**
+   - Endpoints disponibles para cualquier cuenta autenticada (`admin` o `guest`): `GET /api/playground/chats`, `POST /api/playground/chats`, `GET /api/playground/chats/:id`, `PATCH /api/playground/chats/:id`, `POST /api/playground/chats/:id/messages`, `DELETE /api/playground/chats/:id` y `DELETE /api/playground/chats`.
+   - Al añadir el primer mensaje de usuario en un chat con título por defecto `"Nuevo chat"`, el backend genera automáticamente un título corto a partir del contenido y actualiza `updated_at`.
+4. **Cero fugas de privacidad y borrado en cascada:**
+   - El tráfico de `/v1/*` (`/v1/chat/completions`, `/v1/embeddings`) mantiene su diseño 100% *zero-knowledge* (nunca guarda prompts ni respuestas).
+   - `system_logs` nunca registra títulos, prompts ni respuestas de chats del Playground.
+   - Los backups cifrados `.bifrost.enc` (`exportBackup`) excluyen explícitamente `playground_chats` y `playground_messages` para que el administrador no pueda leer conversaciones de invitados al exportar una copia.
+   - Al eliminar una cuenta (`DELETE /api/users/:id`), sus `playground_chats` y `playground_messages` se eliminan automáticamente mediante `ON DELETE CASCADE`.
+5. **Interfaz en `PlaygroundTab.tsx`:**
+   - Barra lateral con la lista de chats propios ordenados por actividad reciente, botón **Nuevo chat**, acciones para **renombrar**, **eliminar chat** y **limpiar todo el historial**, más un aviso claro de cifrado privado por cuenta.
 
 ---
 

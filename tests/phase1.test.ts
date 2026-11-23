@@ -75,6 +75,8 @@ describe('Phase 1 Backend Acceptance Tests', () => {
           'marketplace_sources',
           'models',
           'nodes',
+          'playground_chats',
+          'playground_messages',
           'provider_keys',
           'providers',
           'sessions',
