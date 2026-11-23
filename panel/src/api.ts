@@ -4,6 +4,8 @@ import type {
   ActivityRange,
   ActivitySeriesItem,
   AddProviderKeyInput,
+  AppendPlaygroundMessageInput,
+  AppendPlaygroundMessagesResult,
   ArtificialWatchAxis,
   ArtificialWatchBenchmarkBlock,
   AuthSuccessResponse,
@@ -38,8 +40,13 @@ import type {
   NodeAssignedKeyRef,
   OpenChartsBenchmarkBlock,
   PercentileTuple,
+  PlaygroundChatDetail,
+  PlaygroundChatMessage,
   PlaygroundChatRequest,
   PlaygroundChatResponse,
+  PlaygroundChatSummary,
+  PlaygroundMessageMetrics,
+  PlaygroundMessageRole,
   ProviderAdaptiveQuota,
   ProviderCacheEntry,
   ProviderKeyItem,
@@ -2491,4 +2498,166 @@ export const api = {
       method: 'POST',
     });
   },
+
+  /* Playground Encrypted Chat History (HU-43) */
+
+  async getPlaygroundChats(): Promise<PlaygroundChatSummary[]> {
+    const raw = await request<unknown>('/api/playground/chats', { method: 'GET' });
+    const r = asRecord(raw);
+    const list = Array.isArray(r.chats) ? r.chats : Array.isArray(raw) ? raw : [];
+    return list.map(normalizePlaygroundChatSummary);
+  },
+
+  async createPlaygroundChat(input?: {
+    title?: string;
+    modelFullId?: string | null;
+  }): Promise<PlaygroundChatSummary> {
+    const raw = await request<unknown>('/api/playground/chats', {
+      method: 'POST',
+      body: JSON.stringify(input ?? {}),
+    });
+    const r = asRecord(raw);
+    return normalizePlaygroundChatSummary(r.chat ?? raw);
+  },
+
+  async getPlaygroundChat(chatId: string): Promise<PlaygroundChatDetail> {
+    const raw = await request<unknown>(
+      `/api/playground/chats/${encodeURIComponent(chatId)}`,
+      { method: 'GET' }
+    );
+    const r = asRecord(raw);
+    const messagesRaw = Array.isArray(r.messages) ? r.messages : [];
+    return {
+      chat: normalizePlaygroundChatSummary(r.chat),
+      messages: messagesRaw.map(normalizePlaygroundChatMessage),
+    };
+  },
+
+  async updatePlaygroundChat(
+    chatId: string,
+    input: { title?: string; modelFullId?: string | null }
+  ): Promise<PlaygroundChatSummary> {
+    const raw = await request<unknown>(
+      `/api/playground/chats/${encodeURIComponent(chatId)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(input),
+      }
+    );
+    const r = asRecord(raw);
+    return normalizePlaygroundChatSummary(r.chat ?? raw);
+  },
+
+  async appendPlaygroundMessage(
+    chatId: string,
+    input: AppendPlaygroundMessageInput | { messages: AppendPlaygroundMessageInput[] }
+  ): Promise<AppendPlaygroundMessagesResult> {
+    const raw = await request<unknown>(
+      `/api/playground/chats/${encodeURIComponent(chatId)}/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify(input),
+      }
+    );
+    const r = asRecord(raw);
+    const messagesRaw = Array.isArray(r.messages)
+      ? r.messages
+      : r.message
+        ? [r.message]
+        : [];
+    const messages = messagesRaw.map(normalizePlaygroundChatMessage);
+    const message = r.message
+      ? normalizePlaygroundChatMessage(r.message)
+      : messages[0]!;
+    return {
+      chat: normalizePlaygroundChatSummary(r.chat),
+      message,
+      messages,
+    };
+  },
+
+  deletePlaygroundChat(chatId: string): Promise<{ ok: boolean }> {
+    return request<{ ok: boolean }>(
+      `/api/playground/chats/${encodeURIComponent(chatId)}`,
+      { method: 'DELETE' }
+    );
+  },
+
+  clearPlaygroundChats(): Promise<{ ok: boolean; deletedCount: number }> {
+    return request<{ ok: boolean; deletedCount: number }>('/api/playground/chats', {
+      method: 'DELETE',
+    });
+  },
 };
+
+function normalizePlaygroundChatSummary(raw: unknown): PlaygroundChatSummary {
+  const r = asRecord(raw);
+  return {
+    id: String(r.id ?? ''),
+    title: String(r.title ?? 'Nuevo chat'),
+    modelFullId:
+      typeof r.modelFullId === 'string'
+        ? r.modelFullId
+        : typeof r.model_full_id === 'string'
+          ? r.model_full_id
+          : null,
+    messageCount: asNum(r.messageCount ?? r.message_count, 0),
+    createdAt: asNum(r.createdAt ?? r.created_at, 0),
+    updatedAt: asNum(r.updatedAt ?? r.updated_at, 0),
+  };
+}
+
+function normalizePlaygroundMessageMetrics(raw: unknown): PlaygroundMessageMetrics | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = asRecord(raw);
+  const out: PlaygroundMessageMetrics = {};
+  let hasAny = false;
+  if ('ttftMs' in r) {
+    out.ttftMs = asNullableNum(r.ttftMs);
+    hasAny = true;
+  }
+  if ('tokensPerSec' in r) {
+    out.tokensPerSec = asNullableNum(r.tokensPerSec);
+    hasAny = true;
+  }
+  if ('promptTokens' in r) {
+    out.promptTokens = asNullableNum(r.promptTokens);
+    hasAny = true;
+  }
+  if ('completionTokens' in r) {
+    out.completionTokens = asNullableNum(r.completionTokens);
+    hasAny = true;
+  }
+  if ('reasoningTokens' in r) {
+    out.reasoningTokens = asNullableNum(r.reasoningTokens);
+    hasAny = true;
+  }
+  return hasAny ? out : null;
+}
+
+function normalizePlaygroundChatMessage(raw: unknown): PlaygroundChatMessage {
+  const r = asRecord(raw);
+  const rawRole = r.role;
+  const role: PlaygroundMessageRole =
+    rawRole === 'assistant' || rawRole === 'system' ? rawRole : 'user';
+  return {
+    id: String(r.id ?? ''),
+    chatId: String(r.chatId ?? r.chat_id ?? ''),
+    role,
+    content: String(r.content ?? ''),
+    reasoningContent:
+      typeof r.reasoningContent === 'string'
+        ? r.reasoningContent
+        : typeof r.reasoning_content === 'string'
+          ? r.reasoning_content
+          : null,
+    modelFullId:
+      typeof r.modelFullId === 'string'
+        ? r.modelFullId
+        : typeof r.model_full_id === 'string'
+          ? r.model_full_id
+          : null,
+    metrics: normalizePlaygroundMessageMetrics(r.metrics),
+    createdAt: asNum(r.createdAt ?? r.created_at, 0),
+  };
+}

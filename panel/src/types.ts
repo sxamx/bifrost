@@ -185,6 +185,57 @@ export interface PlaygroundChatResponse {
   };
 }
 
+/* HU-43 — Encrypted Per-Account Playground Chat History */
+
+export type PlaygroundMessageRole = 'user' | 'assistant' | 'system';
+
+export interface PlaygroundMessageMetrics {
+  ttftMs?: number | null;
+  tokensPerSec?: number | null;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  reasoningTokens?: number | null;
+}
+
+export interface PlaygroundChatSummary {
+  id: string;
+  title: string;
+  modelFullId: string | null;
+  messageCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PlaygroundChatMessage {
+  id: string;
+  chatId: string;
+  role: PlaygroundMessageRole;
+  content: string;
+  reasoningContent: string | null;
+  modelFullId: string | null;
+  metrics: PlaygroundMessageMetrics | null;
+  createdAt: number;
+}
+
+export interface PlaygroundChatDetail {
+  chat: PlaygroundChatSummary;
+  messages: PlaygroundChatMessage[];
+}
+
+export interface AppendPlaygroundMessageInput {
+  role: PlaygroundMessageRole;
+  content: string;
+  reasoningContent?: string | null;
+  modelFullId?: string | null;
+  metrics?: PlaygroundMessageMetrics | null;
+}
+
+export interface AppendPlaygroundMessagesResult {
+  chat: PlaygroundChatSummary;
+  message: PlaygroundChatMessage;
+  messages: PlaygroundChatMessage[];
+}
+
 /* Phase 8 — Users, Invitations (HU-04, HU-05) & Encrypted Backups (HU-25, HU-25b) */
 
 export interface ManagedUserItem {

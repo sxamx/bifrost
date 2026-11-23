@@ -193,6 +193,34 @@ CREATE TABLE IF NOT EXISTS marketplace_sources (
   last_error TEXT,
   created_at INTEGER NOT NULL
 );
+
+-- Historial de chats del Playground cifrado y privado por cuenta (HU-43)
+CREATE TABLE IF NOT EXISTS playground_chats (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  encrypted_title BLOB NOT NULL,
+  model_full_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_playground_chats_user_updated
+  ON playground_chats(user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS playground_messages (
+  id TEXT PRIMARY KEY,
+  chat_id TEXT NOT NULL REFERENCES playground_chats(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+  encrypted_content BLOB NOT NULL,
+  encrypted_reasoning BLOB,
+  model_full_id TEXT,
+  metrics_json TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_playground_messages_chat_created
+  ON playground_messages(chat_id, created_at ASC);
 `;
 
 function ensureNodesColumns(db: DatabaseSync): void {
