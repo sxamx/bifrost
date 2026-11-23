@@ -2889,6 +2889,58 @@ select.input {
   gap: 10px;
 }
 
+.pg-inprogress-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent-border);
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.pg-pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: bf-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes bf-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+.chat-bubble.assistant.has-error {
+  border-color: rgba(244, 63, 94, 0.35);
+}
+
+.pg-turn-error {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: var(--err-soft);
+  border: 1px solid rgba(244, 63, 94, 0.28);
+  color: var(--err);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
 .playground-params-card {
   padding: 18px 20px;
 }

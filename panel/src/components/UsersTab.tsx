@@ -604,6 +604,7 @@ export const UsersTab: React.FC = () => {
                   <th>ID</th>
                   <th>Cuota asignada</th>
                   <th>Estado</th>
+                  <th>Canjeada por</th>
                   <th>Expira</th>
                   <th style={{ textAlign: 'right' }}>Acción</th>
                 </tr>
@@ -635,6 +636,13 @@ export const UsersTab: React.FC = () => {
                           <span className="status-badge error">Expirada</span>
                         ) : (
                           <span className="status-badge active">Pendiente</span>
+                        )}
+                      </td>
+                      <td>
+                        {inv.usedAt && inv.usedByUsername ? (
+                          <span className="meta-tag accent mono">@{inv.usedByUsername}</span>
+                        ) : (
+                          <span className="field-hint">—</span>
                         )}
                       </td>
                       <td style={{ color: 'var(--sub)', fontSize: '0.85rem' }}>
