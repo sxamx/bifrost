@@ -198,12 +198,12 @@ Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`
 ### HU-42 — Marketplace multi-repositorio opt-in, versionado de catálogo y actualización en sitio de proveedores
 
 **Como** administrador de Bifrost,  
-**quiero** poder activar opcionalmente el repositorio oficial recomendado (`sxamx/bifrost-providers`) o añadir múltiples repositorios HTTPS externos de manifiestos, consultar las versiones del catálogo y comprobar si existen actualizaciones para los proveedores ya instalados,  
+**quiero** poder activar opcionalmente el repositorio oficial recomendado (`mazzapata/providers`) o añadir múltiples repositorios HTTPS externos de manifiestos, consultar las versiones del catálogo y comprobar si existen actualizaciones para los proveedores ya instalados,  
 **para** descubrir nuevos proveedores sin descargas externas obligatorias por defecto y actualizar en sitio sus manifiestos (`schema_json`) sin perder claves, modelos ni historial de uso.
 
 **Criterios de aceptación:**
 1. **Repositorios multi-fuente opt-in y validación SSRF:**
-   - El repositorio oficial recomendado (`sxamx/bifrost-providers`) viene pre-registrado en el Core con `enabled = false` por defecto (modelo *opt-in*: mientras no sea activado explícitamente por el administrador, el catálogo no realiza consultas remotas externas y utiliza únicamente el catálogo local integrado).
+   - El repositorio oficial recomendado (`mazzapata/providers`) viene pre-registrado en el Core con `enabled = false` por defecto (modelo *opt-in*: mientras no sea activado explícitamente por el administrador, el catálogo no realiza consultas remotas externas y utiliza únicamente el catálogo local integrado).
    - El administrador puede añadir, habilitar, deshabilitar y eliminar múltiples repositorios HTTPS personalizados mediante los endpoints `/api/marketplace/sources`, aplicando validación SSRF estricta sobre cada URL de índice remota (bloqueo de esquemas no HTTPS, IPs privadas/loopback/link-local y redirecciones inseguras).
 2. **Versionado de catálogo y comprobación bajo demanda:**
    - Los manifiestos y el catálogo exponen metadatos de versión (`catalogVersion`, `manifestVersion` y `manifestHash`) que la interfaz muestra en el encabezado del Marketplace y en cada tarjeta de proveedor.
@@ -279,15 +279,15 @@ Continuación del backlog funcional de Bifrost tras la v1.0.0 (`HU-01` a `HU-26`
 
 ## Prioridad P3 — Planificado / Documentado (Cuotas adaptativas y Marketplace)
 
-### HU-38 — Metadatos de límite en el marketplace (`bifrost-providers`)
+### HU-38 — Metadatos de límite en el marketplace (`mazzapata/providers`)
 
 **Como** mantenedor del marketplace y usuario de Bifrost,  
-**quiero** que los manifiestos de proveedores en `bifrost-providers` declaren el tipo de límite de su capa gratuita (`none` / `requests` / `tokens`),  
+**quiero** que los manifiestos de proveedores en `mazzapata/providers` declaren el tipo de límite de su capa gratuita (`none` / `requests` / `tokens`),  
 **para** que Bifrost interprete correctamente la cuota de cada proveedor sin suposiciones erróneas.
 
 **Criterios de aceptación (planificado):**
 1. El esquema de `ProviderManifest` incorpora un campo opcional de metadatos de cuota (por ejemplo `rateLimitKind: 'none' | 'requests' | 'tokens'` y ventanas soportadas).
-2. Los manifiestos existentes y nuevos en `bifrost-providers` pueden declarar si el proveedor no aplica cuota fija (`none`), limita por número de peticiones (`requests`) o limita por volumen de tokens (`tokens`).
+2. Los manifiestos existentes y nuevos en `mazzapata/providers` pueden declarar si el proveedor no aplica cuota fija (`none`), limita por número de peticiones (`requests`) o limita por volumen de tokens (`tokens`).
 3. El panel muestra esta clasificación en la ficha del proveedor instalado y la utiliza como entrada para el medidor de cuota.
 
 ---

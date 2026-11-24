@@ -4,7 +4,7 @@
 
 Bifrost unifica las cuotas gratuitas de múltiples proveedores y cuentas detrás de un único punto de entrada (`/v1/chat/completions` y `/v1/models`), cifra todas las credenciales en reposo con `AES-256-GCM`, reparte cada clave por un nodo de salida dedicado de cero conocimiento y ofrece un panel web progresivo (PWA) con telemetría local, cuotas diarias en UTC para invitados y respaldos cifrados portables.
 
-La aplicación se instala **vacía por diseño**: no incluye claves, cuentas ni proveedores preinstalados. Cada administrador instala bajo demanda únicamente las integraciones que necesita desde el catálogo declarativo [`sxamx/bifrost-providers`](https://github.com/sxamx/bifrost-providers).
+La aplicación se instala **vacía por diseño**: no incluye claves, cuentas ni proveedores preinstalados. Cada administrador instala bajo demanda únicamente las integraciones que necesita desde el catálogo declarativo [`mazzapata/providers`](https://github.com/mazzapata/providers).
 
 ---
 
@@ -37,7 +37,7 @@ La aplicación se instala **vacía por diseño**: no incluye claves, cuentas ni 
 flowchart LR
   C["Clientes OpenAI\n(Zed, Cursor, OpenCode, SDKs)\nBearer sk-bf-..."] -->|"HTTP / HTTPS\n/v1/*"| CORE["core/\nHono + Node.js + SQLite WAL\nAES-256-GCM · Cuotas UTC · Failover"]
   PANEL["panel/ (PWA)\nReact + Vite + TypeScript"] <-->|"/api/*"| CORE
-  CORE <-->|"Catálogo declarativo"| MP["sxamx/bifrost-providers\n(official-json / experimental-adapter)"]
+  CORE <-->|"Catálogo declarativo"| MP["mazzapata/providers\n(official-json / experimental-adapter)"]
   CORE -->|"Túnel TCP HTTP CONNECT\n(TLS extremo a extremo desde core/)"| NODE["nodes/\nAgente ligero zero-knowledge\n(Tailscale o TLS con huella SHA-256)"]
   NODE -->|"Bytes TLS cifrados"| UP["APIs oficiales de proveedores\n(OpenRouter, Groq, NVIDIA NIM, Google AI Studio...)"]
 ```
@@ -45,7 +45,7 @@ flowchart LR
 - **[`core/`](core/) — Núcleo y enrutador HTTP:** servidor en TypeScript sobre **Hono** y **Node.js** (≥ 22 LTS) con base de datos **SQLite** en modo `WAL`. Expone la API compatible con OpenAI (`/v1/*`), la API interna del panel (`/api/*`) y sirve los archivos compilados del panel en un único proceso y puerto (`8080` por defecto). Gestiona rotación y *failover* automático entre claves ante límites `429` o fallos de red, reanudación transparente de respuestas SSE cortadas a mitad de generación, sincronización automática de modelos cada 6 horas (`modelsSource: "api"`) y cálculo local de métricas (percentiles `P50`–`P99` de TTFT y `tok/s`, volumen de tokens `prompt`/`completion`/`reasoning` y *uptime* de 60 días calculado sobre peticiones reales sin *pings* sintéticos).
 - **[`panel/`](panel/) — Panel web progresivo (PWA):** interfaz en React + Vite + TypeScript instalable en escritorio y móvil (`manifest.webmanifest` + *Service Worker*). Incluye asistente de puesta en marcha, resumen diario de cuotas, gestión de proveedores y múltiples claves cifradas, catálogo enriquecido con comparativas, *Playground* interactivo con medición en vivo de `TTFT` y `tok/s`, visor de registros con redacción automática de secretos y gestión de respaldos.
 - **[`nodes/`](nodes/) — Nodos de salida de cero conocimiento (*zero-knowledge*):** agente independiente para máquinas virtuales remotas que opera exclusivamente como túnel TCP transparente mediante `HTTP CONNECT`. El núcleo establece la sesión TLS de extremo a extremo directamente contra el proveedor de destino; el nodo jamás recibe claves API, cabeceras HTTP ni el contenido de los *prompts* o respuestas. Emplea tokens autenticados con rotación automática cada 24 horas (ventana de gracia de 5 minutos) y *heartbeat* cada 30 segundos.
-- **[`sxamx/bifrost-providers`](https://github.com/sxamx/bifrost-providers) — Catálogo de proveedores:** repositorio comunitario curado donde cada proveedor se describe como datos declarativos validados contra [`schemas/provider.schema.json`](schemas/provider.schema.json):
+- **[`mazzapata/providers`](https://github.com/mazzapata/providers) — Catálogo de proveedores:** repositorio comunitario curado donde cada proveedor se describe como datos declarativos validados contra [`schemas/provider.schema.json`](schemas/provider.schema.json):
   - `official-json`: fichas JSON puras para APIs oficiales compatibles con OpenAI (cero código ejecutable).
   - `experimental-adapter`: adaptadores aislados en un proceso o contenedor externo (*sidecar*) que exponen un endpoint local compatible con OpenAI.
 
@@ -118,7 +118,7 @@ En Docker Compose pueden definirse en un archivo `.env` junto a `docker-compose.
 | `BIFROST_PORT` | `8080` | Puerto publicado en el host al usar `docker-compose.yml`. |
 | `DATA_DIR` | `/data` (Docker) / `/var/lib/bifrost` (`systemd`) | Directorio persistente (`0700`) para `bifrost.db` y `master.key`. |
 | `BIFROST_MASTER_KEY` | *(vacío; usa `master.key`)* | Llave maestra opcional de 32 bytes codificada en hexadecimal (64 caracteres) o Base64. |
-| `BIFROST_MARKETPLACE_URL` | Índice oficial `sxamx/bifrost-providers` | URL del índice JSON del catálogo de proveedores. |
+| `BIFROST_MARKETPLACE_URL` | Índice oficial `mazzapata/providers` | URL del índice JSON del catálogo de proveedores. |
 | `PANEL_DIST_DIR` | `/app/panel/dist` / `/opt/bifrost/panel/dist` | Ruta a los archivos estáticos compilados del panel web. |
 
 ---
@@ -333,7 +333,7 @@ Cada instancia de Bifrost consulta bajo demanda y almacena en su caché local SQ
 - [Decisiones de arquitectura y seguridad](docs/DECISIONS.md)
 - [Arquitectura técnica, esquema SQLite y contratos HTTP](docs/ARQUITECTURA.md)
 - [Protocolo de cero conocimiento núcleo ↔ nodo de salida](docs/PROTOCOLO-NODOS.md)
-- [Catálogo oficial y comunitario de proveedores (`sxamx/bifrost-providers`)](https://github.com/sxamx/bifrost-providers)
+- [Catálogo oficial y comunitario de proveedores (`mazzapata/providers`)](https://github.com/mazzapata/providers)
 
 ---
 

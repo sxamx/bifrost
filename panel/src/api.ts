@@ -2149,7 +2149,7 @@ export const api = {
         notice:
           err instanceof Error
             ? err.message
-            : 'No se pudo consultar el catálogo remoto bifrost-providers.',
+            : 'No se pudo consultar el catálogo remoto de proveedores.',
       };
     }
   },

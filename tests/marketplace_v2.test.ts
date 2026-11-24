@@ -5,7 +5,11 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { createApp } from '../core/src/app.js';
 import { hashPassword, resolveMasterKey } from '../core/src/crypto.js';
-import { openDatabase } from '../core/src/db.js';
+import {
+  OFFICIAL_MARKETPLACE_SOURCE_NAME,
+  OFFICIAL_MARKETPLACE_SOURCE_URL,
+  openDatabase,
+} from '../core/src/db.js';
 import { computeManifestHash } from '../core/src/marketplace.js';
 
 function makeTempDir(): string {
@@ -73,11 +77,12 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       assert.equal(body.updatesAvailableCount, 0);
       assert.equal(body.sources.length, 1);
       assert.equal(body.sources[0]!.id, 'official');
+      assert.equal(body.sources[0]!.name, 'Catálogo Oficial (mazzapata/providers)');
       assert.equal(body.sources[0]!.isOfficial, true);
       assert.equal(body.sources[0]!.enabled, false);
       assert.equal(
         body.sources[0]!.url,
-        'https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json',
+        'https://raw.githubusercontent.com/mazzapata/providers/main/index.json',
       );
 
       db.close();
@@ -262,7 +267,7 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       const mockFetch: typeof fetch = async (input) => {
         const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
 
-        if (url === 'https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json') {
+        if (url === 'https://raw.githubusercontent.com/mazzapata/providers/main/index.json') {
           officialFetches += 1;
           return new Response(
             JSON.stringify({
@@ -520,6 +525,102 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       assert.equal(delCommunity.status, 200);
 
       db.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('migrates legacy official marketplace URL cleanly to mazzapata/providers and handles UNIQUE(url) conflict safely', async () => {
+    const tmpDir = makeTempDir();
+    const dbPath = path.join(tmpDir, 'migrate-official.db');
+    const legacyUrl = 'https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json';
+    try {
+      // 1. Standard migration from legacy official URL -> new official URL + cache cleanup
+      const db1 = openDatabase(dbPath);
+      db1
+        .prepare(
+          `UPDATE marketplace_sources
+           SET name = 'Legacy Official', url = ?, enabled = 1,
+               catalog_version = '2026-11-01', last_checked_at = 1700000000, last_error = 'old err'
+           WHERE id = 'official'`,
+        )
+        .run(legacyUrl);
+      db1
+        .prepare(
+          `INSERT OR REPLACE INTO external_cache (cache_key, payload_json, etag, fetched_at)
+           VALUES ('marketplace_source:official', '{}', NULL, 1700000000),
+                  ('marketplace:index', '{}', NULL, 1700000000),
+                  ('marketplace:unapproved', '{}', NULL, 1700000000),
+                  ('unrelated_cache', '{}', NULL, 1700000000)`,
+        )
+        .run();
+      db1.close();
+
+      // Re-opening runs ensureOfficialMarketplaceSource migration
+      const db2 = openDatabase(dbPath);
+      const migrated = db2
+        .prepare(
+          `SELECT id, name, url, is_official, enabled, catalog_version, last_checked_at, last_error
+           FROM marketplace_sources WHERE id = 'official'`,
+        )
+        .get() as {
+        id: string;
+        name: string;
+        url: string;
+        is_official: number;
+        enabled: number;
+        catalog_version: string | null;
+        last_checked_at: number | null;
+        last_error: string | null;
+      };
+      assert.equal(migrated.name, OFFICIAL_MARKETPLACE_SOURCE_NAME);
+      assert.equal(migrated.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
+      assert.equal(migrated.is_official, 1);
+      assert.equal(migrated.enabled, 1);
+      assert.equal(migrated.catalog_version, null);
+      assert.equal(migrated.last_checked_at, null);
+      assert.equal(migrated.last_error, null);
+
+      const cacheKeys = (
+        db2
+          .prepare(`SELECT cache_key FROM external_cache ORDER BY cache_key`)
+          .all() as Array<{ cache_key: string }>
+      ).map((r) => r.cache_key);
+      assert.deepEqual(cacheKeys, ['unrelated_cache']);
+
+      // 2. Edge case: user already added mazzapata/providers as a custom source -> no UNIQUE(url) crash on DB init OR createApp(marketplaceUrl)
+      db2
+        .prepare(`UPDATE marketplace_sources SET url = ?, name = 'Legacy Official' WHERE id = 'official'`)
+        .run(legacyUrl);
+      db2
+        .prepare(
+          `INSERT INTO marketplace_sources (id, name, url, is_official, enabled, created_at)
+           VALUES ('custom-mp', 'Mi Mazzapata', ?, 0, 0, 1700000001)`,
+        )
+        .run(OFFICIAL_MARKETPLACE_SOURCE_URL);
+      db2.close();
+
+      // Must open cleanly without throwing UNIQUE constraint error
+      const db3 = openDatabase(dbPath);
+      const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
+      // Must also boot createApp cleanly when BIFROST_MARKETPLACE_URL / marketplaceUrl matches the custom source URL
+      const app = createApp({
+        db: db3,
+        masterKey,
+        marketplaceUrl: OFFICIAL_MARKETPLACE_SOURCE_URL,
+      });
+      const healthRes = await app.request('http://localhost/api/health');
+      assert.equal(healthRes.status, 200);
+
+      const rows = db3
+        .prepare(`SELECT id, url, enabled FROM marketplace_sources ORDER BY id`)
+        .all() as Array<{ id: string; url: string; enabled: number }>;
+      assert.equal(rows.length, 2);
+      const customRow = rows.find((r) => r.id === 'custom-mp');
+      assert.equal(customRow?.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
+      assert.equal(customRow?.enabled, 1);
+      assert.equal(rows.find((r) => r.id === 'official')?.url, legacyUrl);
+      db3.close();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

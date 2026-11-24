@@ -5,7 +5,7 @@ Interfaz web de Bifrost (React + Vite + TypeScript). `core/` sirve los archivos 
 Pantallas previstas, según `design/IDENTIDAD.md`:
 
 - Resumen y cuota del día.
-- Proveedores, marketplace (`bifrost-providers`) y cuentas/claves.
+- Proveedores, marketplace (`mazzapata/providers`) y cuentas/claves.
 - Modelos, con detalle por modelo y benchmarks.
 - Métricas: uptime (60 días), latencia por percentil, velocidad/caché, errores en herramientas y actividad.
 - Logs del sistema y failover (solo admin).

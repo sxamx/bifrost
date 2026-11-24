@@ -375,8 +375,10 @@ function ensureUsageLogsColumns(db: DatabaseSync): void {
 }
 
 export const OFFICIAL_MARKETPLACE_SOURCE_ID = 'official';
-export const OFFICIAL_MARKETPLACE_SOURCE_NAME = 'Bifrost Oficial (sxamx/bifrost-providers)';
+export const OFFICIAL_MARKETPLACE_SOURCE_NAME = 'Catálogo Oficial (mazzapata/providers)';
 export const OFFICIAL_MARKETPLACE_SOURCE_URL =
+  'https://raw.githubusercontent.com/mazzapata/providers/main/index.json';
+const LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL =
   'https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json';
 
 export function ensureProvidersMarketplaceColumns(db: DatabaseSync): void {
@@ -395,8 +397,9 @@ export function ensureProvidersMarketplaceColumns(db: DatabaseSync): void {
 
 function ensureOfficialMarketplaceSource(db: DatabaseSync): void {
   const existing = db
-    .prepare(`SELECT id FROM marketplace_sources WHERE id = ?`)
-    .get(OFFICIAL_MARKETPLACE_SOURCE_ID) as { id: string } | undefined;
+    .prepare(`SELECT id, url FROM marketplace_sources WHERE id = ?`)
+    .get(OFFICIAL_MARKETPLACE_SOURCE_ID) as { id: string; url: string } | undefined;
+
   if (!existing) {
     db.prepare(
       `INSERT OR IGNORE INTO marketplace_sources (
@@ -408,6 +411,30 @@ function ensureOfficialMarketplaceSource(db: DatabaseSync): void {
       OFFICIAL_MARKETPLACE_SOURCE_URL,
       Math.floor(Date.now() / 1000),
     );
+    return;
+  }
+
+  if (existing.url === LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL) {
+    const conflictingRow = db
+      .prepare(`SELECT id FROM marketplace_sources WHERE url = ? AND id != ?`)
+      .get(OFFICIAL_MARKETPLACE_SOURCE_URL, OFFICIAL_MARKETPLACE_SOURCE_ID) as
+      | { id: string }
+      | undefined;
+
+    if (!conflictingRow) {
+      db.prepare(
+        `UPDATE marketplace_sources
+         SET name = ?, url = ?, catalog_version = NULL, last_checked_at = NULL, last_error = NULL
+         WHERE id = ?`,
+      ).run(
+        OFFICIAL_MARKETPLACE_SOURCE_NAME,
+        OFFICIAL_MARKETPLACE_SOURCE_URL,
+        OFFICIAL_MARKETPLACE_SOURCE_ID,
+      );
+      db.prepare(
+        `DELETE FROM external_cache WHERE cache_key IN ('marketplace_source:official', 'marketplace:index', 'marketplace:unapproved')`,
+      ).run();
+    }
   }
 }
 

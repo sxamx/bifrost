@@ -211,7 +211,7 @@ Autenticación: cookie de sesión (`HttpOnly`). Endpoints marcados `[admin]` dev
 - `POST /api/setup` (solo si no existe admin), `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`.
 - `GET/POST/DELETE /api/keys` (API keys internas `sk-bf-...` del usuario autenticado).
 - `GET/POST/DELETE /api/users`, `POST /api/invitations` `[admin]`, `POST /api/invitations/:token/accept`.
-- `GET /api/marketplace` (lee catálogo de `bifrost-providers`), `POST /api/marketplace/install` `[admin]`.
+- `GET /api/marketplace` (lee catálogo de `mazzapata/providers`), `POST /api/marketplace/install` `[admin]`.
 - `GET/POST/DELETE /api/providers`, `POST /api/providers/:id/keys` `[admin]`, `POST /api/providers/:id/detect-models` `[admin]`, `POST /api/providers/:id/reload-models` `[admin]`.
 - `GET/POST/DELETE /api/nodes` `[admin]`, `POST /api/nodes/:id/rotate` `[admin]`.
 - `GET /api/models`, `GET /api/models/:fullId`, `GET /api/models/:fullId/benchmarks`.
@@ -222,9 +222,9 @@ Autenticación: cookie de sesión (`HttpOnly`). Endpoints marcados `[admin]` dev
 
 ---
 
-## 6. Marketplace e integraciones (`bifrost-providers`)
+## 6. Marketplace e integraciones (`mazzapata/providers`)
 
-- **Instalación bajo demanda:** Bifrost arranca vacío. El panel muestra el catálogo remoto de `sxamx/bifrost-providers` y el admin instala solo lo que necesita.
+- **Instalación bajo demanda:** Bifrost arranca vacío. El panel muestra el catálogo remoto de `mazzapata/providers` y el admin instala solo lo que necesita.
 - **Paquetes `official-json`:** contienen únicamente una ficha declarativa validada por `schemas/provider.schema.json`.
 - **Paquetes `experimental-adapter`:** incluyen un manifiesto + proceso/contenedor adaptador aislado que expone un endpoint local compatible con OpenAI (`/v1/chat/completions`, `/v1/models`). Bifrost se comunica con él mediante la ficha del proveedor y gestiona igualmente múltiples cuentas/claves cifradas dentro de la integración instalada en el panel.
 - **Sincronización automática (HU-16):** un job interno corre **cada 6 horas** y actualiza la lista de modelos **solo** en proveedores habilitados con `models_source = 'api'`.

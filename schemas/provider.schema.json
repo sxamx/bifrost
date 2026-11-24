@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/sxamx/bifrost/schemas/provider.schema.json",
   "title": "Bifrost Provider Schema",
-  "description": "Ficha declarativa de un proveedor o adaptador en Bifrost y bifrost-providers.",
+  "description": "Ficha declarativa de un proveedor o adaptador en Bifrost y mazzapata/providers.",
   "type": "object",
   "required": [
     "schemaVersion",

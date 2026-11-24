@@ -368,7 +368,7 @@ export interface MarketplaceUpdateResult {
 - `api.getMarketplace(refresh?: boolean): Promise<MarketplaceCatalogState>`  
   Llama a `GET /api/marketplace` (o `GET /api/marketplace?refresh=1` cuando `refresh === true` para forzar descarga remota y comparación de versiones contra todas las fuentes activas).
 - `api.getMarketplaceSources(): Promise<MarketplaceSourceItem[]>`  
-  Llama a `GET /api/marketplace/sources` (lista el repositorio oficial recomendado `sxamx/bifrost-providers` —por defecto `enabled: false`— y los repositorios personalizados).
+  Llama a `GET /api/marketplace/sources` (lista el repositorio oficial recomendado `mazzapata/providers` —por defecto `enabled: false`— y los repositorios personalizados).
 - `api.addMarketplaceSource(input: { name: string; url: string; enabled?: boolean }): Promise<MarketplaceSourceItem>`  
   Llama a `POST /api/marketplace/sources` (con validación SSRF estricta en backend para URLs HTTPS remotas).
 - `api.updateMarketplaceSource(id: string, input: { name?: string; enabled?: boolean }): Promise<MarketplaceSourceItem>`  
@@ -380,7 +380,7 @@ export interface MarketplaceUpdateResult {
 
 **Requisitos UI (`ProvidersTab.tsx` / `MarketplaceTab.tsx` y `ProviderVaultCard.tsx`):**
 1. **Gestor de repositorios del Marketplace (opt-in):**
-   - Mostrar un panel/sección colapsable de **Repositorios de proveedores** con el repositorio oficial recomendado (`sxamx/bifrost-providers`, `isOfficial: true`) pre-listado y un interruptor para activarlo (`enabled = true`) o desactivarlo (`enabled = false`), explicando que por defecto está desactivado (*opt-in*).
+   - Mostrar un panel/sección colapsable de **Repositorios de proveedores** con el repositorio oficial recomendado (`mazzapata/providers`, `isOfficial: true`) pre-listado y un interruptor para activarlo (`enabled = true`) o desactivarlo (`enabled = false`), explicando que por defecto está desactivado (*opt-in*).
    - Incluir formulario para añadir un repositorio HTTPS personalizado (`name` + `url`, usando `api.addMarketplaceSource({ name, url, enabled? })`), controles de activar/desactivar y edición de nombre (`api.updateMarketplaceSource(id, { name?, enabled? })`), y botón eliminar para repositorios no oficiales (`api.deleteMarketplaceSource(id)`), mostrando `lastError` / `catalogVersion` / `lastCheckedAt` por fuente y `enabledSourcesCount` / `checkedAt` del catálogo, manejando errores SSRF/HTTP vía `ApiError`.
 2. **Versionado, origen y comprobación de actualizaciones:**
    - Mostrar `catalogVersion` (y `checkedAt` / `enabledSourcesCount`) en la cabecera del Marketplace y `manifestVersion` (y `manifestHash` abreviado en tooltip/subtítulo) junto al badge de origen (`sourceName` o distintivo **Oficial** cuando `isOfficial === true`) en cada tarjeta del catálogo (`MarketplaceProviderEntry`).
