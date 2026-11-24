@@ -23,9 +23,10 @@ function makeTempDir(prefix = 'bifrost-sse-rt-'): string {
   return dir;
 }
 
-function extractCookiePair(setCookieHeader: string | null): string {
-  assert.ok(setCookieHeader, 'Expected Set-Cookie header to be present');
-  return setCookieHeader.split(';')[0]!;
+function extractCookiePair(setCookieHeader: string | string[] | undefined): string {
+  const first = Array.isArray(setCookieHeader) ? setCookieHeader[0] : setCookieHeader;
+  assert.ok(first, 'Expected Set-Cookie header to be present');
+  return first.split(';')[0]!;
 }
 
 function closeHttpServer(server: {
@@ -35,6 +36,67 @@ function closeHttpServer(server: {
   return new Promise((resolve) => {
     server.close(() => resolve());
     server.closeAllConnections?.();
+  });
+}
+
+function httpJsonRequest(options: {
+  port: number;
+  method: 'GET' | 'POST';
+  path: string;
+  headers?: Record<string, string>;
+  body?: unknown;
+}): Promise<{
+  statusCode: number;
+  headers: http.IncomingHttpHeaders;
+  json: Record<string, unknown>;
+  rawText: string;
+}> {
+  return new Promise((resolve, reject) => {
+    const bodyStr = options.body !== undefined ? JSON.stringify(options.body) : undefined;
+    const reqHeaders: Record<string, string> = {
+      ...(options.headers ?? {}),
+    };
+    if (bodyStr !== undefined) {
+      reqHeaders['Content-Type'] = 'application/json';
+      reqHeaders['Content-Length'] = String(Buffer.byteLength(bodyStr));
+    }
+
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: options.port,
+        path: options.path,
+        method: options.method,
+        headers: reqHeaders,
+        agent: false,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          const rawText = Buffer.concat(chunks).toString('utf8');
+          let json: Record<string, unknown> = {};
+          try {
+            json = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
+          } catch {
+            // Non-JSON response
+          }
+          resolve({
+            statusCode: res.statusCode ?? 0,
+            headers: res.headers,
+            json,
+            rawText,
+          });
+        });
+        res.on('error', reject);
+      },
+    );
+
+    req.on('error', reject);
+    if (bodyStr !== undefined) {
+      req.write(bodyStr);
+    }
+    req.end();
   });
 }
 
@@ -62,9 +124,8 @@ async function startGatedUpstreamSseServer(): Promise<GatedUpstreamServer> {
 
   const server = http.createServer(async (req, res) => {
     receivedHeaders.push({ ...req.headers });
-    // Consume request body
     for await (const _chunk of req) {
-      // noop
+      // Consume request body
     }
 
     if (req.method === 'POST' && req.url === '/v1/chat/completions') {
@@ -157,11 +218,11 @@ function openRealtimeHttpPost(options: {
         port: options.port,
         path: options.path,
         method: 'POST',
+        agent: false,
         headers: {
           ...options.headers,
           'Content-Type': 'application/json',
           'Content-Length': String(Buffer.byteLength(options.body)),
-          Connection: 'close',
         },
       },
       (res) => {
@@ -198,7 +259,9 @@ function openRealtimeHttpPost(options: {
           }
           if (ended) {
             return Promise.reject(
-              new Error(`Stream ended before receiving ${JSON.stringify(needle)}. Got: ${accumulated}`),
+              new Error(
+                `Stream ended before receiving ${JSON.stringify(needle)}. Got: ${accumulated}`,
+              ),
             );
           }
           return new Promise<string>((resWait, rejWait) => {
@@ -294,15 +357,30 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
     const masterKey = randomBytes(32);
     const upstream = await startGatedUpstreamSseServer();
 
+    const fetchImpl: typeof fetch = (input, init) => {
+      const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (urlStr.includes('models.dev')) {
+        return Promise.resolve(
+          new Response('{}', {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+        );
+      }
+      return globalThis.fetch(input, init);
+    };
+
     const app = createApp({
       db,
       masterKey,
       allowLocalhostUpstreamsForTests: true,
+      fetchImpl,
     });
 
     let bifrostPort = 0;
     const bifrostServer = await new Promise<ReturnType<typeof startBifrostHttpServer>>((resolve) => {
-      const srv = startBifrostHttpServer(app, {
+      let srv!: ReturnType<typeof startBifrostHttpServer>;
+      srv = startBifrostHttpServer(app, {
         hostname: '127.0.0.1',
         port: 0,
         onListening: (info) => {
@@ -315,27 +393,32 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
     let connectProxy: http.Server | null = null;
 
     try {
-      // 1. Bootstrap admin, internal API key, provider (with Accept-Encoding: gzip in extraHeaders to verify override), key, and static model
-      const setupRes = await app.request('/api/setup', {
+      // 1. Bootstrap admin, internal API key, provider (with Accept-Encoding: gzip in extraHeaders to verify override), key, and static model over real HTTP
+      const setupRes = await httpJsonRequest({
+        port: bifrostPort,
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'admin', password: 'admin-password-123' }),
+        path: '/api/setup',
+        body: { username: 'admin', password: 'admin-password-123' },
       });
-      assert.equal(setupRes.status, 201);
-      const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+      assert.equal(setupRes.statusCode, 201, `Setup failed: ${setupRes.rawText}`);
+      const adminCookie = extractCookiePair(setupRes.headers['set-cookie']);
 
-      const keyRes = await app.request('/api/keys', {
+      const keyRes = await httpJsonRequest({
+        port: bifrostPort,
         method: 'POST',
-        headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'SSE Realtime Test Key' }),
+        path: '/api/keys',
+        headers: { Cookie: adminCookie },
+        body: { name: 'SSE Realtime Test Key' },
       });
-      assert.equal(keyRes.status, 201);
-      const { rawKey: internalApiKey } = (await keyRes.json()) as { rawKey: string };
+      assert.equal(keyRes.statusCode, 201, `API key creation failed: ${keyRes.rawText}`);
+      const internalApiKey = String(keyRes.json.rawKey);
 
-      const provRes = await app.request('/api/providers', {
+      const provRes = await httpJsonRequest({
+        port: bifrostPort,
         method: 'POST',
-        headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        path: '/api/providers',
+        headers: { Cookie: adminCookie },
+        body: {
           schemaVersion: '1.0',
           id: 'realtime-mock',
           name: 'Realtime Mock Provider',
@@ -350,23 +433,27 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
           modelsSource: 'static',
           reviewedAt: '2026-11-24',
           staticModels: [{ id: 'stream-model', name: 'Stream Model' }],
-        }),
+        },
       });
-      assert.equal(provRes.status, 201);
+      assert.equal(provRes.statusCode, 201, `Provider install failed: ${provRes.rawText}`);
 
-      const provKeyRes = await app.request('/api/providers/realtime-mock/keys', {
+      const provKeyRes = await httpJsonRequest({
+        port: bifrostPort,
         method: 'POST',
-        headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: 'Primary', secret: 'sk-upstream-realtime-key-1234' }),
+        path: '/api/providers/realtime-mock/keys',
+        headers: { Cookie: adminCookie },
+        body: { label: 'Primary', secret: 'sk-upstream-realtime-key-1234' },
       });
-      assert.equal(provKeyRes.status, 201);
-      const provKeyBody = (await provKeyRes.json()) as { key: { id: string } };
+      assert.equal(provKeyRes.statusCode, 201, `Provider key failed: ${provKeyRes.rawText}`);
+      const provKeyId = String((provKeyRes.json.key as { id: string }).id);
 
-      const detectRes = await app.request('/api/providers/realtime-mock/detect-models', {
+      const detectRes = await httpJsonRequest({
+        port: bifrostPort,
         method: 'POST',
+        path: '/api/providers/realtime-mock/detect-models',
         headers: { Cookie: adminCookie },
       });
-      assert.equal(detectRes.status, 200);
+      assert.equal(detectRes.statusCode, 200, `Model detect failed: ${detectRes.rawText}`);
 
       // =========================================================================
       // Case 1: Real HTTP POST /v1/chat/completions (stream: true)
@@ -424,13 +511,15 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
       // =========================================================================
       upstream.resetGate();
 
-      const createChatRes = await app.request('/api/playground/chats', {
+      const createChatRes = await httpJsonRequest({
+        port: bifrostPort,
         method: 'POST',
-        headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ modelFullId: 'realtime-mock/stream-model' }),
+        path: '/api/playground/chats',
+        headers: { Cookie: adminCookie },
+        body: { modelFullId: 'realtime-mock/stream-model' },
       });
-      assert.equal(createChatRes.status, 201);
-      const createdChat = (await createChatRes.json()) as { chat: { id: string } };
+      assert.equal(createChatRes.statusCode, 201, `Create chat failed: ${createChatRes.rawText}`);
+      const createdChatId = String((createChatRes.json.chat as { id: string }).id);
 
       const pgClient = await openRealtimeHttpPost({
         port: bifrostPort,
@@ -440,7 +529,7 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
           Accept: 'application/json, text/event-stream',
         },
         body: JSON.stringify({
-          chatId: createdChat.chat.id,
+          chatId: createdChatId,
           model: 'realtime-mock/stream-model',
           stream: true,
           messages: [{ role: 'user', content: 'Playground real-time check' }],
@@ -469,14 +558,15 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
       assert.ok(pgFull.includes('data: [DONE]'));
 
       await waitForPendingPlaygroundStreamsForTests();
-      const chatDetailRes = await app.request(`/api/playground/chats/${createdChat.chat.id}`, {
+      const chatDetailRes = await httpJsonRequest({
+        port: bifrostPort,
+        method: 'GET',
+        path: `/api/playground/chats/${createdChatId}`,
         headers: { Cookie: adminCookie },
       });
-      assert.equal(chatDetailRes.status, 200);
-      const chatDetail = (await chatDetailRes.json()) as {
-        messages: Array<{ role: string; content: string }>;
-      };
-      const assistantMsg = chatDetail.messages.find((m) => m.role === 'assistant');
+      assert.equal(chatDetailRes.statusCode, 200);
+      const messages = chatDetailRes.json.messages as Array<{ role: string; content: string }>;
+      const assistantMsg = messages.find((m) => m.role === 'assistant');
       assert.equal(assistantMsg?.content, 'ChunkOne ChunkTwo');
 
       // =========================================================================
@@ -519,10 +609,7 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
         nowSec,
         nowSec,
       );
-      db.prepare(`UPDATE provider_keys SET node_id = ? WHERE id = ?`).run(
-        'node-rt-1',
-        provKeyBody.key.id,
-      );
+      db.prepare(`UPDATE provider_keys SET node_id = ? WHERE id = ?`).run('node-rt-1', provKeyId);
 
       const tunnelClient = await openRealtimeHttpPost({
         port: bifrostPort,
