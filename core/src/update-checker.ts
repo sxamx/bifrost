@@ -10,6 +10,7 @@ const execFileAsync = promisify(execFile);
 
 export const UPDATE_CHECK_CACHE_KEY = 'system_update_status';
 export const UPDATE_CHECK_TTL_SEC = 900; // 15 minutes
+export const UPDATE_PHASE_STALE_TTL_MS = 180_000; // 180 seconds safety TTL against zombie phases
 export const GITHUB_COMMITS_MAIN_URL = 'https://api.github.com/repos/sxamx/bifrost/commits/main';
 
 export type SystemUpdatePhase = 'idle' | 'pulling' | 'building' | 'restarting' | 'error';
@@ -21,15 +22,33 @@ export interface SystemUpdatePhaseState {
 
 let currentUpdatePhase: SystemUpdatePhase = 'idle';
 let currentUpdatePhaseMessage: string | null = null;
+let updatePhaseUpdatedAt = 0;
 let updateInFlight = false;
 let pendingBackgroundUpdate: Promise<void> | null = null;
 
-function setUpdatePhase(phase: SystemUpdatePhase, message: string | null = null): void {
+function setUpdatePhase(
+  phase: SystemUpdatePhase,
+  message: string | null = null,
+  nowMs: number = Date.now(),
+): void {
   currentUpdatePhase = phase;
   currentUpdatePhaseMessage = message;
+  updatePhaseUpdatedAt = phase === 'idle' ? 0 : nowMs;
 }
 
-export function getCurrentUpdatePhase(): SystemUpdatePhaseState {
+export function getCurrentUpdatePhase(nowMs: number = Date.now()): SystemUpdatePhaseState {
+  if (
+    !updateInFlight &&
+    (currentUpdatePhase === 'restarting' ||
+      currentUpdatePhase === 'pulling' ||
+      currentUpdatePhase === 'building') &&
+    updatePhaseUpdatedAt > 0 &&
+    nowMs - updatePhaseUpdatedAt > UPDATE_PHASE_STALE_TTL_MS
+  ) {
+    currentUpdatePhase = 'idle';
+    currentUpdatePhaseMessage = null;
+    updatePhaseUpdatedAt = 0;
+  }
   return {
     phase: currentUpdatePhase,
     message: currentUpdatePhaseMessage,
@@ -45,6 +64,7 @@ export async function waitForBackgroundUpdateForTests(): Promise<void> {
 export function resetUpdatePhaseForTests(): void {
   currentUpdatePhase = 'idle';
   currentUpdatePhaseMessage = null;
+  updatePhaseUpdatedAt = 0;
   updateInFlight = false;
   pendingBackgroundUpdate = null;
 }
@@ -185,6 +205,7 @@ export async function checkSystemUpdate(
     try {
       const cached = readExternalCache<SystemUpdateStatus>(db, UPDATE_CHECK_CACHE_KEY);
       if (cached && nowSec - cached.fetchedAt < UPDATE_CHECK_TTL_SEC && cached.data) {
+        const livePhase = getCurrentUpdatePhase(nowMs);
         return {
           ...cached.data,
           currentVersion,
@@ -195,8 +216,8 @@ export async function checkSystemUpdate(
             currentCommit && cached.data.latestCommit
               ? !isCommitUpToDate(currentCommit, cached.data.latestCommit)
               : false,
-          updatePhase: currentUpdatePhase,
-          updatePhaseMessage: currentUpdatePhaseMessage,
+          updatePhase: livePhase.phase,
+          updatePhaseMessage: livePhase.message,
         };
       }
     } catch {
@@ -215,6 +236,7 @@ export async function checkSystemUpdate(
     });
 
     if (!response.ok) {
+      const livePhase = getCurrentUpdatePhase(nowMs);
       return {
         currentVersion,
         currentCommit,
@@ -226,8 +248,8 @@ export async function checkSystemUpdate(
         canAutoUpdate,
         runtimeMode,
         checkedAt: nowMs,
-        updatePhase: currentUpdatePhase,
-        updatePhaseMessage: currentUpdatePhaseMessage,
+        updatePhase: livePhase.phase,
+        updatePhaseMessage: livePhase.message,
         error: `GitHub API returned HTTP ${response.status}`,
       };
     }
@@ -260,6 +282,7 @@ export async function checkSystemUpdate(
         ? !isCommitUpToDate(currentCommit, latestCommit)
         : false;
 
+    const livePhase = getCurrentUpdatePhase(nowMs);
     const result: SystemUpdateStatus = {
       currentVersion,
       currentCommit,
@@ -271,8 +294,8 @@ export async function checkSystemUpdate(
       canAutoUpdate,
       runtimeMode,
       checkedAt: nowMs,
-      updatePhase: currentUpdatePhase,
-      updatePhaseMessage: currentUpdatePhaseMessage,
+      updatePhase: livePhase.phase,
+      updatePhaseMessage: livePhase.message,
       error: null,
     };
 
@@ -285,6 +308,7 @@ export async function checkSystemUpdate(
     return result;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const livePhase = getCurrentUpdatePhase(nowMs);
     return {
       currentVersion,
       currentCommit,
@@ -296,8 +320,8 @@ export async function checkSystemUpdate(
       canAutoUpdate,
       runtimeMode,
       checkedAt: nowMs,
-      updatePhase: currentUpdatePhase,
-      updatePhaseMessage: currentUpdatePhaseMessage,
+      updatePhase: livePhase.phase,
+      updatePhaseMessage: livePhase.message,
       error: message || 'Failed to check for updates',
     };
   }
@@ -425,6 +449,14 @@ export async function triggerSystemUpdate(
         if (!response.ok) {
           const errMsg = `Watchtower returned HTTP ${response.status}`;
           setUpdatePhase('error', errMsg);
+        } else {
+          // If Watchtower recreated this container, the process would have been stopped/killed
+          // (or the HTTP connection aborted). A clean 200 OK while still alive means no newer
+          // image was pulled yet (e.g. Docker Publish on GHCR is still building).
+          setUpdatePhase(
+            'error',
+            'Watchtower finished without restarting the container (the new Docker image may still be building on GHCR). Try again in a minute.',
+          );
         }
       } catch (err) {
         const name = err instanceof Error ? err.name : '';
