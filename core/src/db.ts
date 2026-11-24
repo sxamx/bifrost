@@ -432,7 +432,7 @@ function ensureOfficialMarketplaceSource(db: DatabaseSync): void {
         OFFICIAL_MARKETPLACE_SOURCE_ID,
       );
       db.prepare(
-        `DELETE FROM external_cache WHERE cache_key IN ('marketplace_source:official', 'marketplace:index')`,
+        `DELETE FROM external_cache WHERE cache_key IN ('marketplace_source:official', 'marketplace:index', 'marketplace:unapproved')`,
       ).run();
     }
   }

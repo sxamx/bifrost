@@ -550,6 +550,7 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
           `INSERT OR REPLACE INTO external_cache (cache_key, payload_json, etag, fetched_at)
            VALUES ('marketplace_source:official', '{}', NULL, 1700000000),
                   ('marketplace:index', '{}', NULL, 1700000000),
+                  ('marketplace:unapproved', '{}', NULL, 1700000000),
                   ('unrelated_cache', '{}', NULL, 1700000000)`,
         )
         .run();
@@ -587,25 +588,37 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       ).map((r) => r.cache_key);
       assert.deepEqual(cacheKeys, ['unrelated_cache']);
 
-      // 2. Edge case: user already added mazzapata/providers as a custom source -> no UNIQUE(url) crash on startup
+      // 2. Edge case: user already added mazzapata/providers as a custom source -> no UNIQUE(url) crash on DB init OR createApp(marketplaceUrl)
       db2
         .prepare(`UPDATE marketplace_sources SET url = ?, name = 'Legacy Official' WHERE id = 'official'`)
         .run(legacyUrl);
       db2
         .prepare(
           `INSERT INTO marketplace_sources (id, name, url, is_official, enabled, created_at)
-           VALUES ('custom-mp', 'Mi Mazzapata', ?, 0, 1, 1700000001)`,
+           VALUES ('custom-mp', 'Mi Mazzapata', ?, 0, 0, 1700000001)`,
         )
         .run(OFFICIAL_MARKETPLACE_SOURCE_URL);
       db2.close();
 
       // Must open cleanly without throwing UNIQUE constraint error
       const db3 = openDatabase(dbPath);
+      const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
+      // Must also boot createApp cleanly when BIFROST_MARKETPLACE_URL / marketplaceUrl matches the custom source URL
+      const app = createApp({
+        db: db3,
+        masterKey,
+        marketplaceUrl: OFFICIAL_MARKETPLACE_SOURCE_URL,
+      });
+      const healthRes = await app.request('http://localhost/api/health');
+      assert.equal(healthRes.status, 200);
+
       const rows = db3
-        .prepare(`SELECT id, url FROM marketplace_sources ORDER BY id`)
-        .all() as Array<{ id: string; url: string }>;
+        .prepare(`SELECT id, url, enabled FROM marketplace_sources ORDER BY id`)
+        .all() as Array<{ id: string; url: string; enabled: number }>;
       assert.equal(rows.length, 2);
-      assert.equal(rows.find((r) => r.id === 'custom-mp')?.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
+      const customRow = rows.find((r) => r.id === 'custom-mp');
+      assert.equal(customRow?.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
+      assert.equal(customRow?.enabled, 1);
       assert.equal(rows.find((r) => r.id === 'official')?.url, legacyUrl);
       db3.close();
     } finally {

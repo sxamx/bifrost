@@ -335,19 +335,31 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   // Backward compatibility: if marketplaceUrl is explicitly passed (e.g., tests or env override),
   // configure and enable the official source to point to that URL. Normal startup keeps official opt-in (enabled = 0).
   if (explicitMarketplaceUrl) {
-    db.prepare(
-      `INSERT INTO marketplace_sources (
-         id, name, url, is_official, enabled, catalog_version, last_checked_at, last_error, created_at
-       ) VALUES (?, ?, ?, 1, 1, NULL, NULL, NULL, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         url = excluded.url,
-         enabled = 1`,
-    ).run(
-      OFFICIAL_MARKETPLACE_SOURCE_ID,
-      OFFICIAL_MARKETPLACE_SOURCE_NAME,
-      explicitMarketplaceUrl,
-      nowSeconds(),
-    );
+    const conflictingSource = db
+      .prepare(`SELECT id FROM marketplace_sources WHERE url = ? AND id != ?`)
+      .get(explicitMarketplaceUrl, OFFICIAL_MARKETPLACE_SOURCE_ID) as
+      | { id: string }
+      | undefined;
+
+    if (conflictingSource) {
+      db.prepare(`UPDATE marketplace_sources SET enabled = 1 WHERE id = ?`).run(
+        conflictingSource.id,
+      );
+    } else {
+      db.prepare(
+        `INSERT INTO marketplace_sources (
+           id, name, url, is_official, enabled, catalog_version, last_checked_at, last_error, created_at
+         ) VALUES (?, ?, ?, 1, 1, NULL, NULL, NULL, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           url = excluded.url,
+           enabled = 1`,
+      ).run(
+        OFFICIAL_MARKETPLACE_SOURCE_ID,
+        OFFICIAL_MARKETPLACE_SOURCE_NAME,
+        explicitMarketplaceUrl,
+        nowSeconds(),
+      );
+    }
   }
 
   const isAdminInitialized = (): boolean => {
