@@ -15,7 +15,7 @@ services:
       DATA_DIR: /data
       PANEL_DIST_DIR: /app/panel/dist
       BIFROST_MASTER_KEY: "${BIFROST_MASTER_KEY:-}"
-      BIFROST_MARKETPLACE_URL: "${BIFROST_MARKETPLACE_URL:-https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json}"
+      BIFROST_MARKETPLACE_URL: "${BIFROST_MARKETPLACE_URL:-https://raw.githubusercontent.com/mazzapata/providers/main/index.json}"
       BIFROST_WATCHTOWER_URL: "${BIFROST_WATCHTOWER_URL:-}"
       BIFROST_WATCHTOWER_TOKEN: "${BIFROST_WATCHTOWER_TOKEN:-}"
     labels:

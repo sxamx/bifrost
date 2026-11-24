@@ -2,7 +2,7 @@
 
 ## Decidido
 
-- **Nombre oficial:** **Bifrost** (repositorios en GitHub: `sxamx/bifrost` para la app principal y `sxamx/bifrost-providers` para el marketplace).
+- **Nombre oficial:** **Bifrost** (repositorios en GitHub: `sxamx/bifrost` para la app principal y `mazzapata/providers` para el marketplace).
 - **Repos separados:** solo 2 repositorios (app + marketplace). Sin tercer repositorio de datos; cada instancia de Bifrost descarga y cachea en SQLite directamente desde las fuentes abiertas verificadas.
 - **Instalación oficial y autoarranque (HU-01, HU-26):** soportar **ambos** métodos — **Docker Compose** como opción principal recomendada, y script `install.sh` con servicio `systemd` para VMs Linux sin Docker.
 - **Enfoque:** cuotas gratuitas (*free tier*), self-hosted, open-source bajo licencia **MIT**.
@@ -20,7 +20,7 @@
   - Cuota de invitados configurable por el admin en **tokens diarios** (reinicio a `00:00 UTC` o ventana móvil de 24 h).
   - El conteo y el reloj corren **100 % en el servidor** (SQLite + reloj UTC del servidor); los cambios de hora en el cliente no afectan el límite.
   - Bloque principal "Cuota gratuita de hoy" (`HU-17`): se calcula sobre el tope diario configurable por clave + lectura de cabeceras `x-ratelimit-*` cuando el proveedor las envíe.
-- **Marketplace (`bifrost-providers`):**
+- **Marketplace (`mazzapata/providers`):**
   - Repo público en GitHub revisado por el dueño (y colaboradores designados).
   - Las integraciones **no** se instalan automáticamente; el usuario explora el catálogo e instala solo las que desea.
   - Dos tipos de paquete:

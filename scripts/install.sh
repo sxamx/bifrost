@@ -213,7 +213,7 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 PORT=${PORT}
 DATA_DIR=${DATA_DIR}
 PANEL_DIST_DIR=${INSTALL_DIR}/panel/dist
-# BIFROST_MARKETPLACE_URL=https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json
+# BIFROST_MARKETPLACE_URL=https://raw.githubusercontent.com/mazzapata/providers/main/index.json
 EOF
   )
   chmod 0600 "${ENV_FILE}"

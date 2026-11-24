@@ -40,7 +40,7 @@ describe('Phase 7 Backend — Community Marketplace, Sidecar Adapters, Multi-Acc
           return new Response(
             JSON.stringify({
               schemaVersion: '1.0',
-              repository: 'sxamx/bifrost-providers',
+              repository: 'mazzapata/providers',
               providers: [
                 {
                   id: 'groq',
