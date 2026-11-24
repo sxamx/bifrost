@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 import { createApp } from '../core/src/app.js';
 import { hashPassword, resolveMasterKey } from '../core/src/crypto.js';
 import {
+  LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL,
   OFFICIAL_MARKETPLACE_SOURCE_NAME,
   OFFICIAL_MARKETPLACE_SOURCE_URL,
   openDatabase,
@@ -621,6 +622,49 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       assert.equal(customRow?.enabled, 1);
       assert.equal(rows.find((r) => r.id === 'official')?.url, legacyUrl);
       db3.close();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('normalizes legacy BIFROST_MARKETPLACE_URL passed to createApp to OFFICIAL_MARKETPLACE_SOURCE_URL while preserving custom URLs', async () => {
+    const tmpDir = makeTempDir();
+    try {
+      const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
+      const db = openDatabase(path.join(tmpDir, 'legacy-env.db'));
+
+      // Passing the legacy Watchtower-inherited URL must normalize id='official' to mazzapata/providers
+      const app1 = createApp({
+        db,
+        masterKey,
+        marketplaceUrl: LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL,
+      });
+      assert.equal((await app1.request('http://localhost/api/health')).status, 200);
+
+      const officialRow = db
+        .prepare(`SELECT id, name, url, enabled FROM marketplace_sources WHERE id = 'official'`)
+        .get() as { id: string; name: string; url: string; enabled: number };
+      assert.equal(officialRow.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
+      assert.notEqual(officialRow.url, LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL);
+      assert.equal(officialRow.name, OFFICIAL_MARKETPLACE_SOURCE_NAME);
+      assert.equal(officialRow.enabled, 1);
+
+      // Any other custom URL in BIFROST_MARKETPLACE_URL is still respected unchanged
+      const customUrl = 'https://custom-catalog.example.com/index.json';
+      const app2 = createApp({
+        db,
+        masterKey,
+        marketplaceUrl: customUrl,
+      });
+      assert.equal((await app2.request('http://localhost/api/health')).status, 200);
+
+      const customRow = db
+        .prepare(`SELECT url, enabled FROM marketplace_sources WHERE id = 'official'`)
+        .get() as { url: string; enabled: number };
+      assert.equal(customRow.url, customUrl);
+      assert.equal(customRow.enabled, 1);
+
+      db.close();
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

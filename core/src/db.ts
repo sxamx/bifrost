@@ -378,7 +378,7 @@ export const OFFICIAL_MARKETPLACE_SOURCE_ID = 'official';
 export const OFFICIAL_MARKETPLACE_SOURCE_NAME = 'Catálogo Oficial (mazzapata/providers)';
 export const OFFICIAL_MARKETPLACE_SOURCE_URL =
   'https://raw.githubusercontent.com/mazzapata/providers/main/index.json';
-const LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL =
+export const LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL =
   'https://raw.githubusercontent.com/sxamx/bifrost-providers/main/index.json';
 
 export function ensureProvidersMarketplaceColumns(db: DatabaseSync): void {
