@@ -30,8 +30,10 @@ import {
   verifyPassword,
 } from './crypto.js';
 import {
+  LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL,
   OFFICIAL_MARKETPLACE_SOURCE_ID,
   OFFICIAL_MARKETPLACE_SOURCE_NAME,
+  OFFICIAL_MARKETPLACE_SOURCE_URL,
   redactSecretsInText,
   writeSystemLog,
 } from './db.js';
@@ -324,8 +326,12 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     options.schemasDir ?? path.resolve(import.meta.dirname, '../../schemas'),
   );
   const allowLocalhostUpstreamsForTests = Boolean(options.allowLocalhostUpstreamsForTests);
+  const rawExplicitMarketplaceUrl =
+    (options.marketplaceUrl ?? process.env.BIFROST_MARKETPLACE_URL)?.trim() || undefined;
   const explicitMarketplaceUrl =
-    options.marketplaceUrl ?? process.env.BIFROST_MARKETPLACE_URL ?? undefined;
+    rawExplicitMarketplaceUrl === LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL
+      ? OFFICIAL_MARKETPLACE_SOURCE_URL
+      : rawExplicitMarketplaceUrl;
 
   const registry = new DrainingRegistry();
   const app = new Hono<AppEnv>();
