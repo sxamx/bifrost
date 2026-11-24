@@ -1354,11 +1354,15 @@ export async function executeChatCompletions(options: {
       const releaseLease = registry.acquireLease(providerId, key.id);
       try {
         const rawSecret = decryptSecret(key.encrypted_secret, masterKey);
-        const headers: Record<string, string> = {
-          ...buildProviderAuthHeaders(manifest.auth, rawSecret),
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        };
+        const rawAuthHeaders = buildProviderAuthHeaders(manifest.auth, rawSecret);
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(rawAuthHeaders)) {
+          if (k.toLowerCase() === 'accept-encoding') continue;
+          headers[k] = v;
+        }
+        headers['Content-Type'] = 'application/json';
+        headers.Accept = 'text/event-stream';
+        headers['Accept-Encoding'] = 'identity';
         const upstreamBody = applyStrictMaxTokens({
           ...requestBody,
           model: modelId,
@@ -1515,11 +1519,19 @@ export async function executeChatCompletions(options: {
   const encoder = new TextEncoder();
 
   let clientAborted = false;
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   const stream = new ReadableStream<Uint8Array>({
     cancel() {
       clientAborted = true;
+      const readerToCancel = activeReader;
+      activeReader = null;
+      if (readerToCancel) {
+        void readerToCancel.cancel().catch(() => {
+          // Ignore upstream reader cancel errors
+        });
+      }
     },
-    async start(controller) {
+    start(controller) {
       const safeEnqueue = (chunk: Uint8Array): boolean => {
         if (clientAborted) return false;
         try {
@@ -1538,62 +1550,67 @@ export async function executeChatCompletions(options: {
           // Ignore already closed controller
         }
       };
-      let activeConn: {
-        key: ProviderKeyRecord;
-        response: Response;
-        releaseLease: () => void;
-      } | null = initialConnection;
 
-      let contentAccumulated = '';
-      let reasoningAccumulated = '';
-      let toolCallCharsAccumulated = 0;
-      const toolCallsAccumulated = new Map<number, { name: string; args: string }>();
-      let ttftMs: number | null = null;
-      let promptTokens = 0;
-      let completionTokens = 0;
-      let reasoningTokens = 0;
-      let cachedTokens = 0;
-      let wasResumed = false;
-      let quotaCutMidStream = false;
-      let lastKeyUsedId = initialConnection.key.id;
+      void (async () => {
+        let activeConn: {
+          key: ProviderKeyRecord;
+          response: Response;
+          releaseLease: () => void;
+        } | null = initialConnection;
 
-      try {
-        while (activeConn !== null && !clientAborted) {
-          const currentKey = activeConn.key;
-          const currentRes = activeConn.response;
-          const releaseCurrent = activeConn.releaseLease;
-          lastKeyUsedId = currentKey.id;
+        let contentAccumulated = '';
+        let reasoningAccumulated = '';
+        let toolCallCharsAccumulated = 0;
+        const toolCallsAccumulated = new Map<number, { name: string; args: string }>();
+        let ttftMs: number | null = null;
+        let promptTokens = 0;
+        let completionTokens = 0;
+        let reasoningTokens = 0;
+        let cachedTokens = 0;
+        let wasResumed = false;
+        let quotaCutMidStream = false;
+        let lastKeyUsedId = initialConnection.key.id;
 
-          let sawDone = false;
-          let sawFinishReason = false;
-          let streamFailureReason: string | null = null;
+        try {
+          while (activeConn !== null && !clientAborted) {
+            const currentKey = activeConn.key;
+            const currentRes = activeConn.response;
+            const releaseCurrent = activeConn.releaseLease;
+            lastKeyUsedId = currentKey.id;
 
-          const reader = currentRes.body!.getReader();
-          const decoder = new TextDecoder();
-          let buffer = '';
+            let sawDone = false;
+            let sawFinishReason = false;
+            let streamFailureReason: string | null = null;
 
-          const processLine = (rawLine: string): boolean => {
-            const line = rawLine.trim();
-            if (!line || line.startsWith(':')) {
-              return true;
-            }
-            if (!line.startsWith('data:')) {
-              return true;
-            }
+            const reader = currentRes.body!.getReader();
+            activeReader = reader;
+            const decoder = new TextDecoder();
+            let buffer = '';
 
-            const payload = line.slice(5).trim();
-            if (payload === '[DONE]') {
-              sawDone = true;
-              return false;
-            }
+            const processLine = (rawLine: string): boolean => {
+              if (clientAborted) {
+                return false;
+              }
+              const line = rawLine.trim();
+              if (!line || line.startsWith(':')) {
+                return true;
+              }
+              if (!line.startsWith('data:')) {
+                return true;
+              }
 
-            let parsed: Record<string, unknown>;
-            try {
-              parsed = JSON.parse(payload) as Record<string, unknown>;
-            } catch {
-              controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
-              return true;
-            }
+              const payload = line.slice(5).trim();
+              if (payload === '[DONE]') {
+                sawDone = true;
+                return false;
+              }
+
+              let parsed: Record<string, unknown>;
+              try {
+                parsed = JSON.parse(payload) as Record<string, unknown>;
+              } catch {
+                return safeEnqueue(encoder.encode(`data: ${payload}\n\n`));
+              }
 
             if (parsed.error) {
               streamFailureReason = redactSecretsInText(JSON.stringify(parsed.error));
@@ -1702,7 +1719,7 @@ export async function executeChatCompletions(options: {
                   choices: cutChoices,
                   bifrost_quota_cut: true,
                 };
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(cutChunk)}\n\n`));
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify(cutChunk)}\n\n`));
                 return false;
               }
             }
@@ -1711,15 +1728,16 @@ export async function executeChatCompletions(options: {
               ...parsed,
               model: modelFullId,
             };
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(forwardedChunk)}\n\n`));
-            return true;
+            return safeEnqueue(encoder.encode(`data: ${JSON.stringify(forwardedChunk)}\n\n`));
           };
 
           try {
-            while (true) {
+            while (!clientAborted) {
               const { value, done } = await reader.read();
-              if (done) {
-                buffer += decoder.decode();
+              if (done || clientAborted) {
+                if (!clientAborted) {
+                  buffer += decoder.decode();
+                }
                 break;
               }
               buffer += decoder.decode(value, { stream: true });
@@ -1734,12 +1752,13 @@ export async function executeChatCompletions(options: {
                 }
               }
 
-              if (sawDone || quotaCutMidStream || streamFailureReason !== null) {
+              if (clientAborted || sawDone || quotaCutMidStream || streamFailureReason !== null) {
                 break;
               }
             }
 
             if (
+              !clientAborted &&
               !sawDone &&
               !quotaCutMidStream &&
               streamFailureReason === null &&
@@ -1752,15 +1771,25 @@ export async function executeChatCompletions(options: {
               }
             }
           } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            streamFailureReason = redactSecretsInText(`Stream interrupted: ${msg}`);
+            if (!clientAborted) {
+              const msg = err instanceof Error ? err.message : String(err);
+              streamFailureReason = redactSecretsInText(`Stream interrupted: ${msg}`);
+            }
           } finally {
+            if (activeReader === reader) {
+              activeReader = null;
+            }
             try {
               await reader.cancel();
             } catch {
               // Ignore reader cancel errors
             }
             releaseCurrent();
+          }
+
+          if (clientAborted) {
+            activeConn = null;
+            break;
           }
 
           const completedCleanly =
@@ -1802,7 +1831,7 @@ export async function executeChatCompletions(options: {
               streamContractError = 'structured_error';
             }
 
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            safeEnqueue(encoder.encode('data: [DONE]\n\n'));
 
             recordUsageLog(db, {
               userId,
@@ -1939,17 +1968,18 @@ export async function executeChatCompletions(options: {
               code: 'stream_interrupted',
             },
           };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(errFrame)}\n\n`));
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          safeEnqueue(encoder.encode(`data: ${JSON.stringify(errFrame)}\n\n`));
+          safeEnqueue(encoder.encode('data: [DONE]\n\n'));
           activeConn = null;
           break;
         }
-      } finally {
-        if (activeConn !== null) {
-          activeConn.releaseLease();
+        } finally {
+          if (activeConn !== null) {
+            activeConn.releaseLease();
+          }
+          safeClose();
         }
-        safeClose();
-      }
+      })();
     },
   });
 
@@ -1957,8 +1987,9 @@ export async function executeChatCompletions(options: {
     status: 200,
     headers: {
       'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
     },
   });
 }
