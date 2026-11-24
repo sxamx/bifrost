@@ -272,6 +272,7 @@ function openConnectSocketToNode(
             host: parsedEp.host,
             port: parsedEp.port,
           });
+    sock.setNoDelay(true);
 
     const timer = setTimeout(() => {
       if (!settled) {
@@ -389,6 +390,7 @@ export async function fetchViaExitNode(
     : `${rawHost}:${targetPort}`;
 
   const tunnelSocket = await openConnectSocketToNode(node, targetAuthority, 10_000);
+  tunnelSocket.setNoDelay(true);
 
   const method = (init?.method ?? 'GET').toUpperCase();
   const reqHeaders: Record<string, string> = {
@@ -400,6 +402,10 @@ export async function fetchViaExitNode(
     h.forEach((value, key) => {
       reqHeaders[key] = value;
     });
+  }
+
+  if (!Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'accept-encoding')) {
+    reqHeaders['Accept-Encoding'] = 'identity';
   }
 
   let bodyBuffer: Buffer | undefined;
@@ -451,28 +457,54 @@ export async function fetchViaExitNode(
         return;
       }
 
+      let streamClosed = false;
       const webStream = new ReadableStream<Uint8Array>({
         start(controller) {
-          res.on('data', (chunk: Buffer) => {
-            controller.enqueue(new Uint8Array(chunk));
-          });
-          res.on('end', () => {
-            controller.close();
-          });
-          res.on('error', (err) => {
-            controller.error(err);
-          });
-          res.on('close', () => {
-            if (!res.complete) {
+          const onData = (chunk: Buffer) => {
+            if (streamClosed) return;
+            try {
+              controller.enqueue(new Uint8Array(chunk));
+            } catch {
+              streamClosed = true;
+              res.destroy();
+              tunnelSocket.destroy();
+            }
+          };
+          const onEnd = () => {
+            if (streamClosed) return;
+            streamClosed = true;
+            try {
+              controller.close();
+            } catch {
+              // Controller already closed/errored
+            }
+          };
+          const onErr = (err: Error) => {
+            if (streamClosed) return;
+            streamClosed = true;
+            try {
+              controller.error(err);
+            } catch {
+              // Controller already closed/errored
+            }
+          };
+          const onClose = () => {
+            if (!streamClosed && !res.complete) {
+              streamClosed = true;
               try {
                 controller.error(new Error('Upstream stream closed prematurely'));
               } catch {
                 // Controller already closed/errored
               }
             }
-          });
+          };
+          res.on('data', onData);
+          res.once('end', onEnd);
+          res.once('error', onErr);
+          res.once('close', onClose);
         },
         cancel() {
+          streamClosed = true;
           res.destroy();
           tunnelSocket.destroy();
         },
@@ -498,6 +530,7 @@ export async function fetchViaExitNode(
           ca: upstreamTls?.ca,
           rejectUnauthorized: shouldVerifyCa,
         });
+        tlsSock.setNoDelay(true);
         if (pinnedTargetFp !== null) {
           tlsSock.once('secureConnect', () => {
             const peer = tlsSock.getPeerCertificate();

@@ -1,9 +1,9 @@
-import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
 import { loadMasterKeyOrExit } from './crypto.js';
 import { openDatabase, writeSystemLog } from './db.js';
 import { AUTO_SYNC_INTERVAL_MS, runModelsAutoSyncTick } from './models-sync.js';
 import { runNodesHealthTick } from './nodes.js';
+import { startBifrostHttpServer } from './server.js';
 
 const resolved = loadMasterKeyOrExit();
 const db = openDatabase(resolved.dbPath);
@@ -54,15 +54,12 @@ const triggerModelsAutoSyncTick = () => {
 const modelsAutoSyncInterval = setInterval(triggerModelsAutoSyncTick, AUTO_SYNC_INTERVAL_MS);
 modelsAutoSyncInterval.unref();
 
-const server = serve(
-  {
-    fetch: app.fetch,
-    port,
-  },
-  (info) => {
+const server = startBifrostHttpServer(app, {
+  port,
+  onListening: (info) => {
     process.stdout.write(`[Bifrost] Listening on http://0.0.0.0:${info.port}\n`);
   },
-);
+});
 
 function shutdown(signal: string): void {
   process.stdout.write(`[Bifrost] Received ${signal}, shutting down...\n`);
