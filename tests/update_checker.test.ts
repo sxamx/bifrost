@@ -12,6 +12,7 @@ import {
   GITHUB_COMMITS_MAIN_URL,
   SystemUpdateError,
   UPDATE_CHECK_TTL_SEC,
+  UPDATE_PHASE_STALE_TTL_MS,
   checkSystemUpdate,
   getCurrentUpdatePhase,
   isCommitUpToDate,
@@ -899,7 +900,8 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       fs.rmSync(tmpRepo, { recursive: true, force: true });
     }
 
-    // Watchtower mode: sets restarting immediately while triggering in background
+    // Watchtower mode: sets restarting while triggering in background; if 200 OK returns
+    // while process is still alive (no container restart), transitions to 'error' instead of sticking in 'restarting'
     resetUpdatePhaseForTests();
     let phaseDuringWtFetch: SystemUpdatePhase | null = null;
     let messageDuringWtFetch: string | null = null;
@@ -918,7 +920,25 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
     await waitForBackgroundUpdateForTests();
     assert.equal(phaseDuringWtFetch, 'restarting');
     assert.equal(messageDuringWtFetch, 'Watchtower update triggered. Container is restarting…');
+    assert.equal(getCurrentUpdatePhase().phase, 'error');
+    assert.match(getCurrentUpdatePhase().message ?? '', /without restarting/i);
+
+    // Watchtower connection reset (actual container restart in progress) stays 'restarting'
+    // and auto-resets to 'idle' after UPDATE_PHASE_STALE_TTL_MS (180s) if the process somehow survives
+    resetUpdatePhaseForTests();
+    const wtInterruptStart = await triggerSystemUpdate({
+      runtimeMode: 'docker',
+      watchtowerUrl: 'http://watchtower:8080',
+      fetchImpl: async () => {
+        throw new Error('socket hang up ECONNRESET');
+      },
+    });
+    assert.equal(wtInterruptStart.ok, true);
+    await waitForBackgroundUpdateForTests();
     assert.equal(getCurrentUpdatePhase().phase, 'restarting');
+    const afterTtl = getCurrentUpdatePhase(Date.now() + UPDATE_PHASE_STALE_TTL_MS + 1_000);
+    assert.equal(afterTtl.phase, 'idle');
+    assert.equal(afterTtl.message, null);
 
     // Watchtower unexpected error in background -> transitions to error phase and releases lock
     resetUpdatePhaseForTests();
@@ -1019,7 +1039,9 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       });
       assert.equal(retryRes.status, 202);
       await waitForBackgroundUpdateForTests();
-      assert.equal(getCurrentUpdatePhase().phase, 'restarting');
+      // Watchtower returned 200 OK without killing the process -> must NOT stay stuck in 'restarting'
+      assert.equal(getCurrentUpdatePhase().phase, 'error');
+      assert.match(getCurrentUpdatePhase().message ?? '', /GHCR|without restarting/i);
 
       // 4. When already up-to-date -> returns 200 OK with upToDate: true (no background restart)
       resetUpdatePhaseForTests();
@@ -1050,7 +1072,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
     }
   });
 
-  it('releases updateInFlight lock after Watchtower 200 OK if container survives so a new POST /api/system/update does not 409', async () => {
+  it('transitions phase out of restarting and releases lock after Watchtower 200 OK without restart so UI can retry', async () => {
     const db = openDatabase(':memory:');
     const masterKey = randomBytes(32);
     let wtCalls = 0;
@@ -1093,6 +1115,15 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       await waitForBackgroundUpdateForTests();
       assert.equal(wtCalls, 1);
 
+      // GET /api/system/update-status must NOT be stuck in 'restarting'
+      const statusRes = await app.request('http://localhost/api/system/update-status', {
+        headers: { Cookie: adminCookie },
+      });
+      assert.equal(statusRes.status, 200);
+      const statusJson = (await statusRes.json()) as SystemUpdateStatus;
+      assert.equal(statusJson.updatePhase, 'error');
+      assert.match(statusJson.updatePhaseMessage ?? '', /without restarting/i);
+
       // Without calling resetUpdatePhaseForTests(), a subsequent POST must NOT return 409
       const secondRes = await app.request('http://localhost/api/system/update', {
         method: 'POST',
@@ -1101,6 +1132,7 @@ describe('HU-41: System Update Checker & /api/system/update-status', () => {
       assert.equal(secondRes.status, 202);
       await waitForBackgroundUpdateForTests();
       assert.equal(wtCalls, 2);
+      assert.equal(getCurrentUpdatePhase().phase, 'error');
     } finally {
       if (prevRuntime === undefined) delete process.env.BIFROST_RUNTIME;
       else process.env.BIFROST_RUNTIME = prevRuntime;
