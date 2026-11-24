@@ -348,6 +348,7 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
             extraHeaders: { 'Accept-Encoding': 'gzip, br' },
           },
           modelsSource: 'static',
+          reviewedAt: '2026-11-24',
           staticModels: [{ id: 'stream-model', name: 'Stream Model' }],
         }),
       });
@@ -505,16 +506,18 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
       await new Promise<void>((resolve) => connectProxy!.listen(0, '127.0.0.1', () => resolve()));
       const proxyPort = (connectProxy.address() as net.AddressInfo).port;
 
+      const nowSec = Math.floor(Date.now() / 1000);
       db.prepare(
-        `INSERT INTO nodes (id, name, mode, endpoint, token_hash, encrypted_token, status, created_at)
-         VALUES (?, ?, 'tailscale', ?, ?, ?, 'online', ?)`,
+        `INSERT INTO nodes (id, name, mode, endpoint, token_hash, encrypted_token, last_rotated_at, status, created_at)
+         VALUES (?, ?, 'tailscale', ?, ?, ?, ?, 'online', ?)`,
       ).run(
         'node-rt-1',
         'Local CONNECT Node',
         `127.0.0.1:${proxyPort}`,
         sha256Hex(nodeToken),
         encryptSecret(nodeToken, masterKey),
-        Math.floor(Date.now() / 1000),
+        nowSec,
+        nowSec,
       );
       db.prepare(`UPDATE provider_keys SET node_id = ? WHERE id = ?`).run(
         'node-rt-1',
