@@ -569,26 +569,80 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   const effectiveAdaptiveAdjusted = Boolean(
     freeQuota?.adaptiveAdjusted ?? summary?.adaptiveAdjusted
   );
+  const providerQuotasList = freeQuota?.providers ?? summary?.providerQuotas ?? [];
+
+  type GlobalQuotaUnit = 'tokens' | 'requests' | 'mixed' | 'none';
+  const countableProviders = providerQuotasList.filter((pq) => pq.unit !== 'none');
+  const hasTokenProviders = countableProviders.some((pq) => pq.unit === 'tokens');
+  const hasRequestProviders = countableProviders.some((pq) => pq.unit === 'requests');
+  const rawExplicitUnit =
+    (freeQuota as { unit?: string } | null)?.unit ??
+    (summary as { unit?: string } | null)?.unit ??
+    null;
+
+  const globalQuotaUnit: GlobalQuotaUnit =
+    rawExplicitUnit === 'requests' ||
+    rawExplicitUnit === 'tokens' ||
+    rawExplicitUnit === 'mixed' ||
+    rawExplicitUnit === 'none'
+      ? rawExplicitUnit
+      : countableProviders.length === 0
+        ? providerQuotasList.length > 0
+          ? 'none'
+          : 'tokens'
+        : hasTokenProviders && hasRequestProviders
+          ? 'mixed'
+          : hasRequestProviders
+            ? 'requests'
+            : 'tokens';
+
   const totalLimit =
-    freeQuota?.effectiveLimit ??
-    summary?.effectiveLimit ??
-    summary?.totalDailyLimit ??
-    (typeof user.dailyTokenLimit === 'number' && user.dailyTokenLimit > 0
-      ? user.dailyTokenLimit
-      : null);
-  const usedToday = freeQuota?.usedInWindow ?? summary?.usedTokensToday ?? 0;
+    globalQuotaUnit === 'mixed' || globalQuotaUnit === 'none'
+      ? null
+      : globalQuotaUnit === 'requests'
+        ? freeQuota?.effectiveLimit ?? summary?.effectiveLimit ?? null
+        : freeQuota?.effectiveLimit ??
+          summary?.effectiveLimit ??
+          summary?.totalDailyLimit ??
+          (typeof user.dailyTokenLimit === 'number' && user.dailyTokenLimit > 0
+            ? user.dailyTokenLimit
+            : null);
+
+  const usedToday =
+    globalQuotaUnit === 'mixed' || globalQuotaUnit === 'none'
+      ? 0
+      : freeQuota?.usedInWindow ??
+        (globalQuotaUnit === 'tokens' ? (summary?.usedTokensToday ?? 0) : 0);
   const hasConfiguredLimit = totalLimit !== null && totalLimit > 0;
 
-  const pctRemaining =
-    freeQuota?.quotaPercentageRemaining !== null && freeQuota?.quotaPercentageRemaining !== undefined
-      ? Math.round(freeQuota.quotaPercentageRemaining)
-      : summary?.quotaPercentageRemaining !== null && summary?.quotaPercentageRemaining !== undefined
-        ? Math.round(summary.quotaPercentageRemaining)
+  const rawPctRemaining =
+    freeQuota?.quotaPercentageRemaining !== null &&
+    freeQuota?.quotaPercentageRemaining !== undefined &&
+    Number.isFinite(freeQuota.quotaPercentageRemaining)
+      ? Math.max(0, Math.min(100, Math.round(freeQuota.quotaPercentageRemaining)))
+      : summary?.quotaPercentageRemaining !== null &&
+          summary?.quotaPercentageRemaining !== undefined &&
+          Number.isFinite(summary.quotaPercentageRemaining)
+        ? Math.max(0, Math.min(100, Math.round(summary.quotaPercentageRemaining)))
         : hasConfiguredLimit && totalLimit
           ? Math.max(0, Math.min(100, Math.round(((totalLimit - usedToday) / totalLimit) * 100)))
           : null;
 
-  const providerQuotasList = freeQuota?.providers ?? summary?.providerQuotas ?? [];
+  const pctRemaining = globalQuotaUnit === 'none' ? null : rawPctRemaining;
+
+  const hasAny429 = providerQuotasList.some((pq) => pq.recent429Count7d > 0);
+  const isLearningState =
+    pctRemaining === null &&
+    effectiveProvidersCount > 0 &&
+    globalQuotaUnit !== 'none' &&
+    (effectiveConfidence === 'inferred' || hasAny429);
+
+  const globalConfidenceBadge =
+    totalLimit === null && !effectiveAdaptiveAdjusted && effectiveConfidence === 'inferred'
+      ? hasAny429
+        ? 'En aprendizaje (429)'
+        : 'Sin límite fijo'
+      : formatConfidenceLabel(effectiveConfidence);
 
   const resetMode = summary?.resetMode ?? user.quotaResetMode ?? 'utc_midnight';
   const resetTargetMs = parseResetTimestampMs(summary?.nextResetAt ?? null);
@@ -603,10 +657,22 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
           ? 'warn'
           : 'healthy';
 
-  const isRequestUnit =
-    providerQuotasList.length > 0 && providerQuotasList.every((pq) => pq.unit === 'requests');
-  const unitLabel = isRequestUnit ? 'peticiones' : 'tokens';
-  const unitShort = isRequestUnit ? 'req' : 'tok';
+  const unitLabel =
+    globalQuotaUnit === 'requests'
+      ? usedToday === 1
+        ? 'petición'
+        : 'peticiones'
+      : globalQuotaUnit === 'tokens'
+        ? 'tokens'
+        : '';
+  const unitPluralLabel =
+    globalQuotaUnit === 'requests'
+      ? 'peticiones'
+      : globalQuotaUnit === 'tokens'
+        ? 'tokens'
+        : '';
+  const unitShort =
+    globalQuotaUnit === 'requests' ? 'pet.' : globalQuotaUnit === 'tokens' ? 'tok' : '';
   const windowPhrase =
     effectiveActiveWindow === 'hour'
       ? 'esta hora'
@@ -650,23 +716,31 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                 <InfoTip text="Porcentaje disponible combinando topes configurados y cabeceras x-ratelimit-*." />
               </div>
               <div className="kpi-value">
-                {pctRemaining !== null
-                  ? `${pctRemaining}%`
-                  : effectiveProvidersCount === 0
-                    ? '—'
-                    : '100%'}
+                {pctRemaining !== null ? `${pctRemaining}%` : '—'}
               </div>
             </div>
-            <MiniSparkline
-              points={[98, 95, 91, 86, 81, pctRemaining ?? 100]}
-              labels={sparkLabels}
-              color="var(--ok)"
-              unit="%"
-            />
+            {pctRemaining !== null ? (
+              <MiniSparkline
+                points={[98, 95, 91, 86, 81, pctRemaining]}
+                labels={sparkLabels}
+                color="var(--ok)"
+                unit="%"
+              />
+            ) : null}
           </div>
           <div className="kpi-footnote">
-            <span className="status-dot ok" />
-            <span>Reinicio en {countdownText}</span>
+            <span className={`status-dot ${pctRemaining !== null ? 'ok' : 'partial'}`} />
+            <span>
+              {pctRemaining !== null
+                ? `Reinicio en ${countdownText}`
+                : effectiveProvidersCount === 0
+                  ? 'Sin proveedores aún'
+                  : globalQuotaUnit === 'none'
+                    ? 'Sin límite numérico fijo'
+                    : isLearningState
+                      ? `En aprendizaje · reinicio ${countdownText}`
+                      : `Sin tope fijo · reinicio ${countdownText}`}
+            </span>
           </div>
         </article>
 
@@ -679,31 +753,49 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             <div>
               <div className="kpi-label-row">
                 <span>
-                  {isRequestUnit ? 'Peticiones' : 'Tokens'} consumidos ({windowPhrase})
+                  {globalQuotaUnit === 'requests'
+                    ? `Peticiones consumidas (${windowPhrase})`
+                    : globalQuotaUnit === 'tokens'
+                      ? `Tokens consumidos (${windowPhrase})`
+                      : `Consumo (${windowPhrase})`}
                 </span>
-                <InfoTip text="Volumen acumulado en la ventana activa UTC." />
+                <InfoTip text="Volumen acumulado en la ventana activa UTC según la unidad reportada por tus proveedores." />
               </div>
-              <div className="kpi-value">{usedToday.toLocaleString('es-ES')}</div>
+              <div className="kpi-value">
+                {globalQuotaUnit === 'mixed'
+                  ? 'Mixto'
+                  : globalQuotaUnit === 'none'
+                    ? '—'
+                    : usedToday.toLocaleString('es-ES')}
+              </div>
             </div>
-            <MiniSparkline
-              points={[
-                Math.round(usedToday * 0.12),
-                Math.round(usedToday * 0.28),
-                Math.round(usedToday * 0.49),
-                Math.round(usedToday * 0.67),
-                Math.round(usedToday * 0.85),
-                usedToday,
-              ]}
-              labels={sparkLabels}
-              color="var(--accent)"
-              unit={unitShort}
-            />
+            {globalQuotaUnit === 'tokens' || globalQuotaUnit === 'requests' ? (
+              <MiniSparkline
+                points={[
+                  Math.round(usedToday * 0.12),
+                  Math.round(usedToday * 0.28),
+                  Math.round(usedToday * 0.49),
+                  Math.round(usedToday * 0.67),
+                  Math.round(usedToday * 0.85),
+                  usedToday,
+                ]}
+                labels={sparkLabels}
+                color="var(--accent)"
+                unit={unitShort}
+              />
+            ) : null}
           </div>
           <div className="kpi-footnote">
             <span>
-              {totalLimit
-                ? `Tope: ${totalLimit.toLocaleString('es-ES')} ${unitShort}`
-                : 'Cuota abierta por proveedor'}
+              {globalQuotaUnit === 'mixed'
+                ? 'Tokens y peticiones según proveedor'
+                : globalQuotaUnit === 'none'
+                  ? 'Por concurrencia / sin cuota fija'
+                  : totalLimit
+                    ? `Tope: ${totalLimit.toLocaleString('es-ES')} ${unitShort}`
+                    : isLearningState
+                      ? 'En aprendizaje por proveedor'
+                      : 'Cuota abierta por proveedor'}
             </span>
           </div>
         </article>
@@ -948,7 +1040,7 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <span className="meta-tag accent">{formatActiveWindowLabel(effectiveActiveWindow)}</span>
-              <span className="meta-tag">{formatConfidenceLabel(effectiveConfidence)}</span>
+              <span className="meta-tag">{globalConfidenceBadge}</span>
               {effectiveAdaptiveAdjusted ? (
                 <span className="status-badge rate_limited">Ajuste adaptativo 429</span>
               ) : null}
@@ -960,22 +1052,39 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
 
             {summaryLoading && !summary ? (
               <p className="field-hint">Consultando consumo en core/…</p>
-            ) : pctRemaining !== null ? (
+            ) : globalQuotaUnit === 'mixed' ? (
+              <p style={{ color: 'var(--sub)', fontSize: '0.88rem' }}>
+                Unidades mixtas (tokens y peticiones según proveedor) · revisa el desglose inferior
+                para ver el detalle de cada proveedor.
+              </p>
+            ) : globalQuotaUnit === 'none' ? (
+              <p style={{ color: 'var(--sub)', fontSize: '0.88rem' }}>
+                Tus proveedores activos operan por concurrencia o sin límite numérico fijo de cuota.
+              </p>
+            ) : totalLimit !== null && totalLimit > 0 ? (
               <p style={{ color: 'var(--sub)', fontSize: '0.88rem' }}>
                 Consumidos ({windowPhrase}):{' '}
                 <strong className="mono" style={{ color: 'var(--fg)' }}>
                   {usedToday.toLocaleString('es-ES')} {unitLabel}
                 </strong>
-                {totalLimit ? (
+                {usedToday > totalLimit ? (
+                  <>
+                    {' '}
+                    · Tope estimado:{' '}
+                    <strong className="mono" style={{ color: 'var(--fg)' }}>
+                      {totalLimit.toLocaleString('es-ES')} {unitPluralLabel}
+                    </strong>
+                  </>
+                ) : (
                   <>
                     {' '}
                     de{' '}
                     <strong className="mono" style={{ color: 'var(--fg)' }}>
-                      {totalLimit.toLocaleString('es-ES')}
+                      {totalLimit.toLocaleString('es-ES')} {unitPluralLabel}
                     </strong>{' '}
                     disponibles
                   </>
-                ) : null}
+                )}
               </p>
             ) : (
               <p style={{ color: 'var(--sub)', fontSize: '0.88rem' }}>
@@ -983,7 +1092,10 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
                   'Aún no hay proveedores ni topes configurados. Instala tu primer proveedor y define un tope estimado por cuenta para visualizar el porcentaje restante.'
                 ) : (
                   <>
-                    Sin tope numérico asignado · Consumo registrado ({windowPhrase}):{' '}
+                    {isLearningState
+                      ? 'En aprendizaje (sin tope fijo aún)'
+                      : 'Sin tope numérico asignado'}{' '}
+                    · Consumo registrado ({windowPhrase}):{' '}
                     <strong className="mono" style={{ color: 'var(--fg)' }}>
                       {usedToday.toLocaleString('es-ES')} {unitLabel}
                     </strong>
@@ -1001,11 +1113,15 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
               </>
             ) : (
               <>
-                <div className="quota-hero-pct">
-                  {effectiveProvidersCount === 0 ? '—' : '100%'}
-                </div>
+                <div className="quota-hero-pct">—</div>
                 <span className="field-hint">
-                  {effectiveProvidersCount === 0 ? 'sin claves aún' : 'cuota abierta'}
+                  {effectiveProvidersCount === 0
+                    ? 'sin claves aún'
+                    : globalQuotaUnit === 'none'
+                      ? 'sin límite fijo'
+                      : isLearningState
+                        ? 'en aprendizaje'
+                        : 'cuota abierta'}
                 </span>
               </>
             )}
@@ -1017,13 +1133,13 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
           role="progressbar"
           aria-valuemin={0}
           aria-valuemax={100}
-          aria-valuenow={pctRemaining ?? (effectiveProvidersCount === 0 ? 0 : 100)}
-          aria-label="Porcentaje de cuota gratuita disponible hoy"
+          aria-valuenow={pctRemaining ?? 0}
+          aria-label="Porcentaje de cuota gratuita disponible"
         >
           <div
             className={`quota-fill ${fillClass}`}
             style={{
-              width: `${pctRemaining ?? (effectiveProvidersCount === 0 ? 0 : 100)}%`,
+              width: `${pctRemaining ?? 0}%`,
             }}
           />
         </div>
@@ -1069,8 +1185,10 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
               const unitTxt = pq.unit === 'requests' ? 'pet.' : 'tok';
               const winTxt = pq.windowLabel || formatActiveWindowLabel(pq.activeWindow);
               const confidenceTxt =
-                pq.effectiveLimit === null && pq.recent429Count7d === 0
-                  ? 'Sin límite fijo'
+                pq.effectiveLimit === null
+                  ? pq.recent429Count7d === 0
+                    ? 'Sin límite fijo'
+                    : 'En aprendizaje (429)'
                   : formatConfidenceLabel(pq.confidence);
               return (
                 <div
