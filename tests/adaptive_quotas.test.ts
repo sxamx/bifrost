@@ -1066,5 +1066,414 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
         db.close();
       }
     });
+
+    it('7) Cold-start / burst guard: 6 early 429s without long reset (0-2 reqs) do NOT poison daily ceiling to 2', async () => {
+      const db = openDatabase(':memory:');
+      const masterKey = randomBytes(32);
+      let clockMs = Date.UTC(2026, 10, 21, 18, 0, 0);
+      let upstreamMode: 'ok' | 'early_429_no_header' | 'early_429_short_retry' = 'ok';
+
+      try {
+        const mockUpstream = await startMockServer((_req, res) => {
+          if (upstreamMode === 'ok') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                id: 'chatcmpl-or-ok',
+                object: 'chat.completion',
+                choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+              }),
+            );
+            return;
+          }
+          if (upstreamMode === 'early_429_short_retry') {
+            res.writeHead(429, {
+              'Content-Type': 'application/json',
+              'retry-after': '300',
+            });
+            res.end(JSON.stringify({ error: { message: 'Upstream :free model temporarily saturated' } }));
+            return;
+          }
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Upstream :free provider rate-limited' } }));
+        });
+
+        const app = createApp({ db, masterKey, now: () => clockMs });
+        const setupRes = await app.request('http://localhost/api/setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'admin', password: 'AdminPassword123!' }),
+        });
+        assert.equal(setupRes.status, 201);
+        const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+        const keyRes = await app.request('http://localhost/api/keys', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+          body: JSON.stringify({ name: 'openrouter-burst-test-key' }),
+        });
+        assert.equal(keyRes.status, 201);
+        const { rawKey } = (await keyRes.json()) as { rawKey: string };
+
+        const installRes = await app.request('http://localhost/api/providers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+          body: JSON.stringify({
+            schemaVersion: '1.0',
+            id: 'openrouter-burst',
+            name: 'OpenRouter',
+            packageType: 'experimental-adapter',
+            baseUrl: `${mockUpstream.url}/v1`,
+            auth: { type: 'bearer', header: 'Authorization', prefix: 'Bearer ' },
+            modelsSource: 'static',
+            reviewedAt: '2026-11-21',
+            adapter: { defaultPort: 8080, healthPath: '/health' },
+            staticModels: [{ id: 'free-model', name: 'Free Model' }],
+            rateLimitKind: 'requests',
+            rateLimitWindows: ['day'],
+          }),
+        });
+        assert.equal(installRes.status, 201);
+
+        const nowSec = Math.floor(clockMs / 1000);
+        const key1 = randomUUID();
+        const key2 = randomUUID();
+        const key3 = randomUUID();
+        const insertKey = db.prepare(
+          `INSERT INTO provider_keys (
+             id, provider_id, label, encrypted_secret, last4,
+             node_id, forced_node, daily_quota_limit, status, created_at
+           ) VALUES (?, 'openrouter-burst', ?, ?, ?, NULL, 0, NULL, 'active', ?)`,
+        );
+        insertKey.run(key1, 'Key 1', encryptSecret('sk-or-1', masterKey), '0001', nowSec - 300);
+        insertKey.run(key2, 'Key 2', encryptSecret('sk-or-2', masterKey), '0002', nowSec - 200);
+        insertKey.run(key3, 'Key 3', encryptSecret('sk-or-3', masterKey), '0003', nowSec - 100);
+
+        db.prepare(
+          `INSERT INTO models (
+             full_id, provider_id, model_id, name, modalities_json, capabilities_json, is_free, first_seen_at, active
+           ) VALUES ('openrouter-burst/free-model', 'openrouter-burst', 'free-model', 'Free Model', '{"input":["text"],"output":["text"]}', '{}', 1, ?, 1)`,
+        ).run(nowSec);
+
+        // 2 early successful requests (0-2 reqs on key)
+        for (let i = 0; i < 2; i++) {
+          const okRes = await app.request('http://localhost/v1/chat/completions', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${rawKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: 'openrouter-burst/free-model',
+              messages: [{ role: 'user', content: `early-${i}` }],
+            }),
+          });
+          assert.equal(okRes.status, 200);
+          clockMs += 5_000;
+        }
+
+        // Trigger 6 early 429s across retries without a long reset (>3600s):
+        // mix of missing Retry-After (repeated >30s apart) and short Retry-After: 300.
+        // Each router request fails across keys, recording 429 events while each key has 0-2 reqs.
+        upstreamMode = 'early_429_no_header';
+        clockMs += 65_000;
+        const r1 = await app.request('http://localhost/v1/chat/completions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${rawKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'openrouter-burst/free-model',
+            messages: [{ role: 'user', content: 'burst-wave-1' }],
+          }),
+        });
+        assert.equal(r1.status, 429);
+
+        // Advance 90s (> 60s default backoff, <= 600s repeat window) and hit 429 again on all 3 keys (total 6 x 429)
+        clockMs += 90_000;
+        upstreamMode = 'early_429_short_retry';
+        const r2 = await app.request('http://localhost/v1/chat/completions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${rawKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'openrouter-burst/free-model',
+            messages: [{ role: 'user', content: 'burst-wave-2' }],
+          }),
+        });
+        assert.equal(r2.status, 429);
+
+        // Advance past short 300s backoff and inspect adaptive quota
+        clockMs += 310_000;
+
+        const cacheRow = db
+          .prepare(`SELECT payload_json FROM external_cache WHERE cache_key = 'adaptive_rl:openrouter-burst'`)
+          .get() as { payload_json: string };
+        const storedEvents = JSON.parse(cacheRow.payload_json) as Array<{
+          kind: string;
+          observedRequests: number;
+        }>;
+        assert.equal(storedEvents.length, 6);
+        assert.ok(
+          storedEvents.every((e) => e.kind === 'burst'),
+          `Expected all 6 early 429 events to be classified as 'burst', got: ${JSON.stringify(storedEvents)}`,
+        );
+
+        const fqRes = await app.request('http://localhost/api/metrics/free-quota', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(fqRes.status, 200);
+        const fq = (await fqRes.json()) as {
+          effectiveLimit: number | null;
+          remainingInWindow: number | null;
+          quotaPercentageRemaining: number | null;
+          adaptiveAdjusted: boolean;
+          providers: Array<{
+            providerId: string;
+            usableKeysCount: number;
+            inferredLimit: number | null;
+            effectiveLimit: number | null;
+            usedInWindow: number;
+            remainingInWindow: number | null;
+            recent429Count7d: number;
+            adaptiveAdjusted: boolean;
+          }>;
+        };
+
+        const prov = fq.providers[0]!;
+        assert.equal(prov.usableKeysCount, 3);
+        assert.equal(prov.recent429Count7d, 6);
+        assert.equal(prov.inferredLimit, null);
+        assert.equal(prov.effectiveLimit, null);
+        assert.equal(prov.remainingInWindow, null);
+        assert.equal(prov.adaptiveAdjusted, false);
+        assert.equal(fq.effectiveLimit, null);
+        assert.equal(fq.quotaPercentageRemaining, null);
+
+        // Also verify pre-existing poisoned SQLite rows (kind='quota', observedRequests=2, resetDeltaSec=null/300)
+        // are neutralized on read by the cold-start guard
+        const evalNowSec = Math.floor(clockMs / 1000);
+        db.prepare(
+          `UPDATE external_cache SET payload_json = ?, fetched_at = ? WHERE cache_key = 'adaptive_rl:openrouter-burst'`,
+        ).run(
+          JSON.stringify(
+            Array.from({ length: 6 }, (_, idx) => ({
+              keyId: idx % 2 === 0 ? key1 : key2,
+              kind: 'quota',
+              windowSeconds: 86400,
+              observedTokens: 300,
+              observedRequests: idx < 3 ? 2 : 1,
+              resetDeltaSec: idx % 2 === 0 ? null : 300,
+              createdAt: evalNowSec - 600 + idx * 60,
+            })),
+          ),
+          evalNowSec,
+        );
+
+        const fqLegacyRes = await app.request('http://localhost/api/metrics/free-quota', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(fqLegacyRes.status, 200);
+        const fqLegacy = (await fqLegacyRes.json()) as typeof fq;
+        assert.equal(fqLegacy.providers[0]?.inferredLimit, null);
+        assert.equal(fqLegacy.providers[0]?.effectiveLimit, null);
+        assert.equal(fqLegacy.quotaPercentageRemaining, null);
+
+        // Explicit long reset header (resetDeltaSec > 3600, e.g., Retry-After until UTC midnight = 28800s)
+        // IS still honored as a real quota ceiling (2 * 3 keys = 6) when traffic has not exceeded it.
+        db.prepare(
+          `UPDATE external_cache SET payload_json = ?, fetched_at = ? WHERE cache_key = 'adaptive_rl:openrouter-burst'`,
+        ).run(
+          JSON.stringify([
+            {
+              keyId: key1,
+              kind: 'quota',
+              windowSeconds: 28800,
+              observedTokens: 300,
+              observedRequests: 2,
+              resetDeltaSec: 28800,
+              createdAt: evalNowSec - 30,
+            },
+          ]),
+          evalNowSec,
+        );
+
+        const fqLongResetRes = await app.request('http://localhost/api/metrics/free-quota', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(fqLongResetRes.status, 200);
+        const fqLongReset = (await fqLongResetRes.json()) as typeof fq;
+        assert.equal(fqLongReset.providers[0]?.inferredLimit, 6);
+        assert.equal(fqLongReset.providers[0]?.effectiveLimit, 6);
+      } finally {
+        db.close();
+      }
+    });
+
+    it('8) Upward auto-healing: stale inferred_429 = 2 in SQLite heals when 30 successful requests occur today (never 30/2 or 0%)', async () => {
+      const db = openDatabase(':memory:');
+      const masterKey = randomBytes(32);
+      const clockMs = Date.UTC(2026, 10, 21, 19, 0, 0);
+      const nowSec = Math.floor(clockMs / 1000);
+
+      try {
+        const app = createApp({ db, masterKey, now: () => clockMs });
+        const setupRes = await app.request('http://localhost/api/setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'admin', password: 'AdminPassword123!' }),
+        });
+        assert.equal(setupRes.status, 201);
+        const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+        const userRow = db.prepare(`SELECT id FROM users WHERE username = 'admin'`).get() as { id: string };
+
+        await app.request('http://localhost/api/providers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+          body: JSON.stringify(
+            baseManifest({
+              id: 'openrouter-heal',
+              name: 'OpenRouter',
+              rateLimitKind: 'requests',
+              rateLimitWindows: ['day'],
+            }),
+          ),
+        });
+
+        // 3 active keys with no manual daily_quota_limit (OpenRouter free tier)
+        const key1 = randomUUID();
+        const key2 = randomUUID();
+        const key3 = randomUUID();
+        const insertKey = db.prepare(
+          `INSERT INTO provider_keys (
+             id, provider_id, label, encrypted_secret, last4,
+             node_id, forced_node, daily_quota_limit, status, created_at
+           ) VALUES (?, 'openrouter-heal', ?, ?, ?, NULL, 0, NULL, 'active', ?)`,
+        );
+        insertKey.run(key1, 'Key 1', encryptSecret('sk-or-h1', masterKey), '1001', nowSec - 7200);
+        insertKey.run(key2, 'Key 2', encryptSecret('sk-or-h2', masterKey), '1002', nowSec - 7100);
+        insertKey.run(key3, 'Key 3', encryptSecret('sk-or-h3', masterKey), '1003', nowSec - 7000);
+
+        // Pre-existing inferred_429 ceiling = 2 on key1 (with explicit long reset > 3600s so it passes cold-start guard)
+        db.prepare(
+          `INSERT INTO external_cache (cache_key, payload_json, etag, fetched_at)
+           VALUES ('adaptive_rl:openrouter-heal', ?, NULL, ?)`,
+        ).run(
+          JSON.stringify([
+            {
+              keyId: key1,
+              kind: 'quota',
+              windowSeconds: 86400,
+              observedTokens: 500,
+              observedRequests: 2,
+              resetDeltaSec: 86400,
+              createdAt: nowSec - 3600,
+            },
+          ]),
+          nowSec - 3600,
+        );
+
+        // Sanity check: before today's 30 requests, inferred ceiling is active (2 * 3 = 6)
+        const beforeRes = await app.request('http://localhost/api/metrics/free-quota', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(beforeRes.status, 200);
+        const before = (await beforeRes.json()) as {
+          effectiveLimit: number | null;
+          quotaPercentageRemaining: number | null;
+          providers: Array<{ inferredLimit: number | null; effectiveLimit: number | null }>;
+        };
+        assert.equal(before.providers[0]?.inferredLimit, 6);
+        assert.equal(before.effectiveLimit, 6);
+
+        // Now record 30 successful requests today in the exact worst-case distribution:
+        // key1 has 2 requests (would keep ownCeiling=2 with remaining=0),
+        // key2 has 14 requests (> 2), key3 has 14 requests (> 2) -> total used = 30.
+        // Without provider-level upward auto-healing this produced "30 / 2 pet." and "0% disponible"!
+        const insertUsage = db.prepare(
+          `INSERT INTO usage_logs (
+             user_id, provider_id, provider_key_id, model_full_id,
+             prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
+             duration_ms, status, created_at
+           ) VALUES (?, 'openrouter-heal', ?, 'openrouter-heal/test-model', 100, 100, 0, 0, 50, 'ok', ?)`,
+        );
+        for (let i = 0; i < 2; i++) {
+          insertUsage.run(userRow.id, key1, nowSec - 1800 + i);
+        }
+        for (let i = 0; i < 14; i++) {
+          insertUsage.run(userRow.id, key2, nowSec - 1500 + i);
+        }
+        for (let i = 0; i < 14; i++) {
+          insertUsage.run(userRow.id, key3, nowSec - 1200 + i);
+        }
+
+        const afterRes = await app.request('http://localhost/api/metrics/free-quota', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(afterRes.status, 200);
+        const after = (await afterRes.json()) as {
+          effectiveLimit: number | null;
+          usedInWindow: number;
+          remainingInWindow: number | null;
+          quotaPercentageRemaining: number | null;
+          adaptiveAdjusted: boolean;
+          providers: Array<{
+            providerId: string;
+            inferredLimit: number | null;
+            effectiveLimit: number | null;
+            usedInWindow: number;
+            remainingInWindow: number | null;
+            adaptiveAdjusted: boolean;
+          }>;
+        };
+
+        const provAfter = after.providers[0]!;
+        assert.equal(provAfter.usedInWindow, 30);
+        assert.equal(provAfter.inferredLimit, null);
+        assert.equal(provAfter.effectiveLimit, null);
+        assert.equal(provAfter.remainingInWindow, null);
+        assert.equal(provAfter.adaptiveAdjusted, false);
+        assert.equal(after.usedInWindow, 30);
+        assert.equal(after.effectiveLimit, null);
+        assert.equal(after.remainingInWindow, null);
+        assert.equal(after.quotaPercentageRemaining, null);
+        assert.notEqual(after.quotaPercentageRemaining, 0);
+
+        // Also verify /api/metrics/summary reflects the healed state
+        const summaryRes = await app.request('http://localhost/api/metrics/summary', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(summaryRes.status, 200);
+        const summary = (await summaryRes.json()) as {
+          effectiveLimit: number | null;
+          quotaPercentageRemaining: number | null;
+          providerQuotas: Array<{
+            inferredLimit: number | null;
+            effectiveLimit: number | null;
+            usedInWindow: number;
+          }>;
+        };
+        assert.equal(summary.effectiveLimit, null);
+        assert.equal(summary.quotaPercentageRemaining, null);
+        assert.equal(summary.providerQuotas[0]?.usedInWindow, 30);
+        assert.equal(summary.providerQuotas[0]?.inferredLimit, null);
+        assert.equal(summary.providerQuotas[0]?.effectiveLimit, null);
+
+        // Also verify single-key + unattributed usage (30 > 2) never returns 30/2 or 0%
+        db.prepare(`DELETE FROM usage_logs WHERE provider_id = 'openrouter-heal'`).run();
+        db.prepare(`DELETE FROM provider_keys WHERE id IN (?, ?)`).run(key2, key3);
+        for (let i = 0; i < 30; i++) {
+          insertUsage.run(userRow.id, null, nowSec - 600 + i);
+        }
+
+        const unattrRes = await app.request('http://localhost/api/metrics/free-quota', {
+          headers: { Cookie: adminCookie },
+        });
+        assert.equal(unattrRes.status, 200);
+        const unattr = (await unattrRes.json()) as typeof after;
+        assert.equal(unattr.usedInWindow, 30);
+        assert.equal(unattr.effectiveLimit, null);
+        assert.equal(unattr.quotaPercentageRemaining, null);
+        assert.equal(unattr.providers[0]?.inferredLimit, null);
+        assert.equal(unattr.providers[0]?.effectiveLimit, null);
+      } finally {
+        db.close();
+      }
+    });
   });
 });

@@ -110,6 +110,23 @@ interface UsableKeyRow {
   status: string;
 }
 
+const MIN_REQUESTS_FOR_UNCONFIRMED_429_CEILING = 5;
+const LONG_RESET_DELTA_THRESHOLD_SEC = 3600;
+
+export function isEarlyRequest429Burst(
+  unit: QuotaUnit,
+  observedRequests: number,
+  resetDeltaSec: number | null,
+): boolean {
+  if (unit !== 'requests') return false;
+  const hasExplicitLongReset =
+    resetDeltaSec !== null &&
+    Number.isFinite(resetDeltaSec) &&
+    resetDeltaSec > LONG_RESET_DELTA_THRESHOLD_SEC;
+  if (hasExplicitLongReset) return false;
+  return observedRequests < MIN_REQUESTS_FOR_UNCONFIRMED_429_CEILING;
+}
+
 interface ParsedRlEvent {
   keyId: string | null;
   kind: 'burst' | 'quota';
@@ -230,8 +247,14 @@ export function computeAdaptiveFreeQuotas(
                 typeof e.resetDeltaSec === 'number' && Number.isFinite(e.resetDeltaSec)
                   ? e.resetDeltaSec
                   : null;
-              const kind: 'burst' | 'quota' =
-                e.kind === 'burst'
+              const observedRequests = Number(e.observedRequests ?? 0);
+              const kind: 'burst' | 'quota' = isEarlyRequest429Burst(
+                unit,
+                observedRequests,
+                resetDeltaSec,
+              )
+                ? 'burst'
+                : e.kind === 'burst'
                   ? 'burst'
                   : e.kind === 'quota'
                     ? 'quota'
@@ -257,7 +280,7 @@ export function computeAdaptiveFreeQuotas(
                 kind,
                 windowSeconds,
                 observedTokens: Number(e.observedTokens ?? 0),
-                observedRequests: Number(e.observedRequests ?? 0),
+                observedRequests,
                 resetDeltaSec,
                 createdAt: Number(e.createdAt ?? 0),
               };
@@ -297,31 +320,13 @@ export function computeAdaptiveFreeQuotas(
       continue;
     }
 
-    // Fix #1: Ignore 'burst' events when computing inferred quota ceilings & windows
+    // Fix #1: Ignore 'burst' events (including cold-start/early request 429s) when computing inferred ceilings & windows
     const quotaEvents = rlEvents.filter((e) => e.kind === 'quota');
 
     const headerDelta =
       earliestResetSec !== null ? Math.max(0, earliestResetSec - nowSec) : null;
     const headerWindowSeconds =
       hasHeaderSignal && headerDelta !== null && headerDelta > 120 ? headerDelta : null;
-
-    let inferredWindowSeconds: number | null = null;
-    if (quotaEvents.length > 0) {
-      const latest = quotaEvents[0]!;
-      if (latest.windowSeconds !== null && latest.windowSeconds > 120) {
-        inferredWindowSeconds = latest.windowSeconds;
-      } else if (quotaEvents.length >= 2) {
-        const span = Math.abs(quotaEvents[0]!.createdAt - quotaEvents[1]!.createdAt);
-        if (span <= 3600) inferredWindowSeconds = 3600;
-        else if (span <= 86400) inferredWindowSeconds = 86400;
-        else inferredWindowSeconds = 604800;
-      } else {
-        inferredWindowSeconds = manifestWindowSeconds;
-      }
-    }
-
-    let windowSeconds =
-      headerWindowSeconds ?? inferredWindowSeconds ?? manifestWindowSeconds;
 
     const queryUsageByKey = (winSec: number): {
       byKey: Map<string, number>;
@@ -359,104 +364,201 @@ export function computeAdaptiveFreeQuotas(
       return { byKey, unattributed };
     };
 
-    let usageSnapshot = queryUsageByKey(windowSeconds);
+    const evaluateQuotaCandidate = (
+      candidateEvents: ParsedRlEvent[],
+    ): {
+      windowSeconds: number;
+      inferredWindowSeconds: number | null;
+      usageSnapshot: { byKey: Map<string, number>; unattributed: number };
+      usedInWindow: number;
+      inferredLimit: number | null;
+      effectiveLimit: number | null;
+      remainingInWindow: number | null;
+      hasAnyInferred: boolean;
+    } => {
+      let candidateInferredWindowSec: number | null = null;
+      if (candidateEvents.length > 0) {
+        const latest = candidateEvents[0]!;
+        if (latest.windowSeconds !== null && latest.windowSeconds > 120) {
+          candidateInferredWindowSec = latest.windowSeconds;
+        } else if (candidateEvents.length >= 2) {
+          const span = Math.abs(
+            candidateEvents[0]!.createdAt - candidateEvents[1]!.createdAt,
+          );
+          if (span <= 3600) candidateInferredWindowSec = 3600;
+          else if (span <= 86400) candidateInferredWindowSec = 86400;
+          else candidateInferredWindowSec = 604800;
+        } else {
+          candidateInferredWindowSec = manifestWindowSeconds;
+        }
+      }
 
-    // Fix #4 + Auto-healing upward: evaluate each usable key's ceiling individually
-    const ownCeilingsByKey = new Map<string, number | null>();
-    for (const k of usableKeys) {
-      const keyUsed = usageSnapshot.byKey.get(k.id) ?? 0;
-      const keyEvents = quotaEvents.filter(
-        (e) => e.keyId === k.id || e.keyId === null,
+      let candidateWindowSec =
+        headerWindowSeconds ?? candidateInferredWindowSec ?? manifestWindowSeconds;
+      let usageSnapshot = queryUsageByKey(candidateWindowSec);
+
+      // Fix #4 + Auto-healing upward: evaluate each usable key's ceiling individually
+      const ownCeilingsByKey = new Map<string, number | null>();
+      for (const k of usableKeys) {
+        const keyUsed = usageSnapshot.byKey.get(k.id) ?? 0;
+        const keyEvents = candidateEvents.filter(
+          (e) => e.keyId === k.id || e.keyId === null,
+        );
+
+        let ownCeiling: number | null = null;
+        for (const evt of keyEvents) {
+          const val =
+            unit === 'requests'
+              ? Number(evt.observedRequests ?? 0)
+              : Number(evt.observedTokens ?? 0);
+          // Auto-healing upward (per-key): ignore stale inferred ceilings below proven successful usage
+          if (val > 0 && keyUsed <= val && (ownCeiling === null || val < ownCeiling)) {
+            ownCeiling = val;
+          }
+        }
+        ownCeilingsByKey.set(k.id, ownCeiling);
+      }
+
+      // Representative per-key inferred ceiling from usable keys with an active (non-healed) ceiling
+      const activeOwnCeilings = Array.from(ownCeilingsByKey.values()).filter(
+        (v): v is number => v !== null,
       );
+      const fallbackPerKeyCeiling =
+        activeOwnCeilings.length > 0 ? Math.min(...activeOwnCeilings) : null;
 
-      let ownCeiling: number | null = null;
-      for (const evt of keyEvents) {
+      // If all previously inferred quota ceilings healed upward, revert inferred window shift
+      if (fallbackPerKeyCeiling === null && headerWindowSeconds === null) {
+        if (candidateWindowSec !== manifestWindowSeconds) {
+          candidateWindowSec = manifestWindowSeconds;
+          usageSnapshot = queryUsageByKey(candidateWindowSec);
+        }
+      }
+
+      let providerInferredSum = 0;
+      let hasAnyInferred = false;
+      let providerEffectiveSum = 0;
+      let hasAnyEffective = false;
+      let providerRemainingSum = 0;
+      let hasAnyRemaining = false;
+      let usedInWindow = usageSnapshot.unattributed;
+
+      for (const k of usableKeys) {
+        const keyUsed = usageSnapshot.byKey.get(k.id) ?? 0;
+        usedInWindow += keyUsed;
+
+        const keyConfigured =
+          k.daily_quota_limit !== null && k.daily_quota_limit !== undefined
+            ? Number(k.daily_quota_limit)
+            : null;
+
+        let keyInferred = ownCeilingsByKey.get(k.id) ?? null;
+        if (keyInferred === null && fallbackPerKeyCeiling !== null) {
+          // Inherit provider per-key ceiling unless this key already proved higher usage
+          if (keyUsed <= fallbackPerKeyCeiling) {
+            keyInferred = fallbackPerKeyCeiling;
+          }
+        }
+
+        if (keyInferred !== null) {
+          providerInferredSum += keyInferred;
+          hasAnyInferred = true;
+        }
+
+        const keyHasLowerInferred =
+          keyInferred !== null && (keyConfigured === null || keyInferred < keyConfigured);
+        const keyEffective = keyHasLowerInferred ? keyInferred : keyConfigured;
+
+        if (keyEffective !== null) {
+          providerEffectiveSum += keyEffective;
+          hasAnyEffective = true;
+        }
+
+        const keyHasHeader = isRealHeaderSignal(k, nowSec);
+        const keyRemaining = keyHasHeader
+          ? Number(k.ratelimit_remaining ?? 0)
+          : keyEffective !== null
+            ? Math.max(0, keyEffective - keyUsed)
+            : null;
+
+        if (keyRemaining !== null) {
+          providerRemainingSum += keyRemaining;
+          hasAnyRemaining = true;
+        }
+      }
+
+      const inferredLimit = hasAnyInferred ? providerInferredSum : null;
+      const effectiveLimit = hasAnyEffective ? providerEffectiveSum : null;
+      const remainingInWindow = hasAnyRemaining
+        ? !hasHeaderSignal && usageSnapshot.unattributed > 0
+          ? Math.max(0, providerRemainingSum - usageSnapshot.unattributed)
+          : providerRemainingSum
+        : effectiveLimit !== null
+          ? Math.max(0, effectiveLimit - usedInWindow)
+          : null;
+
+      return {
+        windowSeconds: candidateWindowSec,
+        inferredWindowSeconds: candidateInferredWindowSec,
+        usageSnapshot,
+        usedInWindow,
+        inferredLimit,
+        effectiveLimit,
+        remainingInWindow,
+        hasAnyInferred,
+      };
+    };
+
+    let evalResult = evaluateQuotaCandidate(quotaEvents);
+
+    // Provider-level auto-healing upward:
+    // If there is no official header signal and an inferred_429 ceiling is already exceeded by
+    // proven successful usage in the current window (usedInWindow > inferredLimit), invalidate
+    // obsolete 429 events so the provider never reports `effectiveLimit < usedInWindow` or `0%`.
+    if (
+      !hasHeaderSignal &&
+      evalResult.hasAnyInferred &&
+      evalResult.inferredLimit !== null &&
+      evalResult.usedInWindow > evalResult.inferredLimit &&
+      (configuredLimit === null ||
+        (evalResult.effectiveLimit !== null &&
+          evalResult.usedInWindow > evalResult.effectiveLimit))
+    ) {
+      const maxKeyUsed = usableKeys.reduce(
+        (max, k) => Math.max(max, evalResult.usageSnapshot.byKey.get(k.id) ?? 0),
+        0,
+      );
+      const nonObsoleteQuotaEvents = quotaEvents.filter((evt) => {
         const val =
           unit === 'requests'
             ? Number(evt.observedRequests ?? 0)
             : Number(evt.observedTokens ?? 0);
-        // Auto-healing upward: ignore stale inferred ceilings that are below proven successful usage
-        if (val > 0 && keyUsed <= val && (ownCeiling === null || val < ownCeiling)) {
-          ownCeiling = val;
-        }
-      }
-      ownCeilingsByKey.set(k.id, ownCeiling);
-    }
+        if (val <= 0) return false;
+        if (val < maxKeyUsed) return false;
+        const scaledCapacity = val * Math.max(1, usableKeysCount);
+        return scaledCapacity >= evalResult.usedInWindow;
+      });
 
-    // Representative per-key inferred ceiling from usable keys with an active (non-healed) ceiling
-    const activeOwnCeilings = Array.from(ownCeilingsByKey.values()).filter(
-      (v): v is number => v !== null,
-    );
-    const fallbackPerKeyCeiling =
-      activeOwnCeilings.length > 0 ? Math.min(...activeOwnCeilings) : null;
+      evalResult = evaluateQuotaCandidate(nonObsoleteQuotaEvents);
 
-    // If all previously inferred quota ceilings healed upward, revert inferred window shift
-    if (fallbackPerKeyCeiling === null && headerWindowSeconds === null) {
-      if (windowSeconds !== manifestWindowSeconds) {
-        windowSeconds = manifestWindowSeconds;
-        usageSnapshot = queryUsageByKey(windowSeconds);
+      // Final guard: never return an inferred_429 ceiling already surpassed by successful usage
+      if (
+        evalResult.hasAnyInferred &&
+        evalResult.inferredLimit !== null &&
+        evalResult.usedInWindow > evalResult.inferredLimit
+      ) {
+        evalResult = evaluateQuotaCandidate([]);
       }
     }
 
-    let providerInferredSum = 0;
-    let hasAnyInferred = false;
-    let providerEffectiveSum = 0;
-    let hasAnyEffective = false;
-    let providerRemainingSum = 0;
-    let hasAnyRemaining = false;
-    let usedInWindow = usageSnapshot.unattributed;
-
-    for (const k of usableKeys) {
-      const keyUsed = usageSnapshot.byKey.get(k.id) ?? 0;
-      usedInWindow += keyUsed;
-
-      const keyConfigured =
-        k.daily_quota_limit !== null && k.daily_quota_limit !== undefined
-          ? Number(k.daily_quota_limit)
-          : null;
-
-      let keyInferred = ownCeilingsByKey.get(k.id) ?? null;
-      if (keyInferred === null && fallbackPerKeyCeiling !== null) {
-        // Inherit provider per-key ceiling unless this key already proved higher usage
-        if (keyUsed <= fallbackPerKeyCeiling) {
-          keyInferred = fallbackPerKeyCeiling;
-        }
-      }
-
-      if (keyInferred !== null) {
-        providerInferredSum += keyInferred;
-        hasAnyInferred = true;
-      }
-
-      const keyHasLowerInferred =
-        keyInferred !== null && (keyConfigured === null || keyInferred < keyConfigured);
-      const keyEffective = keyHasLowerInferred ? keyInferred : keyConfigured;
-
-      if (keyEffective !== null) {
-        providerEffectiveSum += keyEffective;
-        hasAnyEffective = true;
-      }
-
-      const keyHasHeader = isRealHeaderSignal(k, nowSec);
-      const keyRemaining = keyHasHeader
-        ? Number(k.ratelimit_remaining ?? 0)
-        : keyEffective !== null
-          ? Math.max(0, keyEffective - keyUsed)
-          : null;
-
-      if (keyRemaining !== null) {
-        providerRemainingSum += keyRemaining;
-        hasAnyRemaining = true;
-      }
-    }
-
-    const inferredLimit = hasAnyInferred ? providerInferredSum : null;
-    const effectiveLimit = hasAnyEffective ? providerEffectiveSum : null;
-    const remainingInWindow = hasAnyRemaining
-      ? providerRemainingSum
-      : effectiveLimit !== null
-        ? Math.max(0, effectiveLimit - usedInWindow)
-        : null;
+    const {
+      windowSeconds,
+      inferredWindowSeconds,
+      usedInWindow,
+      inferredLimit,
+      effectiveLimit,
+      remainingInWindow,
+      hasAnyInferred,
+    } = evalResult;
 
     const activeWindow = activeWindowFromSeconds(windowSeconds);
     const windowLabel = formatWindowLabel(windowSeconds);
