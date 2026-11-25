@@ -152,6 +152,26 @@ function parseClampedMaxTokens(raw: string): number {
   return Math.max(64, Math.min(32768, parsed));
 }
 
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  );
+}
+
+function advanceUtf16Index(target: string, currentIndex: number, step: number): number {
+  let next = Math.min(target.length, currentIndex + step);
+  if (next > 0 && next < target.length) {
+    const prevCode = target.charCodeAt(next - 1);
+    // Avoid splitting UTF-16 surrogate pairs (emojis / astral plane characters)
+    if (prevCode >= 0xd800 && prevCode <= 0xdbff) {
+      next = Math.min(target.length, next + 1);
+    }
+  }
+  return next;
+}
+
 export const PlaygroundTab: React.FC = () => {
   const [models, setModels] = useState<ProviderModelItem[]>([]);
   const [modelsLoading, setModelsLoading] = useState(true);
@@ -189,10 +209,12 @@ export const PlaygroundTab: React.FC = () => {
   const [turns, setTurns] = useState<DisplayChatTurn[]>([]);
   const [promptInput, setPromptInput] = useState('');
   const [streamingContent, setStreamingContent] = useState<string | null>(null);
+  const [streamingReasoning, setStreamingReasoning] = useState('');
   const [sending, setSending] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
 
   const scrollBoxRef = useRef<HTMLDivElement | null>(null);
+  const isNearBottomRef = useRef(true);
   const reqIdRef = useRef(0);
   const loadChatReqIdRef = useRef(0);
   const isMountedRef = useRef(true);
@@ -200,6 +222,13 @@ export const PlaygroundTab: React.FC = () => {
   const streamAbortRef = useRef<AbortController | null>(null);
   const settingsDebounceRef = useRef<number | null>(null);
   const bgPollTimerRef = useRef<number | null>(null);
+
+  // Adaptive 60fps stream smoothing buffers (avoid setState per micro-chunk SSE)
+  const streamTargetContentRef = useRef('');
+  const streamTargetReasoningRef = useRef('');
+  const streamDisplayedContentRef = useRef('');
+  const streamDisplayedReasoningRef = useRef('');
+  const streamRafRef = useRef<number | null>(null);
 
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
@@ -219,15 +248,94 @@ export const PlaygroundTab: React.FC = () => {
     }
   }, []);
 
+  const cancelStreamSmoothing = useCallback((resetState = true) => {
+    if (streamRafRef.current !== null) {
+      window.cancelAnimationFrame(streamRafRef.current);
+      streamRafRef.current = null;
+    }
+    streamTargetContentRef.current = '';
+    streamTargetReasoningRef.current = '';
+    streamDisplayedContentRef.current = '';
+    streamDisplayedReasoningRef.current = '';
+    if (resetState) {
+      setStreamingContent(null);
+      setStreamingReasoning('');
+    }
+  }, []);
+
+  const scheduleStreamSmoothing = useCallback((expectedReqId: number) => {
+    if (streamRafRef.current !== null) return;
+
+    const stepFrame = () => {
+      streamRafRef.current = null;
+      if (!isMountedRef.current || reqIdRef.current !== expectedReqId) return;
+
+      const targetR = streamTargetReasoningRef.current;
+      const displayedR = streamDisplayedReasoningRef.current;
+      const backlogR = targetR.length - displayedR.length;
+      if (backlogR > 0) {
+        const stepR = Math.max(2, Math.ceil(backlogR / 6));
+        const nextIdxR = advanceUtf16Index(targetR, displayedR.length, stepR);
+        const nextR = targetR.slice(0, nextIdxR);
+        streamDisplayedReasoningRef.current = nextR;
+        setStreamingReasoning(nextR);
+      }
+
+      const targetC = streamTargetContentRef.current;
+      const displayedC = streamDisplayedContentRef.current;
+      const backlogC = targetC.length - displayedC.length;
+      if (backlogC > 0) {
+        const stepC = Math.max(2, Math.ceil(backlogC / 6));
+        const nextIdxC = advanceUtf16Index(targetC, displayedC.length, stepC);
+        const nextC = targetC.slice(0, nextIdxC);
+        streamDisplayedContentRef.current = nextC;
+        setStreamingContent(nextC);
+      }
+
+      const remainingR =
+        streamTargetReasoningRef.current.length - streamDisplayedReasoningRef.current.length;
+      const remainingC =
+        streamTargetContentRef.current.length - streamDisplayedContentRef.current.length;
+      if (remainingR > 0 || remainingC > 0) {
+        streamRafRef.current = window.requestAnimationFrame(stepFrame);
+      }
+    };
+
+    streamRafRef.current = window.requestAnimationFrame(stepFrame);
+  }, []);
+
+  const pushStreamBuffer = useCallback(
+    (expectedReqId: number, partialContent: string, partialReasoning = '') => {
+      if (!isMountedRef.current || reqIdRef.current !== expectedReqId) return;
+      streamTargetContentRef.current = partialContent;
+      streamTargetReasoningRef.current = partialReasoning;
+
+      if (prefersReducedMotion()) {
+        if (streamRafRef.current !== null) {
+          window.cancelAnimationFrame(streamRafRef.current);
+          streamRafRef.current = null;
+        }
+        streamDisplayedContentRef.current = partialContent;
+        streamDisplayedReasoningRef.current = partialReasoning;
+        setStreamingContent(partialContent);
+        setStreamingReasoning(partialReasoning);
+        return;
+      }
+
+      scheduleStreamSmoothing(expectedReqId);
+    },
+    [scheduleStreamSmoothing]
+  );
+
   const abortLocalStream = useCallback(() => {
     if (streamAbortRef.current) {
       streamAbortRef.current.abort();
       streamAbortRef.current = null;
     }
     reqIdRef.current += 1;
-    setStreamingContent(null);
+    cancelStreamSmoothing(true);
     setSending(false);
-  }, []);
+  }, [cancelStreamSmoothing]);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -238,6 +346,10 @@ export const PlaygroundTab: React.FC = () => {
       if (streamAbortRef.current) {
         streamAbortRef.current.abort();
         streamAbortRef.current = null;
+      }
+      if (streamRafRef.current !== null) {
+        window.cancelAnimationFrame(streamRafRef.current);
+        streamRafRef.current = null;
       }
       if (settingsDebounceRef.current !== null) {
         window.clearTimeout(settingsDebounceRef.current);
@@ -362,6 +474,7 @@ export const PlaygroundTab: React.FC = () => {
       clearSettingsDebounce();
 
       const reqId = ++loadChatReqIdRef.current;
+      isNearBottomRef.current = true;
       setLoadingChatId(chatId);
       setChatError(null);
       setHistoryError(null);
@@ -450,11 +563,18 @@ export const PlaygroundTab: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const handleChatScroll = useCallback(() => {
+    const el = scrollBoxRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isNearBottomRef.current = distanceFromBottom <= 72;
+  }, []);
+
   useEffect(() => {
-    if (scrollBoxRef.current) {
+    if (scrollBoxRef.current && isNearBottomRef.current) {
       scrollBoxRef.current.scrollTop = scrollBoxRef.current.scrollHeight;
     }
-  }, [turns, streamingContent, activeChatInProgress]);
+  }, [turns, streamingContent, streamingReasoning, activeChatInProgress]);
 
   const currentModelObj = models.find((m) => m.fullId === selectedModel) ?? null;
   const supportsReasoning = Boolean(currentModelObj?.capabilities?.reasoning);
@@ -691,9 +811,12 @@ export const PlaygroundTab: React.FC = () => {
     };
 
     const nextHistory = [...turns, userTurn];
+    isNearBottomRef.current = true;
+    cancelStreamSmoothing(false);
     setTurns(nextHistory);
     setPromptInput('');
     setSending(true);
+    setStreamingReasoning('');
     setStreamingContent('');
 
     const apiMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [];
@@ -738,10 +861,8 @@ export const PlaygroundTab: React.FC = () => {
           chatId: targetChatId,
           stream: true,
         },
-        (partial) => {
-          if (isMountedRef.current && reqId === reqIdRef.current) {
-            setStreamingContent(partial);
-          }
+        (partial, partialReasoning) => {
+          pushStreamBuffer(reqId, partial, partialReasoning ?? '');
         },
         { signal: controller.signal }
       );
@@ -752,6 +873,7 @@ export const PlaygroundTab: React.FC = () => {
       if (!isMountedRef.current) return;
 
       if (reqId === reqIdRef.current && activeChatIdRef.current === targetChatId) {
+        cancelStreamSmoothing(true);
         const assistantTurn: DisplayChatTurn = {
           id: `a-${Date.now()}`,
           role: 'assistant',
@@ -764,7 +886,6 @@ export const PlaygroundTab: React.FC = () => {
           createdAt: Date.now(),
         };
         setTurns((prev) => [...prev, assistantTurn]);
-        setStreamingContent(null);
         setSending(false);
         setActiveChatInProgress(false);
 
@@ -808,7 +929,7 @@ export const PlaygroundTab: React.FC = () => {
       if (!isMountedRef.current || reqId !== reqIdRef.current) return;
 
       streamAbortRef.current = null;
-      setStreamingContent(null);
+      cancelStreamSmoothing(true);
       setSending(false);
       setActiveChatInProgress(false);
 
@@ -1280,7 +1401,11 @@ export const PlaygroundTab: React.FC = () => {
             </div>
           ) : null}
 
-          <div ref={scrollBoxRef} className="chat-messages-scroll">
+          <div
+            ref={scrollBoxRef}
+            className="chat-messages-scroll"
+            onScroll={handleChatScroll}
+          >
             {loadingChatId ? (
               <div className="empty-state" style={{ margin: 'auto 0' }}>
                 <div className="spinner" aria-hidden="true" />
@@ -1371,8 +1496,29 @@ export const PlaygroundTab: React.FC = () => {
 
                 {streamingContent !== null ? (
                   <div className="chat-bubble assistant">
+                    {streamingReasoning ? (
+                      <details
+                        open
+                        style={{
+                          background: 'var(--panel)',
+                          border: '1px solid var(--line)',
+                          borderRadius: 8,
+                          padding: '8px 12px',
+                          fontSize: '0.82rem',
+                          color: 'var(--sub)',
+                        }}
+                      >
+                        <summary style={{ cursor: 'pointer', fontWeight: 700 }}>
+                          Cadena de razonamiento
+                        </summary>
+                        <p style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>
+                          {streamingReasoning}
+                        </p>
+                      </details>
+                    ) : null}
                     <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                      {streamingContent || 'Generando respuesta…'}
+                      {streamingContent ||
+                        (streamingReasoning ? 'Redactando respuesta…' : 'Generando respuesta…')}
                     </div>
                   </div>
                 ) : activeChatInProgress ? (
