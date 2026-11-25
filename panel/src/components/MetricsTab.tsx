@@ -352,7 +352,15 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
               <span className="meta-tag accent">
                 Ventana: {formatQuotaWindow(freeQuota.activeWindow)}
               </span>
-              <span className="meta-tag">{formatQuotaConfidence(freeQuota.confidence)}</span>
+              <span className="meta-tag">
+                {freeQuota.effectiveLimit === null &&
+                !freeQuota.adaptiveAdjusted &&
+                freeQuota.confidence === 'inferred'
+                  ? freeQuota.providers.some((p) => p.recent429Count7d > 0)
+                    ? 'En aprendizaje (429)'
+                    : 'Sin límite fijo'
+                  : formatQuotaConfidence(freeQuota.confidence)}
+              </span>
               {freeQuota.adaptiveAdjusted ? (
                 <span className="status-badge rate_limited">Ajuste adaptativo 429</span>
               ) : null}
@@ -370,8 +378,10 @@ export const MetricsTab: React.FC<MetricsTabProps> = ({
               const unitTxt = pq.unit === 'requests' ? 'pet.' : 'tok';
               const winTxt = pq.windowLabel || formatQuotaWindow(pq.activeWindow);
               const confidenceTxt =
-                pq.effectiveLimit === null && pq.recent429Count7d === 0
-                  ? 'Sin límite fijo'
+                pq.effectiveLimit === null
+                  ? pq.recent429Count7d === 0
+                    ? 'Sin límite fijo'
+                    : 'En aprendizaje (429)'
                   : formatQuotaConfidence(pq.confidence);
               return (
                 <div
