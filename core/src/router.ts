@@ -1,6 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { decryptSecret } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
+import { isEarlyRequest429Burst } from './metrics/adaptive-quota.js';
 import {
   type NodeMode,
   type UpstreamTlsOptions,
@@ -185,10 +186,18 @@ function updateKeyHealthy(
     `UPDATE provider_keys
      SET status = 'active',
          last_error = NULL,
-         ratelimit_remaining = COALESCE(?, ratelimit_remaining),
-         ratelimit_reset_at = COALESCE(?, ratelimit_reset_at)
+         ratelimit_remaining = CASE
+           WHEN ? IS NOT NULL THEN ?
+           WHEN status = 'rate_limited' AND ratelimit_remaining = 0 THEN NULL
+           ELSE ratelimit_remaining
+         END,
+         ratelimit_reset_at = CASE
+           WHEN ? IS NOT NULL THEN ?
+           WHEN status = 'rate_limited' AND ratelimit_remaining = 0 THEN NULL
+           ELSE ratelimit_reset_at
+         END
      WHERE id = ?`,
-  ).run(remaining, resetAt, keyId);
+  ).run(remaining, remaining, resetAt, resetAt, keyId);
 }
 
 function inferWindowFromResetDelta(resetDeltaSec: number | null): 'hour' | 'day' | 'week' | null {
@@ -396,6 +405,16 @@ function recordRateLimitEvent(
 
   const observedTokens = Number(usageRow?.observed_tokens ?? 0);
   const observedRequests = Number(usageRow?.observed_requests ?? 0);
+
+  // Cold-start / upstream saturation burst guard for request-limited providers:
+  // Do not infer a daily quota ceiling from early 429s (< 5 successful requests on the key)
+  // unless upstream explicitly sends a long reset header (resetDeltaSec > 3600s).
+  if (
+    manifestRateLimitKind === 'requests' &&
+    isEarlyRequest429Burst('requests', observedRequests, resetDeltaSec)
+  ) {
+    kind = 'burst';
+  }
 
   events.unshift({
     keyId,
