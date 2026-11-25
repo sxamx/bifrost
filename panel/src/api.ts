@@ -1144,7 +1144,7 @@ export const api = {
 
   streamPlaygroundChat(
     input: PlaygroundChatRequest,
-    onDelta?: (partialText: string) => void,
+    onDelta?: (partialText: string, partialReasoning?: string) => void,
     options?: { signal?: AbortSignal }
   ): Promise<PlaygroundChatResponse> {
     return this.sendPlaygroundChat(
@@ -1156,7 +1156,7 @@ export const api = {
 
   async sendPlaygroundChat(
     input: PlaygroundChatRequest,
-    onDelta?: (partialText: string) => void,
+    onDelta?: (partialText: string, partialReasoning?: string) => void,
     options?: { signal?: AbortSignal }
   ): Promise<PlaygroundChatResponse> {
     const startedMs = performance.now();
@@ -1273,14 +1273,14 @@ export const api = {
                 }
                 contentAcc += deltaText;
                 reasoningAcc += deltaReasoning;
-                onDelta?.(contentAcc);
+                onDelta?.(contentAcc, reasoningAcc);
               }
             } else if (typeof evt.delta === 'string') {
               if (firstTokenMs === null) {
                 firstTokenMs = Math.round(performance.now() - startedMs);
               }
               contentAcc += evt.delta;
-              onDelta?.(contentAcc);
+              onDelta?.(contentAcc, reasoningAcc);
             }
           } catch {
             // Ignore malformed SSE comment/chunk
