@@ -8,6 +8,10 @@ BIFROST_USER="${BIFROST_USER:-bifrost}"
 BIFROST_GROUP="${BIFROST_GROUP:-bifrost}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/bifrost}"
 DATA_DIR="${DATA_DIR:-/var/lib/bifrost}"
+PORT_EXPLICIT=0
+if [[ -n "${PORT+x}" && -n "${PORT}" ]]; then
+  PORT_EXPLICIT=1
+fi
 PORT="${PORT:-8080}"
 ENV_FILE="/etc/default/bifrost"
 SERVICE_NAME="bifrost.service"
@@ -15,6 +19,10 @@ SERVICE_DEST="/etc/systemd/system/${SERVICE_NAME}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
 
 log() {
   printf '\033[1;34m[bifrost]\033[0m %s\n' "$*"
@@ -104,21 +112,24 @@ log "Preparando directorios '${INSTALL_DIR}' (0755) y '${DATA_DIR}' (0700)..."
 mkdir -p "${INSTALL_DIR}" "${DATA_DIR}"
 chmod 0755 "${INSTALL_DIR}"
 chmod 0700 "${DATA_DIR}"
-chown -R "${BIFROST_USER}:${BIFROST_GROUP}" "${DATA_DIR}"
 
 # 4. Provision /var/lib/bifrost/master.key (32 random bytes, 0600, never overwrite!)
 MASTER_KEY_PATH="${DATA_DIR}/master.key"
 DB_PATH="${DATA_DIR}/bifrost.db"
+
+if [[ -L "${MASTER_KEY_PATH}" ]] || { [[ -e "${MASTER_KEY_PATH}" ]] && [[ ! -f "${MASTER_KEY_PATH}" ]]; }; then
+  err "La ruta ${MASTER_KEY_PATH} existe pero no es un archivo regular. Abortando sin sobrescribir."
+  exit 1
+fi
+
+chown -hR "${BIFROST_USER}:${BIFROST_GROUP}" "${DATA_DIR}"
 
 HAS_PERSISTED_ENV_KEY=0
 if [[ -f "${ENV_FILE}" ]] && grep -Eq '^[[:space:]]*BIFROST_MASTER_KEY=[^[:space:]#]+' "${ENV_FILE}"; then
   HAS_PERSISTED_ENV_KEY=1
 fi
 
-if [[ -L "${MASTER_KEY_PATH}" ]] || { [[ -e "${MASTER_KEY_PATH}" ]] && [[ ! -f "${MASTER_KEY_PATH}" ]]; }; then
-  err "La ruta ${MASTER_KEY_PATH} existe pero no es un archivo regular. Abortando sin sobrescribir."
-  exit 1
-elif [[ -f "${MASTER_KEY_PATH}" ]]; then
+if [[ -f "${MASTER_KEY_PATH}" ]]; then
   KEY_BYTES="$(wc -c < "${MASTER_KEY_PATH}" | tr -d '[:space:]')"
   if [[ "${KEY_BYTES}" -ne 32 ]]; then
     err "La llave existente en ${MASTER_KEY_PATH} es inválida (${KEY_BYTES} bytes; se esperan exactamente 32 bytes). Abortando sin sobrescribir."
@@ -186,25 +197,32 @@ chmod 0755 "${INSTALL_DIR}/nodes/install-node.sh"
 
 log "Instalando dependencias y compilando panel (${INSTALL_DIR}/panel)..."
 if [[ -f "${INSTALL_DIR}/panel/package-lock.json" ]]; then
-  npm --prefix "${INSTALL_DIR}/panel" ci
+  NODE_ENV=development npm --prefix "${INSTALL_DIR}/panel" ci
 else
-  npm --prefix "${INSTALL_DIR}/panel" install
+  NODE_ENV=development npm --prefix "${INSTALL_DIR}/panel" install
 fi
-npm --prefix "${INSTALL_DIR}/panel" run build
+NODE_ENV=development npm --prefix "${INSTALL_DIR}/panel" run build
 rm -rf "${INSTALL_DIR}/panel/node_modules"
 
 log "Instalando dependencias y compilando núcleo (${INSTALL_DIR}/core)..."
 if [[ -f "${INSTALL_DIR}/core/package-lock.json" ]]; then
-  npm --prefix "${INSTALL_DIR}/core" ci
+  NODE_ENV=development npm --prefix "${INSTALL_DIR}/core" ci
 else
-  npm --prefix "${INSTALL_DIR}/core" install
+  NODE_ENV=development npm --prefix "${INSTALL_DIR}/core" install
 fi
-npm --prefix "${INSTALL_DIR}/core" run build
+NODE_ENV=development npm --prefix "${INSTALL_DIR}/core" run build
 npm --prefix "${INSTALL_DIR}/core" prune --omit=dev
 
 chown -R "${BIFROST_USER}:${BIFROST_GROUP}" "${INSTALL_DIR}"
 
 # 6. Provision /etc/default/bifrost (if absent) and install systemd unit
+SED_USER="$(escape_sed_replacement "${BIFROST_USER}")"
+SED_GROUP="$(escape_sed_replacement "${BIFROST_GROUP}")"
+SED_INSTALL_DIR="$(escape_sed_replacement "${INSTALL_DIR}")"
+SED_DATA_DIR="$(escape_sed_replacement "${DATA_DIR}")"
+SED_PORT="$(escape_sed_replacement "${PORT}")"
+SED_NODE_BIN="$(escape_sed_replacement "${NODE_BIN}")"
+
 if [[ ! -f "${ENV_FILE}" ]]; then
   (
     umask 0077
@@ -217,21 +235,27 @@ PANEL_DIST_DIR=${INSTALL_DIR}/panel/dist
 EOF
   )
   chmod 0600 "${ENV_FILE}"
+elif [[ "${PORT_EXPLICIT}" -eq 1 ]]; then
+  if grep -Eq '^[[:space:]]*PORT=' "${ENV_FILE}"; then
+    sed -i -e "s|^[[:space:]]*PORT=.*|PORT=${SED_PORT}|" "${ENV_FILE}"
+  else
+    printf '\nPORT=%s\n' "${PORT}" >> "${ENV_FILE}"
+  fi
 fi
 
 log "Instalando servicio systemd en ${SERVICE_DEST}..."
 install -m 0644 "${INSTALL_DIR}/scripts/${SERVICE_NAME}" "${SERVICE_DEST}"
 
 sed -i \
-  -e "s|^User=.*|User=${BIFROST_USER}|" \
-  -e "s|^Group=.*|Group=${BIFROST_GROUP}|" \
-  -e "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}/core|" \
-  -e "s|^Environment=PORT=.*|Environment=PORT=${PORT}|" \
-  -e "s|^Environment=DATA_DIR=.*|Environment=DATA_DIR=${DATA_DIR}|" \
-  -e "s|^Environment=PANEL_DIST_DIR=.*|Environment=PANEL_DIST_DIR=${INSTALL_DIR}/panel/dist|" \
-  -e "s|^ExecStart=.*|ExecStart=${NODE_BIN} ${INSTALL_DIR}/core/dist/index.js|" \
-  -e "s|^ReadWritePaths=.*|ReadWritePaths=${DATA_DIR}|" \
-  -e "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${INSTALL_DIR}|" \
+  -e "s|^User=.*|User=${SED_USER}|" \
+  -e "s|^Group=.*|Group=${SED_GROUP}|" \
+  -e "s|^WorkingDirectory=.*|WorkingDirectory=${SED_INSTALL_DIR}/core|" \
+  -e "s|^Environment=PORT=.*|Environment=PORT=${SED_PORT}|" \
+  -e "s|^Environment=DATA_DIR=.*|Environment=DATA_DIR=${SED_DATA_DIR}|" \
+  -e "s|^Environment=PANEL_DIST_DIR=.*|Environment=PANEL_DIST_DIR=${SED_INSTALL_DIR}/panel/dist|" \
+  -e "s|^ExecStart=.*|ExecStart=\"${SED_NODE_BIN}\" \"${SED_INSTALL_DIR}/core/dist/index.js\"|" \
+  -e "s|^ReadWritePaths=.*|ReadWritePaths=${SED_DATA_DIR}|" \
+  -e "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${SED_INSTALL_DIR}|" \
   "${SERVICE_DEST}"
 
 systemctl daemon-reload

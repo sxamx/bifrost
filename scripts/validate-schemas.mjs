@@ -14,6 +14,8 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 const SCHEMAS_DIR = path.join(REPO_ROOT, 'schemas');
 const EXAMPLES_DIR = path.join(SCHEMAS_DIR, 'examples');
+const MARKETPLACE_REPO_DIR = path.join(SCHEMAS_DIR, 'marketplace-repo');
+const SAFE_MANIFEST_PATH_RE = /^providers\/[a-z0-9-]+\.json$/;
 
 function isValidIsoDate(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
@@ -26,6 +28,18 @@ function isValidIsoDate(value) {
     dt.getUTCMonth() === month - 1 &&
     dt.getUTCDate() === day
   );
+}
+
+function isValidHttpUri(value) {
+  if (typeof value !== 'string' || value.trim().length === 0 || /\s/.test(value)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 function isValidUri(value) {
@@ -106,10 +120,32 @@ export function validateAgainstSchema(value, schema, pointer = '$') {
     }
   }
 
-  if (Array.isArray(value) && schema.items) {
-    value.forEach((item, idx) => {
-      errors.push(...validateAgainstSchema(item, schema.items, `${pointer}[${idx}]`));
-    });
+  if (typeof value === 'number') {
+    if (typeof schema.minimum === 'number' && value < schema.minimum) {
+      errors.push(`${pointer}: value ${value} is less than minimum ${schema.minimum}`);
+    }
+    if (typeof schema.maximum === 'number' && value > schema.maximum) {
+      errors.push(`${pointer}: value ${value} exceeds maximum ${schema.maximum}`);
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (schema.items) {
+      value.forEach((item, idx) => {
+        errors.push(...validateAgainstSchema(item, schema.items, `${pointer}[${idx}]`));
+      });
+    }
+    if (schema.uniqueItems === true) {
+      const seen = new Set();
+      value.forEach((item, idx) => {
+        const key = JSON.stringify(item);
+        if (seen.has(key)) {
+          errors.push(`${pointer}[${idx}]: duplicate item ${key} (uniqueItems: true)`);
+        } else {
+          seen.add(key);
+        }
+      });
+    }
   }
 
   if (typeof value === 'object' && !Array.isArray(value)) {
@@ -139,6 +175,21 @@ export function validateAgainstSchema(value, schema, pointer = '$') {
 
 function validateProviderSemantics(manifest) {
   const errors = [];
+  if (typeof manifest.baseUrl === 'string') {
+    if (!isValidHttpUri(manifest.baseUrl)) {
+      errors.push('$.baseUrl: must be an http:// or https:// URI');
+    } else {
+      const parsed = new URL(manifest.baseUrl);
+      if (parsed.username || parsed.password) {
+        errors.push('$.baseUrl: credentials (userinfo) are not allowed in URL');
+      }
+      const pkgType =
+        manifest.packageType === 'experimental-adapter' ? 'experimental-adapter' : 'official-json';
+      if (pkgType === 'official-json' && parsed.protocol !== 'https:') {
+        errors.push('$.baseUrl: official-json providers must use https://');
+      }
+    }
+  }
   if (manifest.modelsSource === 'static') {
     if (!manifest.reviewedAt) {
       errors.push('$.reviewedAt: required when modelsSource is "static"');
@@ -147,13 +198,211 @@ function validateProviderSemantics(manifest) {
       errors.push('$.staticModels: non-empty array required when modelsSource is "static"');
     }
   }
-  if (manifest.modelsSource === 'api' && !manifest.modelsEndpoint) {
-    errors.push('$.modelsEndpoint: required when modelsSource is "api"');
+  if (manifest.modelsSource === 'api') {
+    if (typeof manifest.modelsEndpoint !== 'string' || manifest.modelsEndpoint.trim().length === 0) {
+      errors.push('$.modelsEndpoint: required when modelsSource is "api"');
+    }
   }
   if (manifest.packageType === 'experimental-adapter' && !manifest.adapter) {
     errors.push('$.adapter: required when packageType is "experimental-adapter"');
   }
+  if (manifest.privacy !== undefined) {
+    if (!manifest.privacy || typeof manifest.privacy !== 'object' || Array.isArray(manifest.privacy)) {
+      errors.push('$.privacy: must be an object');
+    } else {
+      const priv = manifest.privacy;
+      const validRetention = ['zero', 'transient', 'retained', 'variable'];
+      const validTraining = ['never', 'opt_out', 'allowed', 'unknown'];
+      if (typeof priv.retention !== 'string' || !validRetention.includes(priv.retention)) {
+        errors.push(`$.privacy.retention: must be one of ${validRetention.join(', ')}`);
+      }
+      if (typeof priv.training !== 'string' || !validTraining.includes(priv.training)) {
+        errors.push(`$.privacy.training: must be one of ${validTraining.join(', ')}`);
+      }
+      if (priv.retentionDays !== undefined) {
+        if (
+          typeof priv.retentionDays !== 'number' ||
+          !Number.isInteger(priv.retentionDays) ||
+          priv.retentionDays < 0
+        ) {
+          errors.push('$.privacy.retentionDays: must be a non-negative integer');
+        }
+      }
+      if (priv.policyUrl !== undefined) {
+        if (typeof priv.policyUrl !== 'string' || !isValidHttpUri(priv.policyUrl)) {
+          errors.push('$.privacy.policyUrl: must be an http:// or https:// URI');
+        }
+      }
+      if (priv.note !== undefined && typeof priv.note !== 'string') {
+        errors.push('$.privacy.note: must be a string');
+      }
+    }
+  }
+  if (manifest.rateLimitKind !== undefined) {
+    const validKinds = ['none', 'requests', 'tokens', 'concurrency'];
+    if (typeof manifest.rateLimitKind !== 'string' || !validKinds.includes(manifest.rateLimitKind)) {
+      errors.push(`$.rateLimitKind: must be one of ${validKinds.join(', ')}`);
+    }
+  }
+  if (manifest.rateLimitWindows !== undefined) {
+    if (!Array.isArray(manifest.rateLimitWindows)) {
+      errors.push('$.rateLimitWindows: must be an array');
+    } else {
+      const validWindows = ['hour', 'day', 'week'];
+      const seen = new Set();
+      for (let i = 0; i < manifest.rateLimitWindows.length; i += 1) {
+        const w = manifest.rateLimitWindows[i];
+        if (typeof w !== 'string' || !validWindows.includes(w)) {
+          errors.push(`$.rateLimitWindows[${i}]: must be one of ${validWindows.join(', ')}`);
+        } else if (seen.has(w)) {
+          errors.push(`$.rateLimitWindows[${i}]: duplicate window "${w}"`);
+        } else {
+          seen.add(w);
+        }
+      }
+      if (manifest.rateLimitKind === 'none' && manifest.rateLimitWindows.length > 0) {
+        errors.push('$.rateLimitWindows: must be empty or omitted when rateLimitKind is "none"');
+      }
+    }
+  }
   return errors;
+}
+
+export function validateMarketplaceRepo(providerSchema, repoDir = MARKETPLACE_REPO_DIR) {
+  const errors = [];
+  const indexPath = path.join(repoDir, 'index.json');
+  const providersDir = path.join(repoDir, 'providers');
+
+  if (!fs.existsSync(indexPath)) {
+    errors.push(`Missing marketplace index: ${indexPath}`);
+    return { errors, validatedProviders: 0 };
+  }
+
+  let indexData;
+  try {
+    indexData = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  } catch (err) {
+    errors.push(`schemas/marketplace-repo/index.json: invalid JSON (${err.message})`);
+    return { errors, validatedProviders: 0 };
+  }
+
+  if (!indexData || typeof indexData !== 'object' || Array.isArray(indexData)) {
+    errors.push('schemas/marketplace-repo/index.json: root must be a JSON object');
+    return { errors, validatedProviders: 0 };
+  }
+
+  if (indexData.schemaVersion !== '1.0') {
+    errors.push(`index.json $.schemaVersion: expected "1.0", got ${JSON.stringify(indexData.schemaVersion)}`);
+  }
+  if (typeof indexData.repository !== 'string' || indexData.repository.trim().length === 0) {
+    errors.push('index.json $.repository: non-empty string required');
+  }
+  if (typeof indexData.updatedAt !== 'string' || !isValidIsoDate(indexData.updatedAt)) {
+    errors.push(`index.json $.updatedAt: invalid ISO date ${JSON.stringify(indexData.updatedAt)}`);
+  }
+  if (!Array.isArray(indexData.providers) || indexData.providers.length === 0) {
+    errors.push('index.json $.providers: non-empty array required');
+    return { errors, validatedProviders: 0 };
+  }
+
+  const seenIds = new Set();
+  const validatedFiles = new Set();
+
+  for (let i = 0; i < indexData.providers.length; i += 1) {
+    const entry = indexData.providers[i];
+    const ptr = `index.json $.providers[${i}]`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      errors.push(`${ptr}: expected object`);
+      continue;
+    }
+    if (typeof entry.id !== 'string' || !/^[a-z0-9-]+$/.test(entry.id)) {
+      errors.push(`${ptr}.id: invalid provider id ${JSON.stringify(entry.id)}`);
+    } else if (seenIds.has(entry.id)) {
+      errors.push(`${ptr}.id: duplicate provider id "${entry.id}"`);
+    } else {
+      seenIds.add(entry.id);
+    }
+    if (typeof entry.name !== 'string' || entry.name.trim().length === 0) {
+      errors.push(`${ptr}.name: non-empty string required`);
+    }
+    if (typeof entry.approved !== 'boolean') {
+      errors.push(`${ptr}.approved: boolean required`);
+    }
+    if (entry.publishedAt !== undefined && !isValidIsoDate(entry.publishedAt)) {
+      errors.push(`${ptr}.publishedAt: invalid ISO date ${JSON.stringify(entry.publishedAt)}`);
+    }
+    if (typeof entry.manifestPath !== 'string' || !SAFE_MANIFEST_PATH_RE.test(entry.manifestPath)) {
+      errors.push(`${ptr}.manifestPath: must match ^providers/[a-z0-9-]+\\.json$`);
+      continue;
+    }
+
+    const resolvedFile = path.resolve(repoDir, entry.manifestPath);
+    const rel = path.relative(repoDir, resolvedFile);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      errors.push(`${ptr}.manifestPath: escapes marketplace-repo directory`);
+      continue;
+    }
+    if (!fs.existsSync(resolvedFile)) {
+      errors.push(`${ptr}.manifestPath: target file does not exist (${entry.manifestPath})`);
+      continue;
+    }
+
+    let manifest;
+    try {
+      manifest = JSON.parse(fs.readFileSync(resolvedFile, 'utf8'));
+    } catch (err) {
+      errors.push(`${entry.manifestPath}: invalid JSON (${err.message})`);
+      continue;
+    }
+
+    validatedFiles.add(path.resolve(resolvedFile));
+    const manifestErrors = [
+      ...validateAgainstSchema(manifest, providerSchema),
+      ...validateProviderSemantics(manifest),
+    ];
+    if (typeof entry.id === 'string' && manifest.id !== entry.id) {
+      manifestErrors.push(
+        `$.id: mismatch between index.json (${JSON.stringify(entry.id)}) and ${entry.manifestPath} (${JSON.stringify(manifest.id)})`,
+      );
+    }
+    if (entry.packageType !== undefined && manifest.packageType !== entry.packageType) {
+      manifestErrors.push(
+        `$.packageType: mismatch between index.json (${JSON.stringify(entry.packageType)}) and ${entry.manifestPath} (${JSON.stringify(manifest.packageType)})`,
+      );
+    }
+    for (const errMsg of manifestErrors) {
+      errors.push(`schemas/marketplace-repo/${entry.manifestPath}: ${errMsg}`);
+    }
+  }
+
+  if (fs.existsSync(providersDir)) {
+    const providerFiles = fs
+      .readdirSync(providersDir)
+      .filter((f) => f.endsWith('.json'))
+      .sort();
+
+    for (const filename of providerFiles) {
+      const fullFile = path.resolve(providersDir, filename);
+      if (validatedFiles.has(fullFile)) continue;
+      let manifest;
+      try {
+        manifest = JSON.parse(fs.readFileSync(fullFile, 'utf8'));
+      } catch (err) {
+        errors.push(`schemas/marketplace-repo/providers/${filename}: invalid JSON (${err.message})`);
+        continue;
+      }
+      validatedFiles.add(fullFile);
+      const manifestErrors = [
+        ...validateAgainstSchema(manifest, providerSchema),
+        ...validateProviderSemantics(manifest),
+      ];
+      for (const errMsg of manifestErrors) {
+        errors.push(`schemas/marketplace-repo/providers/${filename}: ${errMsg}`);
+      }
+    }
+  }
+
+  return { errors, validatedProviders: validatedFiles.size };
 }
 
 function loadSchema(schemaFilename) {
@@ -253,11 +502,26 @@ function run() {
     }
   }
 
+  if (fs.existsSync(MARKETPLACE_REPO_DIR)) {
+    const mpCheck = validateMarketplaceRepo(providerSchema, MARKETPLACE_REPO_DIR);
+    if (mpCheck.errors.length > 0) {
+      console.error('[fail] schemas/marketplace-repo validation failed:');
+      for (const e of mpCheck.errors) {
+        console.error(`  - ${e}`);
+      }
+      hasFailures = true;
+    } else {
+      console.log(
+        `[ok] Validated schemas/marketplace-repo/index.json and ${mpCheck.validatedProviders} provider manifest(s)`,
+      );
+    }
+  }
+
   if (hasFailures) {
     process.exit(1);
   }
 
-  console.log(`[pass] All schemas and ${exampleFiles.length} example manifest(s) passed 100% validation.`);
+  console.log(`[pass] All schemas, ${exampleFiles.length} example manifest(s), and marketplace-repo manifests passed 100% validation.`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {

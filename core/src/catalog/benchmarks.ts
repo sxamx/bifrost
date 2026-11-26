@@ -5,10 +5,13 @@ import {
   DEFAULT_CACHE_TTL_SEC,
   type FetchLike,
   readExternalCache,
+  readResponseBufferWithLimit,
   touchExternalCacheTimestamp,
   writeExternalCache,
 } from './cache.js';
 import { readZipArchive } from './zip.js';
+
+export { readResponseBufferWithLimit };
 
 export const LMARENA_AGENT_URL =
   'https://datasets-server.huggingface.co/rows?dataset=lmarena-ai%2Fleaderboard-dataset&config=agent&split=latest&offset=0&length=100';
@@ -17,6 +20,25 @@ export const AW_CODING_INDEX_URL = 'https://artificialwatch.com/data/coding-inde
 export const EPOCH_AI_ZIP_URL = 'https://epoch.ai/data/benchmark_data.zip';
 export const OPENCHARTS_RANKINGS_URL = 'https://www.opencharts.com/benchmarks/rankings.json';
 export const OPENCHARTS_METHODOLOGY_URL = 'https://www.opencharts.com/benchmarks/methodology';
+export const OPENCHARTS_LICENSE_URL =
+  'https://www.opencharts.com/benchmarks/methodology#attribution';
+
+export const MAX_LMARENA_PAGES = 10;
+
+function sanitizeHttpUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || /[\s\u0000-\u001f\u007f]/.test(trimmed)) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return trimmed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 export const CACHE_KEY_LMARENA_AGENT = 'lmarena:agent';
 export const CACHE_KEY_AW_BENCH = 'aw:bench';
@@ -91,10 +113,16 @@ export function filterLmArenaPayload(raw: unknown, capturedAtIso: string): LmAre
             ? r.score_ci_upper
             : null,
       },
-      sessions: typeof r.session_count === 'number' ? r.session_count : null,
-      votes: typeof r.observation_count === 'number' ? r.observation_count : null,
-      rank: typeof r.rank === 'number' ? r.rank : null,
-      category: typeof r.category === 'string' ? r.category : 'overall',
+      sessions:
+        typeof r.session_count === 'number' && Number.isFinite(r.session_count)
+          ? r.session_count
+          : null,
+      votes:
+        typeof r.observation_count === 'number' && Number.isFinite(r.observation_count)
+          ? r.observation_count
+          : null,
+      rank: typeof r.rank === 'number' && Number.isFinite(r.rank) ? r.rank : null,
+      category: typeof r.category === 'string' && r.category.trim() ? r.category.trim() : 'overall',
       medianCostPerTaskUsd:
         typeof r.cost_per_task_p50 === 'number' && Number.isFinite(r.cost_per_task_p50)
           ? r.cost_per_task_p50
@@ -183,7 +211,7 @@ export function filterArtificialWatchPayload(
       index: m.index,
       boards: Object.keys(cleanScores).length,
       scores: cleanScores,
-      page: typeof m.page === 'string' ? m.page : null,
+      page: sanitizeHttpUrl(m.page),
     });
   }
 
@@ -222,7 +250,7 @@ export function filterArtificialWatchPayload(
       typeof obj.attribution === 'string'
         ? obj.attribution
         : `ArtificialWatch ${kind === 'coding' ? 'Coding' : 'Bench'} Index (CC BY 4.0) — ${defaultUrl}`,
-    sourceUrl: typeof obj.url === 'string' ? obj.url : defaultUrl,
+    sourceUrl: sanitizeHttpUrl(obj.url) ?? defaultUrl,
     generatedAt: typeof obj.generatedAt === 'string' ? obj.generatedAt : null,
     sources: cleanSources,
     models,
@@ -295,7 +323,7 @@ export function parseCsvRows(csvText: string): string[][] {
       continue;
     }
 
-    if (ch === '"') {
+    if (ch === '"' && field.length === 0) {
       inQuotes = true;
     } else if (ch === ',') {
       currentRow.push(field);
@@ -501,6 +529,45 @@ export interface OpenChartsSnapshot {
   models: OpenChartsFilteredModel[];
 }
 
+function parseOpenChartsAttribution(rawAttr: unknown): string {
+  const fallback = 'OpenCharts Composite Index & Grade — https://www.opencharts.com/benchmarks';
+  if (typeof rawAttr === 'string' && rawAttr.trim().length > 0) {
+    return rawAttr.trim();
+  }
+  if (Array.isArray(rawAttr)) {
+    const parts: string[] = [];
+    for (const entry of rawAttr) {
+      if (typeof entry === 'string' && entry.trim().length > 0) {
+        parts.push(entry.trim());
+      } else if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+        const rec = entry as Record<string, unknown>;
+        const publisher =
+          typeof rec.publisher === 'string' && rec.publisher.trim().length > 0
+            ? rec.publisher.trim()
+            : typeof rec.name === 'string' && rec.name.trim().length > 0
+              ? rec.name.trim()
+              : null;
+        const url = sanitizeHttpUrl(rec.url);
+        const license =
+          typeof rec.license === 'string' && rec.license.trim().length > 0
+            ? rec.license.trim()
+            : null;
+        const segs: string[] = [];
+        if (publisher) segs.push(publisher);
+        if (license) segs.push(`(${license})`);
+        if (url) segs.push(url);
+        if (segs.length > 0) {
+          parts.push(segs.join(' '));
+        }
+      }
+    }
+    if (parts.length > 0) {
+      return parts.join('; ');
+    }
+  }
+  return fallback;
+}
+
 export function filterOpenChartsPayload(raw: unknown): OpenChartsSnapshot {
   if (!raw || typeof raw !== 'object') {
     throw new Error('Invalid OpenCharts JSON payload.');
@@ -524,7 +591,12 @@ export function filterOpenChartsPayload(raw: unknown): OpenChartsSnapshot {
     const parseRange = (val: unknown): { min: number; max: number } | null => {
       if (!val || typeof val !== 'object') return null;
       const r = val as Record<string, unknown>;
-      if (typeof r.min === 'number' && typeof r.max === 'number') {
+      if (
+        typeof r.min === 'number' &&
+        Number.isFinite(r.min) &&
+        typeof r.max === 'number' &&
+        Number.isFinite(r.max)
+      ) {
         return { min: r.min, max: r.max };
       }
       return null;
@@ -539,18 +611,15 @@ export function filterOpenChartsPayload(raw: unknown): OpenChartsSnapshot {
       index: rawIdx,
       indexRange: parseRange(m.indexRange),
       grade: typeof m.grade === 'string' ? m.grade : null,
-      rank: typeof m.rank === 'number' ? m.rank : null,
+      rank: typeof m.rank === 'number' && Number.isFinite(m.rank) ? m.rank : null,
       rankRange: parseRange(m.rankRange),
-      url: typeof m.url === 'string' ? m.url : null,
+      url: sanitizeHttpUrl(m.url),
     });
   }
 
   return {
     source: 'opencharts',
-    attribution:
-      typeof root.attribution === 'string'
-        ? root.attribution
-        : 'OpenCharts Composite Index & Grade — https://www.opencharts.com/benchmarks',
+    attribution: parseOpenChartsAttribution(root.attribution),
     methodologyUrl: OPENCHARTS_METHODOLOGY_URL,
     sourceUrl: 'https://www.opencharts.com/benchmarks',
     generatedAt: typeof root.generatedAt === 'string' ? root.generatedAt : null,
@@ -616,13 +685,83 @@ export async function syncLmArenaAgentBenchmarks(
   db: DatabaseSync,
   options: { fetchFn?: FetchLike; nowSec?: number; ttlSec?: number; forceRefresh?: boolean } = {},
 ): Promise<LmArenaAgentSnapshot | null> {
-  return syncFilteredJsonSource(
-    db,
-    CACHE_KEY_LMARENA_AGENT,
-    LMARENA_AGENT_URL,
-    (raw, nowIso) => filterLmArenaPayload(raw, nowIso),
-    options,
-  );
+  const fetchFn = options.fetchFn ?? globalThis.fetch;
+  const nowSec = options.nowSec ?? Math.floor(Date.now() / 1000);
+  const ttlSec = options.ttlSec ?? DEFAULT_CACHE_TTL_SEC;
+
+  const existing = readExternalCache<LmArenaAgentSnapshot>(db, CACHE_KEY_LMARENA_AGENT);
+  if (existing && !options.forceRefresh && nowSec - existing.fetchedAt < ttlSec) {
+    return existing.data;
+  }
+
+  try {
+    const headers: Record<string, string> = {
+      'User-Agent': BIFROST_USER_AGENT,
+      Accept: 'application/json',
+    };
+    if (existing?.etag) {
+      headers['If-None-Match'] = existing.etag;
+    }
+
+    const res = await fetchFn(LMARENA_AGENT_URL, {
+      headers,
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.status === 304 && existing) {
+      touchExternalCacheTimestamp(db, CACHE_KEY_LMARENA_AGENT, nowSec);
+      return existing.data;
+    }
+    if (!res.ok) {
+      return existing ? existing.data : null;
+    }
+
+    const firstRaw = (await res.json()) as Record<string, unknown> | null;
+    const allRows: unknown[] =
+      firstRaw && typeof firstRaw === 'object' && Array.isArray(firstRaw.rows)
+        ? [...firstRaw.rows]
+        : [];
+
+    const totalRaw =
+      firstRaw && typeof firstRaw === 'object' ? firstRaw.num_rows_total : undefined;
+    if (typeof totalRaw === 'number' && Number.isFinite(totalRaw) && totalRaw > 100) {
+      const pageSize = 100;
+      const cappedTotal = Math.min(Math.floor(totalRaw), MAX_LMARENA_PAGES * pageSize);
+      for (let offset = pageSize; offset < cappedTotal; offset += pageSize) {
+        const pageUrl = new URL(LMARENA_AGENT_URL);
+        pageUrl.searchParams.set('offset', String(offset));
+        pageUrl.searchParams.set('length', String(pageSize));
+        try {
+          const pageRes = await fetchFn(pageUrl.href, {
+            headers: {
+              'User-Agent': BIFROST_USER_AGENT,
+              Accept: 'application/json',
+            },
+            signal: AbortSignal.timeout(4000),
+          });
+          if (!pageRes.ok) {
+            break;
+          }
+          const pageRaw = (await pageRes.json()) as Record<string, unknown> | null;
+          if (pageRaw && typeof pageRaw === 'object' && Array.isArray(pageRaw.rows) && pageRaw.rows.length > 0) {
+            allRows.push(...pageRaw.rows);
+          } else {
+            break;
+          }
+        } catch {
+          break;
+        }
+      }
+    }
+
+    const filtered = filterLmArenaPayload(
+      { rows: allRows },
+      new Date(nowSec * 1000).toISOString(),
+    );
+    writeExternalCache(db, CACHE_KEY_LMARENA_AGENT, filtered, res.headers.get('etag'), nowSec);
+    return filtered;
+  } catch {
+    return existing ? existing.data : null;
+  }
 }
 
 export async function syncArtificialWatchBenchmarks(
@@ -653,56 +792,15 @@ export async function syncArtificialWatchBenchmarks(
 
 export const MAX_EPOCH_ZIP_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 
-export async function readResponseBufferWithLimit(
-  res: Response,
-  maxBytes = MAX_EPOCH_ZIP_DOWNLOAD_BYTES,
-): Promise<Buffer> {
-  const contentLengthHeader = res.headers.get('content-length');
-  if (contentLengthHeader !== null) {
-    const declaredBytes = Number(contentLengthHeader);
-    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
-      if (res.body) {
-        await res.body.cancel().catch(() => {});
-      }
-      throw new Error(
-        `Response Content-Length (${declaredBytes} bytes) exceeds maximum allowed (${maxBytes} bytes).`,
-      );
-    }
+const inFlightEpochByDb = new WeakMap<DatabaseSync, Map<string, Promise<EpochAiSnapshot | null>>>();
+
+function getEpochInFlightMap(db: DatabaseSync): Map<string, Promise<EpochAiSnapshot | null>> {
+  let map = inFlightEpochByDb.get(db);
+  if (!map) {
+    map = new Map();
+    inFlightEpochByDb.set(db, map);
   }
-
-  if (!res.body) {
-    const ab = await res.arrayBuffer();
-    if (ab.byteLength > maxBytes) {
-      throw new Error(
-        `Response body (${ab.byteLength} bytes) exceeds maximum allowed (${maxBytes} bytes).`,
-      );
-    }
-    return Buffer.from(ab);
-  }
-
-  const reader = res.body.getReader();
-  const chunks: Buffer[] = [];
-  let totalBytes = 0;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value || value.byteLength === 0) continue;
-      totalBytes += value.byteLength;
-      if (totalBytes > maxBytes) {
-        await reader.cancel().catch(() => {});
-        throw new Error(
-          `Streamed response body exceeded maximum allowed size (${maxBytes} bytes).`,
-        );
-      }
-      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  return Buffer.concat(chunks, totalBytes);
+  return map;
 }
 
 export async function syncEpochAiBenchmarks(
@@ -725,32 +823,49 @@ export async function syncEpochAiBenchmarks(
     return existing.data;
   }
 
-  try {
-    const headers: Record<string, string> = {
-      'User-Agent': BIFROST_USER_AGENT,
-    };
-    if (existing?.etag) {
-      headers['If-None-Match'] = existing.etag;
-    }
+  const inFlightMap = getEpochInFlightMap(db);
+  const existingInFlight = inFlightMap.get(CACHE_KEY_EPOCH_INTERNAL);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
 
-    const res = await fetchFn(EPOCH_AI_ZIP_URL, {
-      headers,
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.status === 304 && existing) {
-      touchExternalCacheTimestamp(db, CACHE_KEY_EPOCH_INTERNAL, nowSec);
-      return existing.data;
-    }
-    if (!res.ok) {
+  const work = (async (): Promise<EpochAiSnapshot | null> => {
+    try {
+      const headers: Record<string, string> = {
+        'User-Agent': BIFROST_USER_AGENT,
+      };
+      if (existing?.etag) {
+        headers['If-None-Match'] = existing.etag;
+      }
+
+      const res = await fetchFn(EPOCH_AI_ZIP_URL, {
+        headers,
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.status === 304 && existing) {
+        touchExternalCacheTimestamp(db, CACHE_KEY_EPOCH_INTERNAL, nowSec);
+        return existing.data;
+      }
+      if (!res.ok) {
+        return existing ? existing.data : null;
+      }
+
+      const zipBuf = await readResponseBufferWithLimit(res, maxDownloadBytes);
+      const filtered = parseAndFilterEpochZip(zipBuf, new Date(nowSec * 1000).toISOString());
+      writeExternalCache(db, CACHE_KEY_EPOCH_INTERNAL, filtered, res.headers.get('etag'), nowSec);
+      return filtered;
+    } catch {
       return existing ? existing.data : null;
     }
+  })();
 
-    const zipBuf = await readResponseBufferWithLimit(res, maxDownloadBytes);
-    const filtered = parseAndFilterEpochZip(zipBuf, new Date(nowSec * 1000).toISOString());
-    writeExternalCache(db, CACHE_KEY_EPOCH_INTERNAL, filtered, res.headers.get('etag'), nowSec);
-    return filtered;
-  } catch {
-    return existing ? existing.data : null;
+  inFlightMap.set(CACHE_KEY_EPOCH_INTERNAL, work);
+  try {
+    return await work;
+  } finally {
+    if (inFlightMap.get(CACHE_KEY_EPOCH_INTERNAL) === work) {
+      inFlightMap.delete(CACHE_KEY_EPOCH_INTERNAL);
+    }
   }
 }
 
@@ -767,14 +882,114 @@ export async function syncOpenChartsBenchmarks(
   );
 }
 
-function normalizeMatchTokens(idOrName: string): string {
-  return idOrName
+const SHORT_KNOWN_MODEL_ID_RE = /^o[1-9]\w*$/;
+const KNOWN_ORG_PREFIX_RE =
+  /^(?:nvidia|meta|google|openai|anthropic|mistralai|deepseek|qwen)[:\s-]+/i;
+const KNOWN_ORG_COLON_PREFIX_RE =
+  /^(?:nvidia|meta|google|openai|anthropic|mistralai|deepseek|qwen)\s*:\s*/i;
+const BENCHMARK_TIER_QUALIFIER_RE = /\b(?:ultra|super|lightning|omni|pro|mini|flash)\b/i;
+const BENCHMARK_MOE_SUFFIX_RE =
+  /[-_\s]+\d+(?:\.\d+)?b(?:[-_\s]+a\d+(?:\.\d+)?b)?(?:[-_\s]+reasoning)?$/i;
+
+function isAllowedMatchToken(token: string, allowShortKnownId: boolean): boolean {
+  if (token.length >= 3) return true;
+  if (allowShortKnownId && SHORT_KNOWN_MODEL_ID_RE.test(token)) return true;
+  return false;
+}
+
+function normalizeToMatchToken(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/(?<=\d)[^a-z0-9]+(?=\d)/g, '_')
+    .replace(/[^a-z0-9_]+/g, '')
+    .replace(/^_+|_+$/g, '');
+}
+
+function stripQuantAndDateSuffixes(raw: string): string {
+  let cur = raw.trim();
+  let prev = '';
+  while (cur !== prev) {
+    prev = cur;
+    cur = cur
+      .replace(/\s*\((?:nvfp4|fp8|bf16|fp16)\)\s*$/i, '')
+      .replace(/[-_\s]+(?:nvfp4|fp8|bf16|fp16|instruct|hf)$/i, '')
+      .replace(/[-_\s]+\d{4}-\d{2}-\d{2}$/, '')
+      .replace(/[-_\s]+\d{8}$/, '')
+      .trim();
+  }
+  return cur;
+}
+
+function stripTieredMoeSuffix(raw: string): string | null {
+  if (!BENCHMARK_TIER_QUALIFIER_RE.test(raw) || !BENCHMARK_MOE_SUFFIX_RE.test(raw)) {
+    return null;
+  }
+  const stripped = raw.replace(BENCHMARK_MOE_SUFFIX_RE, '').trim();
+  return stripped && stripped !== raw ? stripped : null;
+}
+
+function extractMatchCandidates(
+  idOrName: string,
+  allowShortKnownId: boolean,
+): { primary: string[]; secondary: string[] } {
+  const base = idOrName
+    .trim()
     .toLowerCase()
     .replace(/\s*\(free\)\s*$/i, '')
     .replace(/:free$/i, '')
     .replace(/-free$/i, '')
     .replace(/^[^/]+\//, '')
-    .replace(/[^a-z0-9]+/g, '');
+    .trim();
+
+  if (!base) {
+    return { primary: [], secondary: [] };
+  }
+
+  const variants: string[] = [base];
+  if (KNOWN_ORG_COLON_PREFIX_RE.test(base)) {
+    const colonStripped = base.replace(KNOWN_ORG_COLON_PREFIX_RE, '').trim();
+    if (colonStripped && !variants.includes(colonStripped)) {
+      variants.push(colonStripped);
+    }
+  } else if (KNOWN_ORG_PREFIX_RE.test(base)) {
+    const orgStripped = base.replace(KNOWN_ORG_PREFIX_RE, '').trim();
+    // Require stripped remainder to begin with a letter so e.g. "Qwen 3.6 Plus" doesn't become "3.6 plus"
+    if (orgStripped && /^[a-z]/.test(orgStripped) && !variants.includes(orgStripped)) {
+      variants.push(orgStripped);
+    }
+  }
+
+  const primarySet = new Set<string>();
+  const secondarySet = new Set<string>();
+
+  for (const variant of variants) {
+    const primaryTok = normalizeToMatchToken(variant);
+    if (isAllowedMatchToken(primaryTok, allowShortKnownId)) {
+      primarySet.add(primaryTok);
+    }
+
+    const quantStripped = stripQuantAndDateSuffixes(variant);
+    if (quantStripped && quantStripped !== variant) {
+      const quantTok = normalizeToMatchToken(quantStripped);
+      if (isAllowedMatchToken(quantTok, allowShortKnownId) && !primarySet.has(quantTok)) {
+        secondarySet.add(quantTok);
+      }
+    }
+
+    const moeSource = quantStripped || variant;
+    const moeStripped = stripTieredMoeSuffix(moeSource);
+    if (moeStripped) {
+      const moeTok = normalizeToMatchToken(moeStripped);
+      if (isAllowedMatchToken(moeTok, allowShortKnownId) && !primarySet.has(moeTok)) {
+        secondarySet.add(moeTok);
+      }
+    }
+  }
+
+  return {
+    primary: Array.from(primarySet),
+    secondary: Array.from(secondarySet),
+  };
 }
 
 function formatRankRangeText(range: { min: number; max: number } | null, rank: number | null): string | null {
@@ -814,20 +1029,80 @@ export function getCachedModelBenchmarks(
   db: DatabaseSync,
   modelLookup: { canonicalModelId?: string | null; modelId: string; name?: string | null },
 ) {
-  const keys = new Set<string>();
-  for (const cand of [modelLookup.canonicalModelId, modelLookup.modelId, modelLookup.name]) {
-    if (cand) {
-      const norm = normalizeMatchTokens(cand);
-      if (norm.length >= 3) keys.add(norm);
+  const primaryKeys = new Set<string>();
+  const secondaryKeys = new Set<string>();
+
+  const lookupSources: Array<{ value: string | null | undefined; fromId: boolean }> = [
+    { value: modelLookup.canonicalModelId, fromId: true },
+    { value: modelLookup.modelId, fromId: true },
+    { value: modelLookup.name, fromId: false },
+  ];
+
+  for (const src of lookupSources) {
+    if (!src.value) continue;
+    const extracted = extractMatchCandidates(src.value, src.fromId);
+    for (const p of extracted.primary) {
+      primaryKeys.add(p);
+    }
+    for (const s of extracted.secondary) {
+      secondaryKeys.add(s);
     }
   }
+  // Ensure secondaryKeys never shadow primaryKeys
+  for (const p of primaryKeys) {
+    secondaryKeys.delete(p);
+  }
 
-  const matchesKey = (...candidates: Array<string | null | undefined>): boolean => {
+  /**
+   * Returns match quality tier:
+   *  1 = exact primary-to-primary
+   *  2 = primary-to-secondary or secondary-to-primary
+   *  3 = secondary-to-secondary
+   *  0 = no match
+   */
+  const matchTier = (...candidates: Array<string | null | undefined>): number => {
+    let bestTier = 0;
     for (const c of candidates) {
       if (!c) continue;
-      if (keys.has(normalizeMatchTokens(c))) return true;
+      const extracted = extractMatchCandidates(c, true);
+      for (const p of extracted.primary) {
+        if (primaryKeys.has(p)) {
+          return 1;
+        }
+        if (secondaryKeys.has(p) && (bestTier === 0 || bestTier > 2)) {
+          bestTier = 2;
+        }
+      }
+      for (const s of extracted.secondary) {
+        if (primaryKeys.has(s) && (bestTier === 0 || bestTier > 2)) {
+          bestTier = 2;
+        } else if (secondaryKeys.has(s) && bestTier === 0) {
+          bestTier = 3;
+        }
+      }
     }
-    return false;
+    return bestTier;
+  };
+
+  const matchesKey = (...candidates: Array<string | null | undefined>): boolean =>
+    matchTier(...candidates) > 0;
+
+  const findBestMatch = <T>(
+    items: T[] | undefined,
+    getCandidates: (item: T) => Array<string | null | undefined>,
+  ): T | null => {
+    if (!items) return null;
+    let bestItem: T | null = null;
+    let bestTier = 0;
+    for (const item of items) {
+      const tier = matchTier(...getCandidates(item));
+      if (tier === 1) return item;
+      if (tier > 0 && (bestTier === 0 || tier < bestTier)) {
+        bestTier = tier;
+        bestItem = item;
+      }
+    }
+    return bestItem;
   };
 
   const lmarenaSnap = readExternalCache<LmArenaAgentSnapshot>(db, CACHE_KEY_LMARENA_AGENT)?.data;
@@ -836,13 +1111,33 @@ export function getCachedModelBenchmarks(
   const epochSnap = readExternalCache<EpochAiSnapshot>(db, CACHE_KEY_EPOCH_INTERNAL)?.data;
   const ocSnap = readExternalCache<OpenChartsSnapshot>(db, CACHE_KEY_OPENCHARTS)?.data;
 
-  const lmarenaMatch = lmarenaSnap?.entries.find((e) => matchesKey(e.model)) ?? null;
-  const awBenchMatch = awBenchSnap?.models.find((m) => matchesKey(m.id, m.name)) ?? null;
-  const awCodingMatch = awCodingSnap?.models.find((m) => matchesKey(m.id, m.name)) ?? null;
-  const epochEciMatch =
-    epochSnap?.eciScores.find((e) => matchesKey(e.model, e.displayName)) ?? null;
-  const epochRuns = epochSnap?.internalRuns.filter((r) => matchesKey(r.modelVersion)) ?? [];
-  const openChartsMatch = ocSnap?.models.find((m) => matchesKey(m.slug, m.name)) ?? null;
+  const lmarenaMatch = findBestMatch(lmarenaSnap?.entries, (e) => [e.model]);
+  const awBenchMatch = findBestMatch(awBenchSnap?.models, (m) => [m.id, m.name]);
+  const awCodingMatch = findBestMatch(awCodingSnap?.models, (m) => [m.id, m.name]);
+  const epochEciMatch = findBestMatch(epochSnap?.eciScores, (e) => [e.model, e.displayName]);
+
+  // For Epoch internal runs, keep best-tier matches per benchmark so exact runs win over secondary aliases
+  const epochRuns: EpochInternalRunScore[] = [];
+  if (epochSnap?.internalRuns) {
+    const bestTierByBenchmark = new Map<string, number>();
+    const scoredRuns: Array<{ run: EpochInternalRunScore; tier: number }> = [];
+    for (const r of epochSnap.internalRuns) {
+      const tier = matchTier(r.modelVersion);
+      if (tier === 0) continue;
+      scoredRuns.push({ run: r, tier });
+      const prev = bestTierByBenchmark.get(r.benchmark);
+      if (prev === undefined || tier < prev) {
+        bestTierByBenchmark.set(r.benchmark, tier);
+      }
+    }
+    for (const entry of scoredRuns) {
+      if (entry.tier === bestTierByBenchmark.get(entry.run.benchmark)) {
+        epochRuns.push(entry.run);
+      }
+    }
+  }
+
+  const openChartsMatch = findBestMatch(ocSnap?.models, (m) => [m.slug, m.name]);
 
   return {
     lmarenaSnap: lmarenaSnap ?? null,
@@ -946,7 +1241,7 @@ export async function resolveAndSyncModelBenchmarks(
     sessions: lmaEntry?.sessions ?? null,
     votes: lmaEntry?.votes ?? null,
     sessionsOrVotes: lmaEntry?.sessions ?? lmaEntry?.votes ?? null,
-    category: 'agent/latest',
+    category: lmaEntry?.category || 'agent/latest',
     medianCostPerTaskUsd: lmaEntry?.medianCostPerTaskUsd ?? null,
     rank: lmaEntry?.rank ?? null,
     totalRanked: cached.lmarenaSnap?.entries.length ?? null,
@@ -1019,6 +1314,19 @@ export async function resolveAndSyncModelBenchmarks(
         })
       : [];
 
+  const awAttribution =
+    awBenchModel && awCodingModel
+      ? [
+          cached.awBenchSnap?.attribution ??
+            'ArtificialWatch Bench Index (CC BY 4.0) — https://artificialwatch.com',
+          cached.awCodingSnap?.attribution ??
+            'ArtificialWatch Coding Index (CC BY 4.0) — https://artificialwatch.com/coding',
+        ]
+          .filter((v, i, arr) => arr.indexOf(v) === i)
+          .join(' | ')
+      : (primaryAwSnap?.attribution ??
+        'ArtificialWatch Index & Percentiles (CC BY 4.0) — https://artificialwatch.com');
+
   const artificialWatchBlock = {
     available: primaryAwModel !== null,
     globalIndex: primaryAwModel?.index ?? null,
@@ -1048,9 +1356,7 @@ export async function resolveAndSyncModelBenchmarks(
         }
       : null,
     license: 'CC BY 4.0',
-    attribution:
-      primaryAwSnap?.attribution ??
-      'ArtificialWatch Index & Percentiles (CC BY 4.0) — https://artificialwatch.com',
+    attribution: awAttribution,
     sourceUrl: primaryAwSnap?.sourceUrl ?? 'https://artificialwatch.com',
     capturedAt: primaryAwSnap?.generatedAt ?? null,
   };
@@ -1104,7 +1410,8 @@ export async function resolveAndSyncModelBenchmarks(
     rankRangeBand: ocModel?.rankRange ?? null,
     rankingPeers: ocPeers,
     methodologyUrl: cached.ocSnap?.methodologyUrl ?? OPENCHARTS_METHODOLOGY_URL,
-    license: 'CC BY 4.0',
+    license: null,
+    licenseUrl: OPENCHARTS_LICENSE_URL,
     attribution:
       cached.ocSnap?.attribution ??
       'OpenCharts Composite Index & Grade — https://www.opencharts.com/benchmarks',

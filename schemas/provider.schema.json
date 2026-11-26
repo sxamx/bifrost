@@ -106,12 +106,31 @@
       "items": {
         "type": "object",
         "required": ["id", "name"],
+        "additionalProperties": false,
         "properties": {
-          "id": { "type": "string" },
-          "name": { "type": "string" },
+          "id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
           "canonicalModelId": { "type": "string" },
-          "contextLength": { "type": "integer" },
-          "maxOutput": { "type": "integer" }
+          "contextLength": { "type": "integer", "minimum": 1 },
+          "maxOutput": { "type": "integer", "minimum": 1 },
+          "modalities": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "input": { "type": "array", "items": { "type": "string" } },
+              "output": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "capabilities": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "tools": { "type": "boolean" },
+              "reasoning": { "type": "boolean" },
+              "structuredOutput": { "type": "boolean" },
+              "structured_output": { "type": "boolean" }
+            }
+          }
         }
       }
     },
@@ -124,8 +143,9 @@
       "type": "object",
       "description": "Configuración del proceso/contenedor aislado cuando packageType es 'experimental-adapter'.",
       "required": ["defaultPort", "healthPath"],
+      "additionalProperties": false,
       "properties": {
-        "defaultPort": { "type": "integer" },
+        "defaultPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "healthPath": { "type": "string", "default": "/health" },
         "accountLabel": { "type": "string", "default": "Token / Sesión" }
       }
@@ -145,7 +165,9 @@
           "enum": ["never", "opt_out", "allowed", "unknown"]
         },
         "retentionDays": {
-          "type": "integer"
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 36500
         },
         "policyUrl": {
           "type": "string",
@@ -163,6 +185,7 @@
     },
     "rateLimitWindows": {
       "type": "array",
+      "uniqueItems": true,
       "description": "Ventanas de cuota soportadas por el proveedor (HU-38).",
       "items": {
         "type": "string",
