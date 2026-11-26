@@ -18,6 +18,7 @@ import {
   UpstreamSsrfError,
   assertSafeUpstreamUrl,
   assertSafeUpstreamUrlSync,
+  createPinnedLookup,
   safeFetch,
   validateSafeUpstreamUrl,
 } from '../core/src/ssrf.js';
@@ -861,6 +862,293 @@ describe('Ola 1 Security Hardening — SSRF DNS/IP-pinning, Endpoint/Header Sani
     } finally {
       db.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('7. B1: createPinnedLookup returns all validated IPs for Happy Eyeballs and safeFetch falls back from unreachable IPv6 to valid IPv4', async () => {
+    // 7a. Direct unit verification that createPinnedLookup returns ALL approved records when all=true
+    const lookup = createPinnedLookup(['2606:4700:4700::1111', '1.1.1.1', '1.0.0.1']);
+    const allRecords = await new Promise<Array<{ address: string; family: number }>>(
+      (resolve, reject) => {
+        lookup('dualstack.example.com', { all: true }, (err, addresses) => {
+          if (err) reject(err);
+          else resolve(addresses as unknown as Array<{ address: string; family: number }>);
+        });
+      },
+    );
+    assert.deepEqual(allRecords, [
+      { address: '2606:4700:4700::1111', family: 6 },
+      { address: '1.1.1.1', family: 4 },
+      { address: '1.0.0.1', family: 4 },
+    ]);
+
+    const singleRecord = await new Promise<{ address: string; family: number }>(
+      (resolve, reject) => {
+        lookup('dualstack.example.com', {}, (err, address, family) => {
+          if (err) reject(err);
+          else resolve({ address: String(address), family: Number(family) });
+        });
+      },
+    );
+    assert.deepEqual(singleRecord, { address: '2606:4700:4700::1111', family: 6 });
+
+    // 7b. Live Happy Eyeballs fallback: IPv4-only server on 127.0.0.1 with dnsLookup returning [::1 (refused), 127.0.0.1 (reachable)]
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ happyEyeballs: true }));
+    });
+    await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', () => resolve()));
+    const addr = srv.address() as { port: number };
+    try {
+      const res = await safeFetch(
+        `http://localhost:${addr.port}/eyeballs`,
+        { method: 'GET' },
+        {
+          mode: 'official-json',
+          allowLocalhostForTests: true,
+          dnsLookup: async () => [
+            { address: '::1', family: 6 },
+            { address: '127.0.0.1', family: 4 },
+          ],
+        },
+      );
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { happyEyeballs: true });
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+  });
+
+  it('8. B2: POST /api/nodes (public_ip) rejects octal, hex, and short-form obfuscated IPv4 endpoints', async () => {
+    const tmpDir = makeTempDir();
+    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, env: {} });
+    const db = openDatabase(path.join(tmpDir, 'nodes-obfuscated.db'));
+    try {
+      const app = createApp({
+        db,
+        masterKey,
+        allowLoopbackNodes: false,
+      });
+      const adminCookie = await setupAdmin(app);
+
+      const obfuscatedEndpoints = [
+        '0251.0376.0251.0376:80',
+        '0xa9.0xfe.0xa9.0xfe:80',
+        '169.254.43518:80',
+        '0300.0.0.0300:80',
+        '192.0.192:80',
+        '0177.0.0.1:9443',
+      ];
+
+      for (const ep of obfuscatedEndpoints) {
+        const res = await app.request('http://localhost/api/nodes', {
+          method: 'POST',
+          headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: 'Obfuscated Node',
+            mode: 'public_ip',
+            endpoint: ep,
+          }),
+        });
+        assert.equal(res.status, 400, `Expected 400 for obfuscated public_ip endpoint ${ep}`);
+      }
+    } finally {
+      db.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('9. B3: safeFetch aborts cleanly when body hangs after headers AND handles HEAD/204 with Content-Encoding: gzip without crashing', async () => {
+    const sockets = new Set<import('node:net').Socket>();
+    const srv = http.createServer((req, res) => {
+      if (req.url === '/hang-body') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.write('partial-chunk-');
+        // Intentionally never call res.end() to simulate stalled upstream body
+        return;
+      }
+      if (req.url === '/head-gzip') {
+        res.writeHead(200, { 'Content-Encoding': 'gzip', 'Content-Type': 'application/json' });
+        res.end();
+        return;
+      }
+      if (req.url === '/no-content-gzip') {
+        res.writeHead(204, { 'Content-Encoding': 'gzip' });
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    srv.on('connection', (sock) => {
+      sockets.add(sock);
+      sock.once('close', () => sockets.delete(sock));
+    });
+
+    await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', () => resolve()));
+    const addr = srv.address() as { port: number };
+    try {
+      // B3(a): 200 OK followed by hanging body must abort cleanly via AbortSignal.timeout(150)
+      const hangRes = await safeFetch(
+        `http://127.0.0.1:${addr.port}/hang-body`,
+        { method: 'GET', signal: AbortSignal.timeout(150) },
+        { mode: 'official-json', allowLocalhostForTests: true },
+      );
+      assert.equal(hangRes.status, 200);
+      await assert.rejects(() => hangRes.text());
+
+      // B3(b): HEAD and 204 responses with Content-Encoding: gzip and empty body must complete cleanly without crashing Node
+      const headRes = await safeFetch(
+        `http://127.0.0.1:${addr.port}/head-gzip`,
+        { method: 'HEAD' },
+        { mode: 'official-json', allowLocalhostForTests: true },
+      );
+      assert.equal(headRes.status, 200);
+      assert.equal(await headRes.text(), '');
+
+      const noContentRes = await safeFetch(
+        `http://127.0.0.1:${addr.port}/no-content-gzip`,
+        { method: 'GET' },
+        { mode: 'official-json', allowLocalhostForTests: true },
+      );
+      assert.equal(noContentRes.status, 204);
+      assert.equal(await noContentRes.text(), '');
+    } finally {
+      for (const s of sockets) s.destroy();
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
+  });
+
+  it('10. B4 & #5 & #6: Rejects forbidden auth.header transport headers, double-dot trailing hostnames, and unsupported body types', async () => {
+    // B4: auth.header forbidden transport/proxy headers rejected in schema and buildProviderAuthHeaders
+    const baseManifest = {
+      schemaVersion: '1.0' as const,
+      id: 'b4-auth-header-test',
+      name: 'B4 Auth Header Test',
+      packageType: 'official-json' as const,
+      baseUrl: 'https://api.example.com/v1',
+      modelsSource: 'static' as const,
+      reviewedAt: '2026-11-26',
+      staticModels: [{ id: 'm1', name: 'M1' }],
+    };
+
+    for (const badAuthHeader of [
+      'Content-Length',
+      'Host',
+      'Transfer-Encoding',
+      'Proxy-Authorization',
+      'Cookie',
+      'Connection',
+      'Upgrade',
+      'TE',
+      'Forwarded',
+      'X-Forwarded-For',
+      'x-forwarded-host',
+    ]) {
+      const check = validateProviderManifest({
+        ...baseManifest,
+        auth: { type: 'header', header: badAuthHeader, prefix: '' },
+      });
+      assert.equal(check.valid, false, `Expected auth.header="${badAuthHeader}" to be rejected`);
+
+      const built = buildProviderAuthHeaders(
+        { type: 'header', header: badAuthHeader, prefix: '' },
+        'secret-123456',
+      );
+      assert.equal(
+        Object.keys(built).some((k) => k.toLowerCase() === badAuthHeader.toLowerCase()),
+        false,
+        `buildProviderAuthHeaders must never emit forbidden auth.header "${badAuthHeader}"`,
+      );
+    }
+
+    // Valid auth.header values ('Authorization' and 'X-Api-Key') still pass and emit properly
+    assert.equal(
+      validateProviderManifest({
+        ...baseManifest,
+        auth: { type: 'bearer', header: 'Authorization', prefix: 'Bearer ' },
+      }).valid,
+      true,
+    );
+    assert.equal(
+      validateProviderManifest({
+        ...baseManifest,
+        auth: { type: 'header', header: 'X-Api-Key', prefix: '' },
+      }).valid,
+      true,
+    );
+    assert.equal(
+      buildProviderAuthHeaders(
+        { type: 'bearer', header: 'Authorization', prefix: 'Bearer ' },
+        'tok-123456',
+      ).Authorization,
+      'Bearer tok-123456',
+    );
+    assert.equal(
+      buildProviderAuthHeaders(
+        { type: 'header', header: 'X-Api-Key', prefix: '' },
+        'key-123456',
+      )['X-Api-Key'],
+      'key-123456',
+    );
+
+    // #5: Hostnames with empty DNS labels / multiple trailing dots blocked by SSRF
+    for (const emptyLabelUrl of [
+      'https://watchtower../v1',
+      'https://metadata.internal../v1',
+      'https://metadata.google.internal../computeMetadata/v1/',
+      'https://foo..bar.example.com/v1',
+    ]) {
+      assert.throws(
+        () => assertSafeUpstreamUrlSync(emptyLabelUrl, { mode: 'official-json' }),
+        UpstreamSsrfError,
+        `Expected empty-label URL ${emptyLabelUrl} to be blocked`,
+      );
+      await assert.rejects(
+        () => assertSafeUpstreamUrl(emptyLabelUrl, { mode: 'official-json' }),
+        UpstreamSsrfError,
+        `Expected async empty-label URL ${emptyLabelUrl} to be blocked`,
+      );
+    }
+
+    // #6: safeFetch supports Blob body and rejects unsupported body types explicitly instead of "[object ...]"
+    let observedBody = '';
+    const srv = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        observedBody = Buffer.concat(chunks).toString('utf8');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ len: observedBody.length }));
+      });
+    });
+    await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', () => resolve()));
+    const addr = srv.address() as { port: number };
+    try {
+      const blobRes = await safeFetch(
+        `http://127.0.0.1:${addr.port}/blob`,
+        { method: 'POST', body: new Blob(['hello-blob']) },
+        { mode: 'official-json', allowLocalhostForTests: true },
+      );
+      assert.equal(blobRes.status, 200);
+      assert.equal(observedBody, 'hello-blob');
+
+      const unsupportedStream = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.close();
+        },
+      });
+      await assert.rejects(
+        () =>
+          safeFetch(
+            `http://127.0.0.1:${addr.port}/stream`,
+            { method: 'POST', body: unsupportedStream },
+            { mode: 'official-json', allowLocalhostForTests: true },
+          ),
+        TypeError,
+      );
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
     }
   });
 });

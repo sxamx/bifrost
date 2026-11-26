@@ -110,16 +110,53 @@ export type NodeEndpointValidationResult =
   | { valid: false; error: string };
 
 const TAILSCALE_DOMAIN_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.ts\.net$/;
-const PUBLIC_HOSTNAME_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/;
+const PUBLIC_HOSTNAME_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z][a-z0-9-]*$/;
+
+function canonicalizeNodeHost(rawHost: string): string | null {
+  const trimmed = rawHost.trim().toLowerCase();
+  if (
+    !trimmed ||
+    /[\u0000-\u001f\u007f\s/@?#%]/.test(trimmed) ||
+    trimmed.includes('..') ||
+    trimmed.startsWith('.')
+  ) {
+    return null;
+  }
+
+  let parsedUrl: URL;
+  try {
+    const authority = trimmed.includes(':') ? `[${trimmed}]` : trimmed;
+    parsedUrl = new URL(`https://${authority}`);
+  } catch {
+    return null;
+  }
+
+  if (parsedUrl.username !== '' || parsedUrl.password !== '' || parsedUrl.port !== '') {
+    return null;
+  }
+
+  let hostname = parsedUrl.hostname.toLowerCase();
+  if (hostname.startsWith('[') && hostname.endsWith(']')) {
+    hostname = hostname.slice(1, -1);
+  }
+  if (hostname.includes('..') || hostname.startsWith('.')) {
+    return null;
+  }
+  hostname = hostname.replace(/\.+$/, '');
+  return hostname || null;
+}
 
 /**
  * Validates an egress node endpoint against SSRF / IMDS rules and mode-specific network constraints:
+ * - Canonicalizes hosts via WHATWG URL parsing so octal/hex/short-form IPv4 literals
+ *   (e.g. `0251.0376.0251.0376`, `0xa9.0xfe.0xa9.0xfe`, `169.254.43518`, `192.0.192`, `0177.0.0.1`)
+ *   are always evaluated against IP rules.
  * - Unconditionally blocks Cloud IMDS (`169.254.0.0/16`, `192.0.0.192`, `100.100.100.200`, `fd00:ec2::254`),
  *   `0.0.0.0/8`, link-local (`fe80::/10`), ULA (`fc00::/7`), multicast, and IPv6 transition ranges.
  * - Loopback (`127.0.0.0/8`, `::1`, `localhost`) is blocked in production and allowed only when
  *   `allowLoopbackNodes` (or test mode) is explicitly active.
  * - `tailscale` mode requires `100.64.0.0/10` (excluding Alibaba IMDS) or a `.ts.net` hostname.
- * - `public_ip` mode blocks loopback, RFC1918, CGNAT, and single-label hostnames.
+ * - `public_ip` mode blocks loopback, RFC1918, CGNAT, and single-label/numeric-TLD hostnames.
  */
 export function validateNodeEndpoint(
   rawEndpoint: string,
@@ -134,8 +171,15 @@ export function validateNodeEndpoint(
     };
   }
 
-  const host = parsed.host.replace(/\.+$/, '');
-  if (!host || isBlockedMetadataHostname(host)) {
+  const host = canonicalizeNodeHost(parsed.host);
+  if (!host) {
+    return {
+      valid: false,
+      error: `Invalid or obfuscated node endpoint host "${parsed.host}".`,
+    };
+  }
+
+  if (isBlockedMetadataHostname(host)) {
     return {
       valid: false,
       error: `Node endpoint host "${host}" is blocked by SSRF policy (metadata/internal host).`,
@@ -148,6 +192,13 @@ export function validateNodeEndpoint(
       error: `Node endpoint host "${host}" is blocked (numeric/hex IP obfuscation).`,
     };
   }
+
+  const normalizedHost = host.includes(':') ? `[${host}]` : host;
+  const canonicalParsed: ParsedEndpoint = {
+    host,
+    port: parsed.port,
+    normalized: `${normalizedHost}:${parsed.port}`,
+  };
 
   const allowLoopback =
     options?.allowLoopbackNodes !== undefined
@@ -170,7 +221,7 @@ export function validateNodeEndpoint(
           error: `Loopback node endpoint "${host}" is forbidden in production.`,
         };
       }
-      return { valid: true, parsed };
+      return { valid: true, parsed: canonicalParsed };
     }
 
     if (mode === 'tailscale') {
@@ -180,7 +231,7 @@ export function validateNodeEndpoint(
           error: `Tailscale mode requires a Tailscale IPv4 in 100.64.0.0/10 or a .ts.net hostname (got "${host}").`,
         };
       }
-      return { valid: true, parsed };
+      return { valid: true, parsed: canonicalParsed };
     }
 
     if (isPrivateOrReservedIp(host)) {
@@ -190,7 +241,7 @@ export function validateNodeEndpoint(
       };
     }
 
-    return { valid: true, parsed };
+    return { valid: true, parsed: canonicalParsed };
   }
 
   if (host === 'localhost' || host.endsWith('.localhost')) {
@@ -200,7 +251,7 @@ export function validateNodeEndpoint(
         error: `Loopback node endpoint "${host}" is forbidden in production.`,
       };
     }
-    return { valid: true, parsed };
+    return { valid: true, parsed: canonicalParsed };
   }
 
   if (mode === 'tailscale') {
@@ -210,7 +261,7 @@ export function validateNodeEndpoint(
         error: `Tailscale mode requires a Tailscale IPv4 in 100.64.0.0/10 or a .ts.net hostname (got "${host}").`,
       };
     }
-    return { valid: true, parsed };
+    return { valid: true, parsed: canonicalParsed };
   }
 
   if (!PUBLIC_HOSTNAME_RE.test(host)) {
@@ -220,7 +271,7 @@ export function validateNodeEndpoint(
     };
   }
 
-  return { valid: true, parsed };
+  return { valid: true, parsed: canonicalParsed };
 }
 
 export function generateNodeToken(): { rawToken: string; tokenHash: string } {
@@ -267,14 +318,17 @@ export function callNodeControlPlane(params: {
   if (!parsedEp) {
     return Promise.reject(new Error(`Invalid node endpoint: "${params.endpoint}"`));
   }
+  const canonicalHost = canonicalizeNodeHost(parsedEp.host);
   if (
-    isBlockedMetadataHostname(parsedEp.host) ||
-    (net.isIP(parsedEp.host) !== 0 && isUnconditionallyBlockedIp(parsedEp.host))
+    !canonicalHost ||
+    isBlockedMetadataHostname(canonicalHost) ||
+    (net.isIP(canonicalHost) !== 0 && isUnconditionallyBlockedIp(canonicalHost))
   ) {
     return Promise.reject(
       new Error(`Node endpoint "${parsedEp.host}" is blocked by SSRF policy.`),
     );
   }
+  parsedEp.host = canonicalHost;
 
   const timeoutMs = params.timeoutMs ?? 5000;
   const bodyStr = params.body ? JSON.stringify(params.body) : undefined;
@@ -391,14 +445,17 @@ function openConnectSocketToNode(
   if (!parsedEp) {
     return Promise.reject(new Error(`Invalid node endpoint "${node.endpoint}"`));
   }
+  const canonicalHost = canonicalizeNodeHost(parsedEp.host);
   if (
-    isBlockedMetadataHostname(parsedEp.host) ||
-    (net.isIP(parsedEp.host) !== 0 && isUnconditionallyBlockedIp(parsedEp.host))
+    !canonicalHost ||
+    isBlockedMetadataHostname(canonicalHost) ||
+    (net.isIP(canonicalHost) !== 0 && isUnconditionallyBlockedIp(canonicalHost))
   ) {
     return Promise.reject(
       new Error(`Node endpoint "${parsedEp.host}" is blocked by SSRF policy.`),
     );
   }
+  parsedEp.host = canonicalHost;
 
   return new Promise((resolve, reject) => {
     let settled = false;

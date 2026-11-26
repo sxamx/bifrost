@@ -274,6 +274,12 @@ export function isForbiddenExtraHeaderName(name: string): boolean {
   return FORBIDDEN_EXTRA_HEADERS.has(lower) || lower.startsWith('x-forwarded-');
 }
 
+export function isForbiddenAuthHeaderName(name: string): boolean {
+  const lower = name.trim().toLowerCase();
+  if (lower === 'authorization') return false;
+  return FORBIDDEN_EXTRA_HEADERS.has(lower) || lower.startsWith('x-forwarded-');
+}
+
 export function validateAuthConfig(auth: unknown): string[] {
   const errors: string[] = [];
   if (!auth || typeof auth !== 'object' || Array.isArray(auth)) {
@@ -285,6 +291,10 @@ export function validateAuthConfig(auth: unknown): string[] {
     if (!isValidHeaderName(cfg.header) || hasHeaderControlChars(cfg.header)) {
       errors.push(
         `$.auth.header: invalid header name ${JSON.stringify(cfg.header)} (expected RFC 9110 token ^[A-Za-z0-9-]+$)`,
+      );
+    } else if (isForbiddenAuthHeaderName(cfg.header)) {
+      errors.push(
+        `$.auth.header: header "${cfg.header}" is forbidden as an auth header`,
       );
     }
   }
@@ -553,14 +563,22 @@ export function buildProviderAuthHeaders(
     const headerName = auth.header || 'Authorization';
     const prefix = auth.prefix !== undefined ? auth.prefix : 'Bearer ';
     const value = `${prefix}${rawSecret}`;
-    if (isValidHeaderName(headerName) && !hasHeaderControlChars(value)) {
+    if (
+      isValidHeaderName(headerName) &&
+      !isForbiddenAuthHeaderName(headerName) &&
+      !hasHeaderControlChars(value)
+    ) {
       map.set(headerName.toLowerCase(), { name: headerName, value });
     }
   } else if (auth.type === 'header') {
     const headerName = auth.header || 'X-API-Key';
     const prefix = auth.prefix ?? '';
     const value = `${prefix}${rawSecret}`;
-    if (isValidHeaderName(headerName) && !hasHeaderControlChars(value)) {
+    if (
+      isValidHeaderName(headerName) &&
+      !isForbiddenAuthHeaderName(headerName) &&
+      !hasHeaderControlChars(value)
+    ) {
       map.set(headerName.toLowerCase(), { name: headerName, value });
     }
   }

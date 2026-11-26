@@ -312,7 +312,7 @@ function normalizeUrlHostname(rawHostname: string): string {
   if (lower.startsWith('[') && lower.endsWith(']')) {
     return lower.slice(1, -1);
   }
-  return lower.replace(/\.$/, '');
+  return lower.replace(/\.+$/, '');
 }
 
 function isLoopbackPermitted(options: ValidateUpstreamUrlOptions): boolean {
@@ -361,6 +361,17 @@ export function validateSafeUpstreamUrlSync(
     return {
       allowed: false,
       reason: 'Embedded credentials in upstream URLs are forbidden.',
+    };
+  }
+
+  const rawHostNoBrackets =
+    parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+      ? parsed.hostname.slice(1, -1)
+      : parsed.hostname;
+  if (rawHostNoBrackets.includes('..') || rawHostNoBrackets.startsWith('.')) {
+    return {
+      allowed: false,
+      reason: `Upstream hostname "${parsed.hostname}" contains empty DNS labels and is blocked by SSRF policy.`,
     };
   }
 
@@ -529,7 +540,7 @@ export async function validateSafeUpstreamUrl(
     }
     return {
       ...syncCheck,
-      resolvedIps: ['127.0.0.1'],
+      resolvedIps: ['127.0.0.1', '::1'],
     };
   }
 
@@ -627,43 +638,93 @@ function isRedirectStatus(status: number): boolean {
   return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
 }
 
-function bodyInitToBuffer(body: RequestInit['body']): Buffer | undefined {
+async function bodyInitToBuffer(body: RequestInit['body']): Promise<Buffer | undefined> {
   if (body === undefined || body === null) return undefined;
   if (typeof body === 'string') return Buffer.from(body, 'utf8');
   if (Buffer.isBuffer(body)) return body;
-  if (body instanceof Uint8Array) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
-  if (body instanceof ArrayBuffer) return Buffer.from(body);
   if (ArrayBuffer.isView(body)) {
     return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
   }
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
   if (body instanceof URLSearchParams) {
     return Buffer.from(body.toString(), 'utf8');
   }
-  return Buffer.from(String(body), 'utf8');
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    return Buffer.from(await body.arrayBuffer());
+  }
+  throw new TypeError('Unsupported request body type for safeFetch.');
 }
 
-function createPinnedLookup(pinnedIp: string): NonNullable<http.RequestOptions['lookup']> {
-  const pinnedFamily = net.isIP(pinnedIp) === 6 ? 6 : 4;
-  return (_hostname, opts, callback) => {
-    const wantsAll = typeof opts === 'object' && opts !== null && opts.all === true;
-    if (wantsAll) {
-      (callback as (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; family: number }>) => void)(
+export interface PinnedAddressRecord {
+  address: string;
+  family: 4 | 6;
+}
+
+export function createPinnedLookup(
+  pinnedIps: ReadonlyArray<string | PinnedAddressRecord>,
+): NonNullable<http.RequestOptions['lookup']> {
+  const normalized: PinnedAddressRecord[] = [];
+  const seen = new Set<string>();
+  for (const entry of pinnedIps) {
+    const address = typeof entry === 'string' ? entry : entry.address;
+    if (seen.has(address)) continue;
+    const detected = net.isIP(address);
+    const family: 4 | 6 | 0 =
+      typeof entry === 'string'
+        ? detected === 6
+          ? 6
+          : detected === 4
+            ? 4
+            : 0
+        : entry.family;
+    if (family !== 4 && family !== 6) continue;
+    seen.add(address);
+    normalized.push({ address, family });
+  }
+
+  return (hostname, opts, callback) => {
+    const optsObj = typeof opts === 'object' && opts !== null ? opts : undefined;
+    const requestedFamily =
+      typeof opts === 'number'
+        ? opts
+        : typeof optsObj?.family === 'number'
+          ? optsObj.family
+          : 0;
+    const matching =
+      requestedFamily === 4 || requestedFamily === 6
+        ? normalized.filter((r) => r.family === requestedFamily)
+        : normalized;
+
+    if (matching.length === 0) {
+      const err = new Error(
+        `No pinned IP address available for "${hostname}" (family=${requestedFamily}).`,
+      ) as NodeJS.ErrnoException;
+      err.code = 'ENOTFOUND';
+      callback(err, '', 0);
+      return;
+    }
+
+    if (optsObj?.all === true) {
+      (callback as (err: NodeJS.ErrnoException | null, addresses: PinnedAddressRecord[]) => void)(
         null,
-        [{ address: pinnedIp, family: pinnedFamily }],
+        matching.map((r) => ({ address: r.address, family: r.family })),
       );
       return;
     }
-    callback(null, pinnedIp, pinnedFamily);
+
+    const first = matching[0]!;
+    callback(null, first.address, first.family);
   };
 }
 
 /**
- * Executes an HTTP/HTTPS request strictly pinned to a pre-validated IP address
- * (mitigating DNS rebinding / TOCTOU) while preserving the original Host header and TLS SNI.
+ * Executes an HTTP/HTTPS request strictly pinned to pre-validated IP addresses
+ * (mitigating DNS rebinding / TOCTOU while preserving Happy Eyeballs fallback,
+ * original Host header, and TLS SNI).
  */
 async function pinnedHttpFetch(
   normalizedUrl: string,
-  pinnedIp: string,
+  pinnedIps: ReadonlyArray<string>,
   init: RequestInit | undefined,
   upstreamTls?: SafeFetchTlsOptions,
 ): Promise<Response> {
@@ -688,27 +749,31 @@ async function pinnedHttpFetch(
     reqHeaders.Connection = 'close';
   }
 
-  const bodyBuffer = bodyInitToBuffer(init?.body);
+  const bodyBuffer = await bodyInitToBuffer(init?.body);
   if (bodyBuffer !== undefined && !seenLower.has('content-length')) {
     reqHeaders['Content-Length'] = String(bodyBuffer.byteLength);
   }
 
   const pathWithQuery = `${parsed.pathname || '/'}${parsed.search || ''}`;
-  const pinnedLookup = createPinnedLookup(pinnedIp);
+  const pinnedLookup = createPinnedLookup(pinnedIps);
   const redirectMode = init?.redirect ?? 'error';
 
-  if (init?.signal?.aborted) {
-    throw init.signal.reason instanceof Error
+  const getAbortError = (): Error =>
+    init?.signal?.reason instanceof Error
       ? init.signal.reason
       : new Error('The operation was aborted.');
+
+  if (init?.signal?.aborted) {
+    throw getAbortError();
   }
 
   return new Promise<Response>((resolve, reject) => {
     let headersResolved = false;
     let clientReq: http.ClientRequest;
+    let bodyAbortHandler: ((reason: Error) => void) | null = null;
 
     const cleanupAbort = () => {
-      if (init?.signal && onAbort) {
+      if (init?.signal) {
         init.signal.removeEventListener('abort', onAbort);
       }
     };
@@ -722,10 +787,11 @@ async function pinnedHttpFetch(
     };
 
     const onAbort = () => {
-      const reason =
-        init?.signal?.reason instanceof Error
-          ? init.signal.reason
-          : new Error('The operation was aborted.');
+      const reason = getAbortError();
+      if (bodyAbortHandler) {
+        bodyAbortHandler(reason);
+        return;
+      }
       clientReq?.destroy(reason);
       failEarly(reason);
     };
@@ -740,27 +806,45 @@ async function pinnedHttpFetch(
       }
 
       headersResolved = true;
-      cleanupAbort();
+
+      // Return early for bodyless responses BEFORE instantiating any zlib transform
+      // so an empty body with Content-Encoding never triggers an uncaught zlib error.
+      if (status === 204 || status === 205 || status === 304 || method === 'HEAD') {
+        cleanupAbort();
+        const emptyHeaders = new Headers();
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (v === undefined) continue;
+          if (Array.isArray(v)) {
+            for (const item of v) emptyHeaders.append(k, item);
+          } else {
+            emptyHeaders.set(k, v);
+          }
+        }
+        res.resume();
+        resolve(new Response(null, { status, headers: emptyHeaders }));
+        return;
+      }
 
       const rawEncoding = String(res.headers['content-encoding'] ?? '')
         .trim()
         .toLowerCase();
+      let zlibStream: zlib.Gunzip | zlib.Inflate | zlib.BrotliDecompress | null = null;
       let decodedStream: NodeJS.ReadableStream = res;
       let decompressed = false;
       if (rawEncoding === 'gzip' || rawEncoding === 'x-gzip') {
-        const gunzip = zlib.createGunzip();
-        res.pipe(gunzip);
-        decodedStream = gunzip;
+        zlibStream = zlib.createGunzip();
+        res.pipe(zlibStream);
+        decodedStream = zlibStream;
         decompressed = true;
       } else if (rawEncoding === 'deflate') {
-        const inflate = zlib.createInflate();
-        res.pipe(inflate);
-        decodedStream = inflate;
+        zlibStream = zlib.createInflate();
+        res.pipe(zlibStream);
+        decodedStream = zlibStream;
         decompressed = true;
       } else if (rawEncoding === 'br') {
-        const brotli = zlib.createBrotliDecompress();
-        res.pipe(brotli);
-        decodedStream = brotli;
+        zlibStream = zlib.createBrotliDecompress();
+        res.pipe(zlibStream);
+        decodedStream = zlibStream;
         decompressed = true;
       }
 
@@ -778,15 +862,43 @@ async function pinnedHttpFetch(
         }
       }
 
-      if (status === 204 || status === 205 || status === 304 || method === 'HEAD') {
-        res.resume();
-        resolve(new Response(null, { status, headers: responseHeaders }));
-        return;
-      }
+      const destroyStreams = (err?: Error) => {
+        if (zlibStream && !zlibStream.destroyed) {
+          zlibStream.destroy(err);
+        }
+        if (!res.destroyed) {
+          res.destroy(err);
+        }
+        if (!clientReq.destroyed) {
+          clientReq.destroy(err);
+        }
+      };
 
       let streamClosed = false;
       const webStream = new ReadableStream<Uint8Array>({
         start(controller) {
+          const finishError = (err: Error) => {
+            if (streamClosed) return;
+            streamClosed = true;
+            bodyAbortHandler = null;
+            cleanupAbort();
+            try {
+              controller.error(err);
+            } catch {
+              // Ignore already closed controller
+            }
+            destroyStreams();
+          };
+
+          bodyAbortHandler = (reason: Error) => {
+            finishError(reason);
+          };
+
+          if (init?.signal?.aborted) {
+            finishError(getAbortError());
+            return;
+          }
+
           const onData = (chunk: Buffer | string) => {
             if (streamClosed) return;
             try {
@@ -794,12 +906,16 @@ async function pinnedHttpFetch(
               controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
             } catch {
               streamClosed = true;
-              res.destroy();
+              bodyAbortHandler = null;
+              cleanupAbort();
+              destroyStreams();
             }
           };
           const onEnd = () => {
             if (streamClosed) return;
             streamClosed = true;
+            bodyAbortHandler = null;
+            cleanupAbort();
             try {
               controller.close();
             } catch {
@@ -807,22 +923,11 @@ async function pinnedHttpFetch(
             }
           };
           const onErr = (err: Error) => {
-            if (streamClosed) return;
-            streamClosed = true;
-            try {
-              controller.error(err);
-            } catch {
-              // Ignore already closed controller
-            }
+            finishError(err);
           };
           const onClose = () => {
             if (!streamClosed && !res.complete) {
-              streamClosed = true;
-              try {
-                controller.error(new Error('Upstream stream closed prematurely'));
-              } catch {
-                // Ignore already closed controller
-              }
+              finishError(new Error('Upstream stream closed prematurely'));
             }
           };
           decodedStream.on('data', onData);
@@ -833,8 +938,9 @@ async function pinnedHttpFetch(
         },
         cancel() {
           streamClosed = true;
-          res.destroy();
-          clientReq.destroy();
+          bodyAbortHandler = null;
+          cleanupAbort();
+          destroyStreams();
         },
       });
 
@@ -921,7 +1027,7 @@ async function pinnedHttpFetch(
  *   runs synchronous SSRF validation and delegates to the mocked `fetchImpl` without real OS DNS.
  * - When `dnsLookup`/`lookupFn` is injected OR when executing a real network request (`globalThis.fetch`),
  *   runs full async DNS validation (`validateSafeUpstreamUrl`), and for real network requests pins the
- *   TCP/TLS connection directly to the approved IP to prevent DNS rebinding.
+ *   TCP/TLS connection directly to the approved IPs (preserving Happy Eyeballs fallback) to prevent DNS rebinding.
  */
 export async function safeFetch(
   rawUrl: string,
@@ -949,10 +1055,12 @@ export async function safeFetch(
     return customFetch(check.normalizedUrl, { ...init, redirect: 'error' });
   }
 
-  const pinnedIp = check.resolvedIps?.[0];
-  if (!pinnedIp) {
-    throw new UpstreamSsrfError(`Unable to pin resolved IP for upstream "${check.hostname ?? rawUrl}".`);
+  const pinnedIps = check.resolvedIps ?? [];
+  if (pinnedIps.length === 0) {
+    throw new UpstreamSsrfError(
+      `Unable to pin resolved IP for upstream "${check.hostname ?? rawUrl}".`,
+    );
   }
 
-  return pinnedHttpFetch(check.normalizedUrl, pinnedIp, init, options.upstreamTls);
+  return pinnedHttpFetch(check.normalizedUrl, pinnedIps, init, options.upstreamTls);
 }
