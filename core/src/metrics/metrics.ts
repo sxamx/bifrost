@@ -10,7 +10,6 @@ import {
   round2,
   utcNextMidnightSec,
   utcStartOfDaySec,
-  utcStartOfHourSec,
 } from './stats.js';
 import type {
   LatencyBucket,
@@ -253,10 +252,37 @@ export function getSummaryMetrics(
   };
 }
 
+const MAX_PERCENTILE_SAMPLES_PER_BUCKET = 10_000;
+const MAX_OVERALL_LATENCY_SAMPLES = 50_000;
+const MAX_SPEED_SAMPLES_PER_MODEL = 10_000;
+
+interface BoundedSampleReservoir {
+  total: number;
+  samples: number[];
+}
+
+function pushReservoirSample(
+  reservoir: BoundedSampleReservoir,
+  value: number,
+  cap: number,
+): void {
+  reservoir.total += 1;
+  if (reservoir.samples.length < cap) {
+    reservoir.samples.push(value);
+    return;
+  }
+  const replaceIdx = Math.floor(Math.random() * reservoir.total);
+  if (replaceIdx < cap) {
+    reservoir.samples[replaceIdx] = value;
+  }
+}
+
 /**
  * HU-18: Computes grouped duration_ms percentiles (P50, P75, P90, P95, P99)
  * bucketed by UTC hour (`today` / `24h`) or UTC day (`7d` / `30d`).
  * Preserves `null` for buckets with 0 samples.
+ * Streams rows via SQLite cursor (`iterate`) with bounded reservoir sampling
+ * so 30-day windows remain memory-safe on 1 GB RAM VMs.
  */
 export function getLatencyMetrics(
   db: DatabaseSync,
@@ -265,7 +291,7 @@ export function getLatencyMetrics(
   const nowSec = options.nowSec ?? Math.floor(Date.now() / 1000);
   const spec = buildTimeBuckets(nowSec, options.range);
 
-  const clauses: string[] = ['created_at >= ?', 'created_at <= ?'];
+  const clauses: string[] = ['created_at >= ?', 'created_at <= ?', 'duration_ms IS NOT NULL'];
   const params: SQLInputValue[] = [spec.rangeStartSec, spec.rangeEndSec];
 
   if (options.providerId) {
@@ -281,55 +307,57 @@ export function getLatencyMetrics(
     params.push(options.userId);
   }
 
-  const rows = db
-    .prepare(
-      `SELECT created_at, duration_ms
-       FROM usage_logs
-       WHERE ${clauses.join(' AND ')}`,
-    )
-    .all(...params) as Array<{ created_at: number; duration_ms: number }>;
+  const bucketExpr =
+    spec.granularity === 'hour'
+      ? '(created_at / 3600) * 3600'
+      : '(created_at / 86400) * 86400';
 
-  const bucketSamples = new Map<number, number[]>();
+  const bucketReservoirs = new Map<number, BoundedSampleReservoir>();
   for (const b of spec.buckets) {
-    bucketSamples.set(b.bucketStartSec, []);
+    bucketReservoirs.set(b.bucketStartSec, { total: 0, samples: [] });
   }
 
-  const allSamples: number[] = [];
-  for (const r of rows) {
-    if (typeof r.duration_ms !== 'number' || !Number.isFinite(r.duration_ms)) {
+  const overallReservoir: BoundedSampleReservoir = { total: 0, samples: [] };
+  const stmt = db.prepare(
+    `SELECT ${bucketExpr} AS bucket_sec, duration_ms
+     FROM usage_logs
+     WHERE ${clauses.join(' AND ')}`,
+  );
+
+  for (const rawRow of stmt.iterate(...params)) {
+    const r = rawRow as { bucket_sec: number; duration_ms: number };
+    const duration = Number(r.duration_ms);
+    if (!Number.isFinite(duration)) {
       continue;
     }
-    allSamples.push(r.duration_ms);
-    const key =
-      spec.granularity === 'hour'
-        ? utcStartOfHourSec(r.created_at)
-        : utcStartOfDaySec(r.created_at);
-    const arr = bucketSamples.get(key);
-    if (arr) {
-      arr.push(r.duration_ms);
+    pushReservoirSample(overallReservoir, duration, MAX_OVERALL_LATENCY_SAMPLES);
+    const bucketKey = Number(r.bucket_sec);
+    const bucket = bucketReservoirs.get(bucketKey);
+    if (bucket) {
+      pushReservoirSample(bucket, duration, MAX_PERCENTILE_SAMPLES_PER_BUCKET);
     }
   }
 
   const buckets: LatencyBucket[] = spec.buckets.map((b) => {
-    const samples = bucketSamples.get(b.bucketStartSec) ?? [];
-    const pcts = computePercentiles(samples);
+    const reservoir = bucketReservoirs.get(b.bucketStartSec) ?? { total: 0, samples: [] };
+    const pcts = computePercentiles(reservoir.samples);
     return {
       bucketStartSec: b.bucketStartSec,
       timestamp: b.bucketStartSec,
       label: b.label,
-      sampleCount: samples.length,
-      count: samples.length,
+      sampleCount: reservoir.total,
+      count: reservoir.total,
       ...pcts,
     };
   });
 
-  const overallPcts = computePercentiles(allSamples);
+  const overallPcts = computePercentiles(overallReservoir.samples);
 
   return {
     range: options.range,
     granularity: spec.granularity,
     overall: {
-      sampleCount: allSamples.length,
+      sampleCount: overallReservoir.total,
       percentiles: overallPcts,
       ...overallPcts,
     },
@@ -340,6 +368,7 @@ export function getLatencyMetrics(
 /**
  * HU-18b: Computes TTFT and tokens/sec percentiles (P50..P99) per active model
  * and prompt cache hit rate (%) per provider.
+ * Filters active models directly in SQL and streams rows via `iterate` with bounded reservoirs.
  */
 export function getSpeedAndCacheMetrics(
   db: DatabaseSync,
@@ -358,48 +387,57 @@ export function getSpeedAndCacheMetrics(
     )
     .all() as Array<{ full_id: string; name: string; provider_id: string }>;
 
-  const modelLogs = db
-    .prepare(
-      `SELECT model_full_id, ttft_ms, tokens_per_sec
-       FROM usage_logs
-       WHERE created_at >= ? AND created_at <= ?`,
-    )
-    .all(spec.rangeStartSec, spec.rangeEndSec) as Array<{
-    model_full_id: string;
-    ttft_ms: number | null;
-    tokens_per_sec: number | null;
-  }>;
-
   const perModelSamples = new Map<
     string,
-    { count: number; ttft: number[]; tps: number[] }
+    { count: number; ttft: BoundedSampleReservoir; tps: BoundedSampleReservoir }
   >();
   for (const m of activeModels) {
-    perModelSamples.set(m.full_id, { count: 0, ttft: [], tps: [] });
+    perModelSamples.set(m.full_id, {
+      count: 0,
+      ttft: { total: 0, samples: [] },
+      tps: { total: 0, samples: [] },
+    });
   }
 
-  for (const row of modelLogs) {
-    const bucket = perModelSamples.get(row.model_full_id);
-    if (!bucket) continue;
-    bucket.count += 1;
-    if (typeof row.ttft_ms === 'number' && Number.isFinite(row.ttft_ms)) {
-      bucket.ttft.push(row.ttft_ms);
-    }
-    if (typeof row.tokens_per_sec === 'number' && Number.isFinite(row.tokens_per_sec)) {
-      bucket.tps.push(row.tokens_per_sec);
+  if (activeModels.length > 0) {
+    const modelLogsStmt = db.prepare(
+      `SELECT u.model_full_id, u.ttft_ms, u.tokens_per_sec
+       FROM usage_logs u
+       INNER JOIN models m ON m.full_id = u.model_full_id
+       INNER JOIN providers p ON p.id = m.provider_id
+       WHERE u.created_at >= ? AND u.created_at <= ?
+         AND m.active = 1 AND p.enabled = 1`,
+    );
+
+    for (const rawRow of modelLogsStmt.iterate(spec.rangeStartSec, spec.rangeEndSec)) {
+      const row = rawRow as {
+        model_full_id: string;
+        ttft_ms: number | null;
+        tokens_per_sec: number | null;
+      };
+      const bucket = perModelSamples.get(row.model_full_id);
+      if (!bucket) continue;
+      bucket.count += 1;
+      if (typeof row.ttft_ms === 'number' && Number.isFinite(row.ttft_ms)) {
+        pushReservoirSample(bucket.ttft, row.ttft_ms, MAX_SPEED_SAMPLES_PER_MODEL);
+      }
+      if (typeof row.tokens_per_sec === 'number' && Number.isFinite(row.tokens_per_sec)) {
+        pushReservoirSample(bucket.tps, row.tokens_per_sec, MAX_SPEED_SAMPLES_PER_MODEL);
+      }
     }
   }
 
   const models: ModelSpeedMetrics[] = activeModels
     .map((m) => {
-      const entry = perModelSamples.get(m.full_id) ?? { count: 0, ttft: [], tps: [] };
+      const entry = perModelSamples.get(m.full_id);
+      const count = entry?.count ?? 0;
       return {
         modelFullId: m.full_id,
         modelName: m.name,
         providerId: m.provider_id,
-        sampleCount: entry.count,
-        ttftMs: computePercentiles(entry.ttft),
-        tokensPerSec: computePercentiles(entry.tps),
+        sampleCount: count,
+        ttftMs: computePercentiles(entry?.ttft.samples ?? []),
+        tokensPerSec: computePercentiles(entry?.tps.samples ?? []),
       };
     })
     .filter((m) => m.sampleCount > 0);

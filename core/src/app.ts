@@ -1014,7 +1014,13 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       .prepare(`SELECT id FROM providers WHERE id = ?`)
       .get(manifest.id) as { id: string } | undefined;
 
-    if (existing && !registry.isProviderDraining(manifest.id)) {
+    if (existing) {
+      if (registry.isProviderDraining(manifest.id)) {
+        return {
+          status: 409 as const,
+          payload: { error: 'Provider is currently being removed; retry shortly.' },
+        };
+      }
       return {
         status: 409 as const,
         payload: { error: `Provider "${manifest.id}" is already installed.` },
@@ -3617,6 +3623,19 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json({ error: 'Invalid JSON request body.' }, 400);
     }
 
+    // BF-07 (backward-compatible): if adminPassword is supplied, verify it before exporting secrets
+    if (body.adminPassword !== undefined) {
+      if (typeof body.adminPassword !== 'string' || body.adminPassword.length === 0) {
+        return c.json({ error: 'Invalid administrator password.' }, 401);
+      }
+      const adminRow = db
+        .prepare(`SELECT password_hash FROM users WHERE id = ?`)
+        .get(user.id) as { password_hash: string } | undefined;
+      if (!adminRow || !(await verifyPassword(body.adminPassword, adminRow.password_hash))) {
+        return c.json({ error: 'Invalid administrator password.' }, 401);
+      }
+    }
+
     try {
       const envelope = await exportEncryptedBackup({
         db,
@@ -3717,6 +3736,14 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           );
         }
         const strippedB64 = rawB64.trim().replace(/^data:[^;]+;base64,/i, '');
+        const maxCap = (options.maxBackupUncompressedBytes ?? 50 * 1024 * 1024) + 1024;
+        const maxBase64Chars = Math.ceil(maxCap / 3) * 4;
+        if (strippedB64.length > maxBase64Chars) {
+          return c.json(
+            { error: `Backup file exceeds maximum allowed size (${maxCap} bytes).` },
+            400,
+          );
+        }
         if (!/^[A-Za-z0-9+/_=-]+$/.test(strippedB64)) {
           return c.json({ error: 'Corrupted BIFROST1 base64 backup payload.' }, 400);
         }
@@ -3730,6 +3757,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         password,
         schemasDir: resolvedSchemasDir,
         actingUserId: user.id,
+        actingSessionId: c.get('sessionId'),
         maxUncompressedBytes: options.maxBackupUncompressedBytes,
         nowSec: nowSeconds(),
       });
@@ -4146,6 +4174,12 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           }
           return c.body(body, 200, headers);
         }
+      }
+
+      if (decodedPath.startsWith('/assets/') || decodedPath.startsWith('/icons/')) {
+        return c.json({ error: 'Asset not found' }, 404, {
+          'Cache-Control': 'no-store',
+        });
       }
     }
 

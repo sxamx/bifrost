@@ -50,30 +50,46 @@ export class DrainingRegistry {
       if (released) return;
       released = true;
 
+      let keyFinalizer: (() => void) | undefined;
       const nextKeyCount = Math.max(0, (this.keyInFlight.get(keyId) ?? 1) - 1);
       if (nextKeyCount === 0) {
         this.keyInFlight.delete(keyId);
-        const keyFinalizer = this.keyFinalizers.get(keyId);
+        keyFinalizer = this.keyFinalizers.get(keyId);
         if (keyFinalizer) {
           this.keyFinalizers.delete(keyId);
           this.drainingKeys.delete(keyId);
-          keyFinalizer();
         }
       } else {
         this.keyInFlight.set(keyId, nextKeyCount);
       }
 
+      let provFinalizer: (() => void) | undefined;
       const nextProvCount = Math.max(0, (this.providerInFlight.get(providerId) ?? 1) - 1);
       if (nextProvCount === 0) {
         this.providerInFlight.delete(providerId);
-        const provFinalizer = this.providerFinalizers.get(providerId);
+        provFinalizer = this.providerFinalizers.get(providerId);
         if (provFinalizer) {
           this.providerFinalizers.delete(providerId);
           this.drainingProviders.delete(providerId);
-          provFinalizer();
         }
       } else {
         this.providerInFlight.set(providerId, nextProvCount);
+      }
+
+      if (keyFinalizer) {
+        try {
+          keyFinalizer();
+        } catch {
+          // Isolate key finalizer failure so provider counters and finalizers are never leaked
+        }
+      }
+
+      if (provFinalizer) {
+        try {
+          provFinalizer();
+        } catch {
+          // Isolate provider finalizer failure
+        }
       }
     };
   }

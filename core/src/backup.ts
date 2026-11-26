@@ -4,11 +4,13 @@ import {
   randomBytes,
   scrypt,
 } from 'node:crypto';
+import net from 'node:net';
 import type { DatabaseSync } from 'node:sqlite';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { decryptSecret, encryptSecret, sha256Hex } from './crypto.js';
 import { writeSystemLog } from './db.js';
 import { validateProviderTargetUrl } from './marketplace.js';
+import { parseNodeEndpoint } from './nodes.js';
 import { validateProviderManifest } from './schema.js';
 
 export const BIFROST_BACKUP_MAGIC = Buffer.from('BIFROST1', 'ascii'); // 8 bytes
@@ -59,6 +61,7 @@ export interface ImportBackupOptions {
   password: string;
   schemasDir?: string;
   actingUserId?: string;
+  actingSessionId?: string;
   maxUncompressedBytes?: number;
   nowSec?: number;
 }
@@ -103,6 +106,8 @@ interface BackupInvitationRecord {
   allowed_models_json: string;
   expires_at: number;
   used_at: number | null;
+  used_by_user_id?: string | null;
+  used_by_username?: string | null;
   created_by: string;
   created_at: number | null;
 }
@@ -120,6 +125,7 @@ interface BackupInternalApiKeyRecord {
   key_hash: string;
   last_used_at: number | null;
   revoked_at: number | null;
+  expires_at?: number | null;
   created_at: number;
 }
 
@@ -146,6 +152,8 @@ interface BackupProviderRecord {
   models_source: 'api' | 'static';
   schema_json: string;
   adapter_url: string | null;
+  source_id?: string | null;
+  manifest_hash?: string | null;
   enabled: number;
   last_models_sync_at: number | null;
   created_at: number;
@@ -162,7 +170,7 @@ interface BackupProviderKeyRecord {
   daily_quota_limit: number | null;
   ratelimit_remaining: number | null;
   ratelimit_reset_at: number | null;
-  status: 'active' | 'rate_limited' | 'error' | 'no_node';
+  status: 'active' | 'rate_limited' | 'error' | 'no_node' | 'disabled';
   last_error: string | null;
   created_at: number;
 }
@@ -181,6 +189,7 @@ interface BackupModelRecord {
   first_seen_at: number;
   upstream_created_at: number | null;
   active: number;
+  disabled_by_admin?: number;
 }
 
 interface BackupUsageLogRecord {
@@ -188,6 +197,7 @@ interface BackupUsageLogRecord {
   user_id: string;
   provider_id: string;
   provider_key_id: string | null;
+  internal_api_key_id?: string | null;
   model_full_id: string;
   prompt_tokens: number;
   completion_tokens: number;
@@ -275,6 +285,8 @@ const INVITATION_KEYS = new Set([
   'allowed_models_json',
   'expires_at',
   'used_at',
+  'used_by_user_id',
+  'used_by_username',
   'created_by',
   'created_at',
 ]);
@@ -289,6 +301,7 @@ const INTERNAL_KEY_KEYS = new Set([
   'key_hash',
   'last_used_at',
   'revoked_at',
+  'expires_at',
   'created_at',
 ]);
 
@@ -315,6 +328,8 @@ const PROVIDER_KEYS = new Set([
   'models_source',
   'schema_json',
   'adapter_url',
+  'source_id',
+  'manifest_hash',
   'enabled',
   'last_models_sync_at',
   'created_at',
@@ -350,6 +365,7 @@ const MODEL_KEYS = new Set([
   'first_seen_at',
   'upstream_created_at',
   'active',
+  'disabled_by_admin',
 ]);
 
 const USAGE_LOG_KEYS = new Set([
@@ -357,6 +373,7 @@ const USAGE_LOG_KEYS = new Set([
   'user_id',
   'provider_id',
   'provider_key_id',
+  'internal_api_key_id',
   'model_full_id',
   'prompt_tokens',
   'completion_tokens',
@@ -650,6 +667,95 @@ export async function unpackBifrostEnvelopeRaw(
   return decompressed.toString('utf8');
 }
 
+const FORBIDDEN_NODE_METADATA_HOSTS = new Set<string>([
+  'metadata.google.internal',
+  'metadata.goog',
+  'metadata',
+  'instance-data',
+  'metadata.azure.internal',
+  'metadata.tencentyun.com',
+]);
+
+function isForbiddenNodeEndpointHost(rawHost: string): string | null {
+  const host = rawHost.trim().toLowerCase().replace(/\.+$/, '');
+  if (!host) return 'empty host';
+  if (host.includes('@') || host.includes('%') || /[\x00-\x1f\x7f\s]/.test(host)) {
+    return 'contains invalid or unsafe characters';
+  }
+  if (FORBIDDEN_NODE_METADATA_HOSTS.has(host) || host.endsWith('.internal')) {
+    return `metadata/internal hostname "${host}" is forbidden`;
+  }
+  if (/^(0x[0-9a-f]+|\d+)$/i.test(host)) {
+    return 'numeric/hex IP obfuscation hostname is forbidden';
+  }
+
+  const ipVer = net.isIP(host);
+  if (ipVer === 4) {
+    const parts = host.split('.').map(Number);
+    const a = parts[0]!;
+    const b = parts[1]!;
+    if (a === 0) return 'unspecified IPv4 range 0.0.0.0/8 is forbidden';
+    if (a === 169 && b === 254) return 'cloud metadata / link-local 169.254.0.0/16 is forbidden';
+    if (a >= 224) return 'multicast / reserved IPv4 range is forbidden';
+  } else if (ipVer === 6) {
+    const lower = host.toLowerCase();
+    if (lower === '::' || /^0{0,4}(:0{0,4}){7}$/.test(lower)) {
+      return 'unspecified IPv6 :: is forbidden';
+    }
+    if (lower.startsWith('fe8') || lower.startsWith('fe9') || lower.startsWith('fea') || lower.startsWith('feb')) {
+      return 'IPv6 link-local fe80::/10 is forbidden';
+    }
+    if (lower === 'fd00:ec2::254' || lower.startsWith('fd00:ec2:')) {
+      return 'AWS IMDS IPv6 fd00:ec2::254 is forbidden';
+    }
+    if (lower.startsWith('ff')) {
+      return 'IPv6 multicast ff00::/8 is forbidden';
+    }
+    const mappedMatch = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(lower);
+    if (mappedMatch) {
+      return isForbiddenNodeEndpointHost(mappedMatch[1]!);
+    }
+    if (lower.startsWith('::ffff:a9fe:') || lower.startsWith('::ffff:0:')) {
+      return 'IPv4-mapped metadata/unspecified IPv6 address is forbidden';
+    }
+  }
+  return null;
+}
+
+function validateBackupPasswordHash(hash: string, label: string): string {
+  const parts = hash.split('$');
+  if (parts.length !== 6 || parts[0] !== 'scrypt') {
+    throw new BackupValidationError(
+      `Invalid BIFROST1 payload: "${label}.password_hash" must use a valid scrypt hash format.`,
+    );
+  }
+  const N = Number(parts[1]);
+  const r = Number(parts[2]);
+  const p = Number(parts[3]);
+  const saltHex = parts[4] ?? '';
+  const derivedHex = parts[5] ?? '';
+
+  const isPowerOfTwo = Number.isInteger(N) && N >= 2 && N <= 1048576 && (N & (N - 1)) === 0;
+  if (
+    !isPowerOfTwo ||
+    !Number.isInteger(r) ||
+    r < 1 ||
+    r > 64 ||
+    !Number.isInteger(p) ||
+    p < 1 ||
+    p > 16 ||
+    !/^[0-9a-f]{16,128}$/i.test(saltHex) ||
+    saltHex.length % 2 !== 0 ||
+    !/^[0-9a-f]{32,256}$/i.test(derivedHex) ||
+    derivedHex.length % 2 !== 0
+  ) {
+    throw new BackupValidationError(
+      `Invalid BIFROST1 payload: "${label}.password_hash" has invalid scrypt parameters or digest encoding.`,
+    );
+  }
+  return hash;
+}
+
 function validateBackupJsonPayload(
   rawJson: string,
   schemasDir?: string,
@@ -679,10 +785,14 @@ function validateBackupJsonPayload(
 
   const users: BackupUserRecord[] = reqArray(root, 'users').map((item, i) => {
     const r = assertPlainRecordWithAllowedKeys(item, USER_KEYS, `users[${i}]`);
+    const passwordHash = validateBackupPasswordHash(
+      reqString(r, 'password_hash', `users[${i}]`),
+      `users[${i}]`,
+    );
     return {
       id: reqString(r, 'id', `users[${i}]`),
       username: reqString(r, 'username', `users[${i}]`),
-      password_hash: reqString(r, 'password_hash', `users[${i}]`),
+      password_hash: passwordHash,
       role: reqEnum(r, 'role', ['admin', 'guest'] as const, `users[${i}]`),
       daily_token_limit: optInt(r, 'daily_token_limit', `users[${i}]`),
       quota_reset_mode: reqEnum(
@@ -739,6 +849,8 @@ function validateBackupJsonPayload(
       allowed_models_json: allowedModelsJson,
       expires_at: reqInt(r, 'expires_at', `invitations[${i}]`),
       used_at: optInt(r, 'used_at', `invitations[${i}]`),
+      used_by_user_id: optString(r, 'used_by_user_id', `invitations[${i}]`),
+      used_by_username: optString(r, 'used_by_username', `invitations[${i}]`),
       created_by: reqString(r, 'created_by', `invitations[${i}]`),
       created_at: optInt(r, 'created_at', `invitations[${i}]`),
     };
@@ -772,20 +884,44 @@ function validateBackupJsonPayload(
       key_hash: reqString(r, 'key_hash', `internalApiKeys[${i}]`),
       last_used_at: optInt(r, 'last_used_at', `internalApiKeys[${i}]`),
       revoked_at: optInt(r, 'revoked_at', `internalApiKeys[${i}]`),
+      expires_at: optInt(r, 'expires_at', `internalApiKeys[${i}]`),
       created_at: reqInt(r, 'created_at', `internalApiKeys[${i}]`),
     };
   });
 
   const nodes: BackupNodeRecord[] = reqArray(root, 'nodes').map((item, i) => {
     const r = assertPlainRecordWithAllowedKeys(item, NODE_KEYS, `nodes[${i}]`);
+    const rawEndpoint = reqString(r, 'endpoint', `nodes[${i}]`);
+    const parsedEndpoint = parseNodeEndpoint(rawEndpoint);
+    if (!parsedEndpoint) {
+      throw new BackupValidationError(
+        `Invalid BIFROST1 payload: "nodes[${i}].endpoint" is not a valid host:port endpoint.`,
+      );
+    }
+    const hostRejectReason = isForbiddenNodeEndpointHost(parsedEndpoint.host);
+    if (hostRejectReason) {
+      throw new BackupValidationError(
+        `Invalid BIFROST1 payload: "nodes[${i}].endpoint" rejected (${hostRejectReason}).`,
+      );
+    }
+    const rawTlsFp = optString(r, 'tls_fingerprint', `nodes[${i}]`);
+    let validatedTlsFp: string | null = null;
+    if (rawTlsFp !== null) {
+      if (!/^[0-9A-F]{64}$/i.test(rawTlsFp)) {
+        throw new BackupValidationError(
+          `Invalid BIFROST1 payload: "nodes[${i}].tls_fingerprint" must be a 64-character SHA-256 hex digest.`,
+        );
+      }
+      validatedTlsFp = rawTlsFp.toUpperCase();
+    }
     return {
       id: reqString(r, 'id', `nodes[${i}]`),
       name: reqString(r, 'name', `nodes[${i}]`),
       mode: reqEnum(r, 'mode', ['tailscale', 'public_ip'] as const, `nodes[${i}]`),
-      endpoint: reqString(r, 'endpoint', `nodes[${i}]`),
+      endpoint: parsedEndpoint.normalized,
       token_hash: reqString(r, 'token_hash', `nodes[${i}]`),
       raw_token: optString(r, 'raw_token', `nodes[${i}]`),
-      tls_fingerprint: optString(r, 'tls_fingerprint', `nodes[${i}]`),
+      tls_fingerprint: validatedTlsFp,
       prev_token_hash: optString(r, 'prev_token_hash', `nodes[${i}]`),
       prev_token_expires_at: optInt(r, 'prev_token_expires_at', `nodes[${i}]`),
       last_seen_at: optInt(r, 'last_seen_at', `nodes[${i}]`),
@@ -861,6 +997,8 @@ function validateBackupJsonPayload(
       models_source: modelsSource,
       schema_json: schemaJson,
       adapter_url: adapterUrl,
+      source_id: optString(r, 'source_id', `providers[${i}]`),
+      manifest_hash: optString(r, 'manifest_hash', `providers[${i}]`),
       enabled,
       last_models_sync_at: optInt(r, 'last_models_sync_at', `providers[${i}]`),
       created_at: reqInt(r, 'created_at', `providers[${i}]`),
@@ -894,7 +1032,7 @@ function validateBackupJsonPayload(
         status: reqEnum(
           r,
           'status',
-          ['active', 'rate_limited', 'error', 'no_node'] as const,
+          ['active', 'rate_limited', 'error', 'no_node', 'disabled'] as const,
           `providerKeys[${i}]`,
         ),
         last_error: optString(r, 'last_error', `providerKeys[${i}]`),
@@ -907,7 +1045,15 @@ function validateBackupJsonPayload(
     const r = assertPlainRecordWithAllowedKeys(item, MODEL_KEYS, `models[${i}]`);
     const isFree = reqInt(r, 'is_free', `models[${i}]`);
     const active = reqInt(r, 'active', `models[${i}]`);
-    if ((isFree !== 0 && isFree !== 1) || (active !== 0 && active !== 1)) {
+    const rawDisabledByAdmin =
+      r.disabled_by_admin === undefined || r.disabled_by_admin === null
+        ? 0
+        : reqInt(r, 'disabled_by_admin', `models[${i}]`);
+    if (
+      (isFree !== 0 && isFree !== 1) ||
+      (active !== 0 && active !== 1) ||
+      (rawDisabledByAdmin !== 0 && rawDisabledByAdmin !== 1)
+    ) {
       throw new BackupValidationError(
         `Invalid BIFROST1 payload: "models[${i}]" boolean flags must be 0 or 1.`,
       );
@@ -926,6 +1072,7 @@ function validateBackupJsonPayload(
       first_seen_at: reqInt(r, 'first_seen_at', `models[${i}]`),
       upstream_created_at: optInt(r, 'upstream_created_at', `models[${i}]`),
       active,
+      disabled_by_admin: rawDisabledByAdmin,
     };
   });
 
@@ -936,6 +1083,7 @@ function validateBackupJsonPayload(
       user_id: reqString(r, 'user_id', `usageLogs[${i}]`),
       provider_id: reqString(r, 'provider_id', `usageLogs[${i}]`),
       provider_key_id: optString(r, 'provider_key_id', `usageLogs[${i}]`),
+      internal_api_key_id: optString(r, 'internal_api_key_id', `usageLogs[${i}]`),
       model_full_id: reqString(r, 'model_full_id', `usageLogs[${i}]`),
       prompt_tokens: reqInt(r, 'prompt_tokens', `usageLogs[${i}]`),
       completion_tokens: reqInt(r, 'completion_tokens', `usageLogs[${i}]`),
@@ -1027,354 +1175,412 @@ export async function exportEncryptedBackup(
   const exportUsage = includeUsageLogs ?? includeTelemetry;
   const exportSysLogs = includeSystemLogs ?? includeTelemetry;
 
-  const users: BackupUserRecord[] = includeUsersAndQuotas
-    ? (
-        db
-          .prepare(
-            `SELECT id, username, password_hash, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at
-             FROM users
-             ORDER BY created_at ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        id: String(r.id),
-        username: String(r.username),
-        password_hash: String(r.password_hash),
-        role: r.role === 'admin' ? 'admin' : 'guest',
-        daily_token_limit:
-          r.daily_token_limit === null || r.daily_token_limit === undefined
-            ? null
-            : Number(r.daily_token_limit),
-        quota_reset_mode:
-          r.quota_reset_mode === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight',
-        enforce_strict_quota:
-          r.enforce_strict_quota === undefined || r.enforce_strict_quota === null
-            ? 1
-            : Number(r.enforce_strict_quota) === 0
-              ? 0
-              : 1,
-        created_at: Number(r.created_at),
-      }))
-    : [];
+  let users: BackupUserRecord[] = [];
+  let invitations: BackupInvitationRecord[] = [];
+  let userModelAccess: BackupUserModelAccessRecord[] = [];
+  let internalApiKeys: BackupInternalApiKeyRecord[] = [];
+  let nodes: BackupNodeRecord[] = [];
+  let providers: BackupProviderRecord[] = [];
+  let providerKeys: BackupProviderKeyRecord[] = [];
+  let models: BackupModelRecord[] = [];
+  let usageLogs: BackupUsageLogRecord[] = [];
+  let systemLogs: BackupSystemLogRecord[] = [];
+  let externalCache: BackupExternalCacheRecord[] = [];
 
-  const invitations: BackupInvitationRecord[] = includeUsersAndQuotas
-    ? (
-        db
-          .prepare(
-            `SELECT id, token_hash, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
-                    expires_at, used_at, created_by, created_at
-             FROM invitations
-             ORDER BY COALESCE(created_at, expires_at) ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        id: String(r.id),
-        token_hash: String(r.token_hash),
-        daily_token_limit: Number(r.daily_token_limit),
-        quota_reset_mode:
-          r.quota_reset_mode === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight',
-        enforce_strict_quota:
-          r.enforce_strict_quota === undefined || r.enforce_strict_quota === null
-            ? 1
-            : Number(r.enforce_strict_quota) === 0
-              ? 0
-              : 1,
-        allowed_models_json: String(r.allowed_models_json),
-        expires_at: Number(r.expires_at),
-        used_at: r.used_at === null || r.used_at === undefined ? null : Number(r.used_at),
-        created_by: String(r.created_by),
-        created_at:
-          r.created_at === null || r.created_at === undefined ? null : Number(r.created_at),
-      }))
-    : [];
-
-  const userModelAccess: BackupUserModelAccessRecord[] = includeUsersAndQuotas
-    ? (
-        db
-          .prepare(
-            `SELECT user_id, model_full_id
-             FROM user_model_access
-             ORDER BY user_id ASC, model_full_id ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        user_id: String(r.user_id),
-        model_full_id: String(r.model_full_id),
-      }))
-    : [];
-
-  const internalApiKeys: BackupInternalApiKeyRecord[] = includeUsersAndQuotas
-    ? (
-        db
-          .prepare(
-            `SELECT id, user_id, name, key_prefix, key_hash, last_used_at, revoked_at, created_at
-             FROM internal_api_keys
-             ORDER BY created_at ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        id: String(r.id),
-        user_id: String(r.user_id),
-        name: String(r.name),
-        key_prefix: String(r.key_prefix),
-        key_hash: String(r.key_hash),
-        last_used_at:
-          r.last_used_at === null || r.last_used_at === undefined
-            ? null
-            : Number(r.last_used_at),
-        revoked_at:
-          r.revoked_at === null || r.revoked_at === undefined
-            ? null
-            : Number(r.revoked_at),
-        created_at: Number(r.created_at),
-      }))
-    : [];
-
-  const nodes: BackupNodeRecord[] = includeNodes
-    ? (
-        db
-          .prepare(
-            `SELECT id, name, mode, endpoint, token_hash, encrypted_token, tls_fingerprint,
-                    prev_token_hash, prev_token_expires_at, last_seen_at, last_rotated_at,
-                    status, created_at
-             FROM nodes
-             ORDER BY created_at ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => {
-        let rawToken: string | null = null;
-        if (r.encrypted_token instanceof Uint8Array || Buffer.isBuffer(r.encrypted_token)) {
-          rawToken = decryptSecret(r.encrypted_token, masterKey);
-        }
-        return {
-          id: String(r.id),
-          name: String(r.name),
-          mode: r.mode === 'public_ip' ? 'public_ip' : 'tailscale',
-          endpoint: String(r.endpoint),
-          token_hash: String(r.token_hash),
-          raw_token: rawToken,
-          tls_fingerprint:
-            r.tls_fingerprint === null || r.tls_fingerprint === undefined
-              ? null
-              : String(r.tls_fingerprint),
-          prev_token_hash:
-            r.prev_token_hash === null || r.prev_token_hash === undefined
-              ? null
-              : String(r.prev_token_hash),
-          prev_token_expires_at:
-            r.prev_token_expires_at === null || r.prev_token_expires_at === undefined
-              ? null
-              : Number(r.prev_token_expires_at),
-          last_seen_at:
-            r.last_seen_at === null || r.last_seen_at === undefined
-              ? null
-              : Number(r.last_seen_at),
-          last_rotated_at: Number(r.last_rotated_at),
-          status:
-            r.status === 'online' || r.status === 'unresponsive' ? r.status : 'offline',
-          created_at: Number(r.created_at),
-        };
-      })
-    : [];
-
-  const providers: BackupProviderRecord[] = includeProvidersAndConfig
-    ? (
-        db
-          .prepare(
-            `SELECT id, name, package_type, models_source, schema_json, adapter_url,
-                    enabled, last_models_sync_at, created_at
-             FROM providers
-             ORDER BY created_at ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        id: String(r.id),
-        name: String(r.name),
-        package_type:
-          r.package_type === 'experimental-adapter'
-            ? 'experimental-adapter'
-            : 'official-json',
-        models_source: r.models_source === 'static' ? 'static' : 'api',
-        schema_json: String(r.schema_json),
-        adapter_url:
-          r.adapter_url === null || r.adapter_url === undefined
-            ? null
-            : String(r.adapter_url),
-        enabled: Number(r.enabled) === 1 ? 1 : 0,
-        last_models_sync_at:
-          r.last_models_sync_at === null || r.last_models_sync_at === undefined
-            ? null
-            : Number(r.last_models_sync_at),
-        created_at: Number(r.created_at),
-      }))
-    : [];
-
-  const providerKeys: BackupProviderKeyRecord[] =
-    includeProvidersAndConfig && includeProviderKeys
+  db.exec('BEGIN DEFERRED');
+  let readTxOpen = true;
+  try {
+    users = includeUsersAndQuotas
       ? (
           db
             .prepare(
-              `SELECT id, provider_id, label, encrypted_secret, last4, node_id, forced_node,
-                      daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
-                      status, last_error, created_at
-               FROM provider_keys
+              `SELECT id, username, password_hash, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at
+               FROM users
+               ORDER BY created_at ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          id: String(r.id),
+          username: String(r.username),
+          password_hash: String(r.password_hash),
+          role: r.role === 'admin' ? 'admin' : 'guest',
+          daily_token_limit:
+            r.daily_token_limit === null || r.daily_token_limit === undefined
+              ? null
+              : Number(r.daily_token_limit),
+          quota_reset_mode:
+            r.quota_reset_mode === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight',
+          enforce_strict_quota:
+            r.enforce_strict_quota === undefined || r.enforce_strict_quota === null
+              ? 1
+              : Number(r.enforce_strict_quota) === 0
+                ? 0
+                : 1,
+          created_at: Number(r.created_at),
+        }))
+      : [];
+
+    invitations = includeUsersAndQuotas
+      ? (
+          db
+            .prepare(
+              `SELECT id, token_hash, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
+                      expires_at, used_at, used_by_user_id, used_by_username, created_by, created_at
+               FROM invitations
+               ORDER BY COALESCE(created_at, expires_at) ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          id: String(r.id),
+          token_hash: String(r.token_hash),
+          daily_token_limit: Number(r.daily_token_limit),
+          quota_reset_mode:
+            r.quota_reset_mode === 'rolling_24h' ? 'rolling_24h' : 'utc_midnight',
+          enforce_strict_quota:
+            r.enforce_strict_quota === undefined || r.enforce_strict_quota === null
+              ? 1
+              : Number(r.enforce_strict_quota) === 0
+                ? 0
+                : 1,
+          allowed_models_json: String(r.allowed_models_json),
+          expires_at: Number(r.expires_at),
+          used_at: r.used_at === null || r.used_at === undefined ? null : Number(r.used_at),
+          used_by_user_id:
+            r.used_by_user_id === null || r.used_by_user_id === undefined
+              ? null
+              : String(r.used_by_user_id),
+          used_by_username:
+            r.used_by_username === null || r.used_by_username === undefined
+              ? null
+              : String(r.used_by_username),
+          created_by: String(r.created_by),
+          created_at:
+            r.created_at === null || r.created_at === undefined ? null : Number(r.created_at),
+        }))
+      : [];
+
+    userModelAccess = includeUsersAndQuotas
+      ? (
+          db
+            .prepare(
+              `SELECT user_id, model_full_id
+               FROM user_model_access
+               ORDER BY user_id ASC, model_full_id ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          user_id: String(r.user_id),
+          model_full_id: String(r.model_full_id),
+        }))
+      : [];
+
+    internalApiKeys = includeUsersAndQuotas
+      ? (
+          db
+            .prepare(
+              `SELECT id, user_id, name, key_prefix, key_hash, last_used_at, revoked_at, expires_at, created_at
+               FROM internal_api_keys
+               ORDER BY created_at ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          id: String(r.id),
+          user_id: String(r.user_id),
+          name: String(r.name),
+          key_prefix: String(r.key_prefix),
+          key_hash: String(r.key_hash),
+          last_used_at:
+            r.last_used_at === null || r.last_used_at === undefined
+              ? null
+              : Number(r.last_used_at),
+          revoked_at:
+            r.revoked_at === null || r.revoked_at === undefined
+              ? null
+              : Number(r.revoked_at),
+          expires_at:
+            r.expires_at === null || r.expires_at === undefined
+              ? null
+              : Number(r.expires_at),
+          created_at: Number(r.created_at),
+        }))
+      : [];
+
+    nodes = includeNodes
+      ? (
+          db
+            .prepare(
+              `SELECT id, name, mode, endpoint, token_hash, encrypted_token, tls_fingerprint,
+                      prev_token_hash, prev_token_expires_at, last_seen_at, last_rotated_at,
+                      status, created_at
+               FROM nodes
                ORDER BY created_at ASC`,
             )
             .all() as Array<Record<string, unknown>>
         ).map((r) => {
-          const blob = r.encrypted_secret as Uint8Array | Buffer;
-          const plaintextSecret = decryptSecret(blob, masterKey);
+          let rawToken: string | null = null;
+          if (r.encrypted_token instanceof Uint8Array || Buffer.isBuffer(r.encrypted_token)) {
+            rawToken = decryptSecret(r.encrypted_token, masterKey);
+          }
           return {
             id: String(r.id),
-            provider_id: String(r.provider_id),
-            label: String(r.label),
-            secret: plaintextSecret,
-            last4: String(r.last4),
-            node_id:
-              includeNodes && r.node_id !== null && r.node_id !== undefined
-                ? String(r.node_id)
-                : null,
-            forced_node: Number(r.forced_node) === 1 ? 1 : 0,
-            daily_quota_limit:
-              r.daily_quota_limit === null || r.daily_quota_limit === undefined
+            name: String(r.name),
+            mode: r.mode === 'public_ip' ? 'public_ip' : 'tailscale',
+            endpoint: String(r.endpoint),
+            token_hash: String(r.token_hash),
+            raw_token: rawToken,
+            tls_fingerprint:
+              r.tls_fingerprint === null || r.tls_fingerprint === undefined
                 ? null
-                : Number(r.daily_quota_limit),
-            ratelimit_remaining:
-              r.ratelimit_remaining === null || r.ratelimit_remaining === undefined
+                : String(r.tls_fingerprint),
+            prev_token_hash:
+              r.prev_token_hash === null || r.prev_token_hash === undefined
                 ? null
-                : Number(r.ratelimit_remaining),
-            ratelimit_reset_at:
-              r.ratelimit_reset_at === null || r.ratelimit_reset_at === undefined
+                : String(r.prev_token_hash),
+            prev_token_expires_at:
+              r.prev_token_expires_at === null || r.prev_token_expires_at === undefined
                 ? null
-                : Number(r.ratelimit_reset_at),
+                : Number(r.prev_token_expires_at),
+            last_seen_at:
+              r.last_seen_at === null || r.last_seen_at === undefined
+                ? null
+                : Number(r.last_seen_at),
+            last_rotated_at: Number(r.last_rotated_at),
             status:
-              r.status === 'rate_limited' || r.status === 'error' || r.status === 'no_node'
-                ? r.status
-                : 'active',
-            last_error:
-              r.last_error === null || r.last_error === undefined
-                ? null
-                : String(r.last_error),
+              r.status === 'online' || r.status === 'unresponsive' ? r.status : 'offline',
             created_at: Number(r.created_at),
           };
         })
       : [];
 
-  const models: BackupModelRecord[] = includeProvidersAndConfig
-    ? (
-        db
-          .prepare(
-            `SELECT full_id, provider_id, model_id, canonical_model_id, name,
-                    context_length, max_output, modalities_json, capabilities_json,
-                    is_free, first_seen_at, upstream_created_at, active
-             FROM models
-             ORDER BY full_id ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        full_id: String(r.full_id),
-        provider_id: String(r.provider_id),
-        model_id: String(r.model_id),
-        canonical_model_id:
-          r.canonical_model_id === null || r.canonical_model_id === undefined
-            ? null
-            : String(r.canonical_model_id),
-        name: String(r.name),
-        context_length:
-          r.context_length === null || r.context_length === undefined
-            ? null
-            : Number(r.context_length),
-        max_output:
-          r.max_output === null || r.max_output === undefined ? null : Number(r.max_output),
-        modalities_json: String(r.modalities_json),
-        capabilities_json: String(r.capabilities_json),
-        is_free: Number(r.is_free) === 1 ? 1 : 0,
-        first_seen_at: Number(r.first_seen_at),
-        upstream_created_at:
-          r.upstream_created_at === null || r.upstream_created_at === undefined
-            ? null
-            : Number(r.upstream_created_at),
-        active: Number(r.active) === 1 ? 1 : 0,
-      }))
-    : [];
+    providers = includeProvidersAndConfig
+      ? (
+          db
+            .prepare(
+              `SELECT id, name, package_type, models_source, schema_json, adapter_url,
+                      source_id, manifest_hash, enabled, last_models_sync_at, created_at
+               FROM providers
+               ORDER BY created_at ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          id: String(r.id),
+          name: String(r.name),
+          package_type:
+            r.package_type === 'experimental-adapter'
+              ? 'experimental-adapter'
+              : 'official-json',
+          models_source: r.models_source === 'static' ? 'static' : 'api',
+          schema_json: String(r.schema_json),
+          adapter_url:
+            r.adapter_url === null || r.adapter_url === undefined
+              ? null
+              : String(r.adapter_url),
+          source_id:
+            r.source_id === null || r.source_id === undefined
+              ? null
+              : String(r.source_id),
+          manifest_hash:
+            r.manifest_hash === null || r.manifest_hash === undefined
+              ? null
+              : String(r.manifest_hash),
+          enabled: Number(r.enabled) === 1 ? 1 : 0,
+          last_models_sync_at:
+            r.last_models_sync_at === null || r.last_models_sync_at === undefined
+              ? null
+              : Number(r.last_models_sync_at),
+          created_at: Number(r.created_at),
+        }))
+      : [];
 
-  const usageLogs: BackupUsageLogRecord[] = exportUsage
-    ? (
-        db
-          .prepare(
-            `SELECT id, user_id, provider_id, provider_key_id, model_full_id,
-                    prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
-                    ttft_ms, duration_ms, tokens_per_sec, status, error_type, created_at
-             FROM usage_logs
-             ORDER BY id ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        id: Number(r.id),
-        user_id: String(r.user_id),
-        provider_id: String(r.provider_id),
-        provider_key_id:
-          r.provider_key_id === null || r.provider_key_id === undefined
-            ? null
-            : String(r.provider_key_id),
-        model_full_id: String(r.model_full_id),
-        prompt_tokens: Number(r.prompt_tokens),
-        completion_tokens: Number(r.completion_tokens),
-        reasoning_tokens: Number(r.reasoning_tokens),
-        cached_tokens: Number(r.cached_tokens),
-        ttft_ms: r.ttft_ms === null || r.ttft_ms === undefined ? null : Number(r.ttft_ms),
-        duration_ms: Number(r.duration_ms),
-        tokens_per_sec:
-          r.tokens_per_sec === null || r.tokens_per_sec === undefined
-            ? null
-            : Number(r.tokens_per_sec),
-        status: r.status === 'error' || r.status === 'resumed' ? r.status : 'ok',
-        error_type:
-          r.error_type === null || r.error_type === undefined ? null : String(r.error_type),
-        created_at: Number(r.created_at),
-      }))
-    : [];
+    providerKeys =
+      includeProvidersAndConfig && includeProviderKeys
+        ? (
+            db
+              .prepare(
+                `SELECT id, provider_id, label, encrypted_secret, last4, node_id, forced_node,
+                        daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
+                        status, last_error, created_at
+                 FROM provider_keys
+                 ORDER BY created_at ASC`,
+              )
+              .all() as Array<Record<string, unknown>>
+          ).map((r) => {
+            const blob = r.encrypted_secret as Uint8Array | Buffer;
+            const plaintextSecret = decryptSecret(blob, masterKey);
+            const hadAssignedNode = r.node_id !== null && r.node_id !== undefined;
+            const rawStatus: BackupProviderKeyRecord['status'] =
+              r.status === 'rate_limited' ||
+              r.status === 'error' ||
+              r.status === 'no_node' ||
+              r.status === 'disabled'
+                ? r.status
+                : 'active';
+            // Anti-Core-IP-leak: if nodes are excluded and key had an assigned node,
+            // force node_id=null and status='no_node' (never 'active') so restore cannot bypass exit node!
+            const strippedNodeDueToExportOption = !includeNodes && hadAssignedNode;
+            return {
+              id: String(r.id),
+              provider_id: String(r.provider_id),
+              label: String(r.label),
+              secret: plaintextSecret,
+              last4: String(r.last4),
+              node_id: includeNodes && hadAssignedNode ? String(r.node_id) : null,
+              forced_node: Number(r.forced_node) === 1 ? 1 : 0,
+              daily_quota_limit:
+                r.daily_quota_limit === null || r.daily_quota_limit === undefined
+                  ? null
+                  : Number(r.daily_quota_limit),
+              ratelimit_remaining:
+                r.ratelimit_remaining === null || r.ratelimit_remaining === undefined
+                  ? null
+                  : Number(r.ratelimit_remaining),
+              ratelimit_reset_at:
+                r.ratelimit_reset_at === null || r.ratelimit_reset_at === undefined
+                  ? null
+                  : Number(r.ratelimit_reset_at),
+              status: strippedNodeDueToExportOption ? 'no_node' : rawStatus,
+              last_error: strippedNodeDueToExportOption
+                ? 'Assigned exit node was excluded from backup; assign an exit node before re-enabling.'
+                : r.last_error === null || r.last_error === undefined
+                  ? null
+                  : String(r.last_error),
+              created_at: Number(r.created_at),
+            };
+          })
+        : [];
 
-  const systemLogs: BackupSystemLogRecord[] = exportSysLogs
-    ? (
-        db
-          .prepare(
-            `SELECT id, level, category, message, meta_json, created_at
-             FROM system_logs
-             ORDER BY id ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        id: Number(r.id),
-        level: r.level === 'warn' || r.level === 'error' ? r.level : 'info',
-        category: (
-          ['failover', 'stream_resume', 'node', 'sync', 'auth', 'backup', 'system'] as const
-        ).includes(r.category as BackupSystemLogRecord['category'])
-          ? (r.category as BackupSystemLogRecord['category'])
-          : 'system',
-        message: String(r.message),
-        meta_json:
-          r.meta_json === null || r.meta_json === undefined ? null : String(r.meta_json),
-        created_at: Number(r.created_at),
-      }))
-    : [];
+    models = includeProvidersAndConfig
+      ? (
+          db
+            .prepare(
+              `SELECT full_id, provider_id, model_id, canonical_model_id, name,
+                      context_length, max_output, modalities_json, capabilities_json,
+                      is_free, first_seen_at, upstream_created_at, active, disabled_by_admin
+               FROM models
+               ORDER BY full_id ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          full_id: String(r.full_id),
+          provider_id: String(r.provider_id),
+          model_id: String(r.model_id),
+          canonical_model_id:
+            r.canonical_model_id === null || r.canonical_model_id === undefined
+              ? null
+              : String(r.canonical_model_id),
+          name: String(r.name),
+          context_length:
+            r.context_length === null || r.context_length === undefined
+              ? null
+              : Number(r.context_length),
+          max_output:
+            r.max_output === null || r.max_output === undefined ? null : Number(r.max_output),
+          modalities_json: String(r.modalities_json),
+          capabilities_json: String(r.capabilities_json),
+          is_free: Number(r.is_free) === 1 ? 1 : 0,
+          first_seen_at: Number(r.first_seen_at),
+          upstream_created_at:
+            r.upstream_created_at === null || r.upstream_created_at === undefined
+              ? null
+              : Number(r.upstream_created_at),
+          active: Number(r.active) === 1 ? 1 : 0,
+          disabled_by_admin: Number(r.disabled_by_admin ?? 0) === 1 ? 1 : 0,
+        }))
+      : [];
 
-  const externalCache: BackupExternalCacheRecord[] = includeCache
-    ? (
-        db
-          .prepare(
-            `SELECT cache_key, payload_json, etag, fetched_at
-             FROM external_cache
-             ORDER BY cache_key ASC`,
-          )
-          .all() as Array<Record<string, unknown>>
-      ).map((r) => ({
-        cache_key: String(r.cache_key),
-        payload_json: String(r.payload_json),
-        etag: r.etag === null || r.etag === undefined ? null : String(r.etag),
-        fetched_at: Number(r.fetched_at),
-      }))
-    : [];
+    usageLogs = exportUsage
+      ? (
+          db
+            .prepare(
+              `SELECT id, user_id, provider_id, provider_key_id, internal_api_key_id, model_full_id,
+                      prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
+                      ttft_ms, duration_ms, tokens_per_sec, status, error_type, created_at
+               FROM usage_logs
+               ORDER BY id ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          id: Number(r.id),
+          user_id: String(r.user_id),
+          provider_id: String(r.provider_id),
+          provider_key_id:
+            r.provider_key_id === null || r.provider_key_id === undefined
+              ? null
+              : String(r.provider_key_id),
+          internal_api_key_id:
+            r.internal_api_key_id === null || r.internal_api_key_id === undefined
+              ? null
+              : String(r.internal_api_key_id),
+          model_full_id: String(r.model_full_id),
+          prompt_tokens: Number(r.prompt_tokens),
+          completion_tokens: Number(r.completion_tokens),
+          reasoning_tokens: Number(r.reasoning_tokens),
+          cached_tokens: Number(r.cached_tokens),
+          ttft_ms: r.ttft_ms === null || r.ttft_ms === undefined ? null : Number(r.ttft_ms),
+          duration_ms: Number(r.duration_ms),
+          tokens_per_sec:
+            r.tokens_per_sec === null || r.tokens_per_sec === undefined
+              ? null
+              : Number(r.tokens_per_sec),
+          status: r.status === 'error' || r.status === 'resumed' ? r.status : 'ok',
+          error_type:
+            r.error_type === null || r.error_type === undefined ? null : String(r.error_type),
+          created_at: Number(r.created_at),
+        }))
+      : [];
+
+    systemLogs = exportSysLogs
+      ? (
+          db
+            .prepare(
+              `SELECT id, level, category, message, meta_json, created_at
+               FROM system_logs
+               ORDER BY id ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          id: Number(r.id),
+          level: r.level === 'warn' || r.level === 'error' ? r.level : 'info',
+          category: (
+            ['failover', 'stream_resume', 'node', 'sync', 'auth', 'backup', 'system'] as const
+          ).includes(r.category as BackupSystemLogRecord['category'])
+            ? (r.category as BackupSystemLogRecord['category'])
+            : 'system',
+          message: String(r.message),
+          meta_json:
+            r.meta_json === null || r.meta_json === undefined ? null : String(r.meta_json),
+          created_at: Number(r.created_at),
+        }))
+      : [];
+
+    externalCache = includeCache
+      ? (
+          db
+            .prepare(
+              `SELECT cache_key, payload_json, etag, fetched_at
+               FROM external_cache
+               ORDER BY cache_key ASC`,
+            )
+            .all() as Array<Record<string, unknown>>
+        ).map((r) => ({
+          cache_key: String(r.cache_key),
+          payload_json: String(r.payload_json),
+          etag: r.etag === null || r.etag === undefined ? null : String(r.etag),
+          fetched_at: Number(r.fetched_at),
+        }))
+      : [];
+
+    db.exec('COMMIT');
+    readTxOpen = false;
+  } finally {
+    if (readTxOpen) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // Ignore rollback errors on failed read snapshot
+      }
+    }
+  }
 
   const payload: ValidatedBackupPayload = {
     format: 'BIFROST1',
@@ -1436,6 +1642,7 @@ export async function importEncryptedBackup(
     password,
     schemasDir,
     actingUserId,
+    actingSessionId,
     maxUncompressedBytes = DEFAULT_MAX_UNCOMPRESSED_BACKUP_BYTES,
     nowSec = Math.floor(Date.now() / 1000),
   } = options;
@@ -1481,7 +1688,15 @@ export async function importEncryptedBackup(
 
   db.exec('BEGIN IMMEDIATE');
   try {
-    // 1. Users (4-step FK-safe swap on username collision so sessions, usage_logs & invitations never break)
+    // Snapshot acting user's pre-import role & password_hash for post-import session hygiene
+    const actingUserBefore = actingUserId
+      ? (db
+          .prepare(`SELECT id, role, password_hash FROM users WHERE id = ?`)
+          .get(actingUserId) as { id: string; role: string; password_hash: string } | undefined)
+      : undefined;
+
+    // 1. Users (FK-safe swap on username collision; NEVER reassign sessions across accounts
+    //    and protect actingUserId's playground_chats from accidental CASCADE deletion)
     const upsertUserStmt = db.prepare(
       `INSERT INTO users (id, username, password_hash, role, daily_token_limit, quota_reset_mode, enforce_strict_quota, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1497,8 +1712,8 @@ export async function importEncryptedBackup(
 
     for (const u of payload.users) {
       const colliding = db
-        .prepare(`SELECT id FROM users WHERE username = ? AND id != ?`)
-        .get(u.username, u.id) as { id: string } | undefined;
+        .prepare(`SELECT id, role FROM users WHERE username = ? AND id != ?`)
+        .get(u.username, u.id) as { id: string; role: string } | undefined;
 
       if (colliding) {
         db.prepare(`UPDATE users SET username = ? WHERE id = ?`).run(
@@ -1527,11 +1742,50 @@ export async function importEncryptedBackup(
           u.id,
           colliding.id,
         );
-        db.prepare(`UPDATE sessions SET user_id = ? WHERE user_id = ?`).run(
+        db.prepare(`UPDATE invitations SET used_by_user_id = ? WHERE used_by_user_id = ?`).run(
           u.id,
           colliding.id,
         );
+        // NEVER reassign sessions of a displaced user to an imported user (prevents privilege hijack)
+        db.prepare(`DELETE FROM sessions WHERE user_id = ?`).run(colliding.id);
+        // Avoid accidentally cascade-deleting the acting admin's playground_chats when replacing own admin account
+        if (actingUserId && colliding.id === actingUserId && u.role === 'admin') {
+          db.prepare(`UPDATE playground_chats SET user_id = ? WHERE user_id = ?`).run(
+            u.id,
+            colliding.id,
+          );
+          db.prepare(`UPDATE playground_messages SET user_id = ? WHERE user_id = ?`).run(
+            u.id,
+            colliding.id,
+          );
+        }
         db.prepare(`DELETE FROM users WHERE id = ?`).run(colliding.id);
+      }
+    }
+
+    // Revoke affected sessions after importing users (keep only current actingSessionId
+    // if actingUserId is still an unchanged admin with the same id, role, and password_hash)
+    if (payload.users.length > 0) {
+      const actingUserAfter = actingUserId
+        ? (db
+            .prepare(`SELECT id, role, password_hash FROM users WHERE id = ?`)
+            .get(actingUserId) as { id: string; role: string; password_hash: string } | undefined)
+        : undefined;
+      const actingAdminUnchanged = Boolean(
+        actingUserBefore &&
+          actingUserAfter &&
+          actingUserAfter.id === actingUserBefore.id &&
+          actingUserAfter.role === 'admin' &&
+          actingUserAfter.role === actingUserBefore.role &&
+          actingUserAfter.password_hash === actingUserBefore.password_hash,
+      );
+
+      if (actingAdminUnchanged && actingSessionId) {
+        db.prepare(`DELETE FROM sessions WHERE id != ?`).run(actingSessionId);
+      } else if (actingAdminUnchanged && actingUserId) {
+        db.prepare(`DELETE FROM sessions WHERE user_id != ?`).run(actingUserId);
+      } else {
+        db.prepare(`DELETE FROM sessions`).run();
       }
     }
 
@@ -1594,14 +1848,16 @@ export async function importEncryptedBackup(
     const upsertProviderStmt = db.prepare(
       `INSERT INTO providers (
          id, name, package_type, models_source, schema_json, adapter_url,
-         enabled, last_models_sync_at, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         source_id, manifest_hash, enabled, last_models_sync_at, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          name = excluded.name,
          package_type = excluded.package_type,
          models_source = excluded.models_source,
          schema_json = excluded.schema_json,
          adapter_url = excluded.adapter_url,
+         source_id = excluded.source_id,
+         manifest_hash = excluded.manifest_hash,
          enabled = excluded.enabled,
          last_models_sync_at = excluded.last_models_sync_at,
          created_at = excluded.created_at`,
@@ -1615,6 +1871,8 @@ export async function importEncryptedBackup(
         prov.models_source,
         prov.schema_json,
         prov.adapter_url,
+        prov.source_id ?? null,
+        prov.manifest_hash ?? null,
         prov.enabled,
         prov.last_models_sync_at,
         prov.created_at,
@@ -1687,8 +1945,8 @@ export async function importEncryptedBackup(
       `INSERT INTO models (
          full_id, provider_id, model_id, canonical_model_id, name,
          context_length, max_output, modalities_json, capabilities_json,
-         is_free, first_seen_at, upstream_created_at, active
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         is_free, first_seen_at, upstream_created_at, active, disabled_by_admin
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(full_id) DO UPDATE SET
          provider_id = excluded.provider_id,
          model_id = excluded.model_id,
@@ -1701,7 +1959,8 @@ export async function importEncryptedBackup(
          is_free = excluded.is_free,
          first_seen_at = excluded.first_seen_at,
          upstream_created_at = excluded.upstream_created_at,
-         active = excluded.active`,
+         active = excluded.active,
+         disabled_by_admin = excluded.disabled_by_admin`,
     );
 
     let restoredModelsCount = 0;
@@ -1725,6 +1984,7 @@ export async function importEncryptedBackup(
         m.first_seen_at,
         m.upstream_created_at,
         m.active,
+        m.disabled_by_admin === 1 ? 1 : 0,
       );
       restoredModelsCount += 1;
     }
@@ -1746,8 +2006,8 @@ export async function importEncryptedBackup(
     // 7. Internal API Keys (`sk-bf-...` hashes)
     const upsertInternalKeyStmt = db.prepare(
       `INSERT INTO internal_api_keys (
-         id, user_id, name, key_prefix, key_hash, last_used_at, revoked_at, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         id, user_id, name, key_prefix, key_hash, last_used_at, revoked_at, expires_at, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          user_id = excluded.user_id,
          name = excluded.name,
@@ -1755,6 +2015,7 @@ export async function importEncryptedBackup(
          key_hash = excluded.key_hash,
          last_used_at = excluded.last_used_at,
          revoked_at = excluded.revoked_at,
+         expires_at = excluded.expires_at,
          created_at = excluded.created_at`,
     );
     let restoredInternalKeysCount = 0;
@@ -1772,6 +2033,7 @@ export async function importEncryptedBackup(
         ik.key_hash,
         ik.last_used_at,
         ik.revoked_at,
+        ik.expires_at ?? null,
         ik.created_at,
       );
       restoredInternalKeysCount += 1;
@@ -1781,8 +2043,8 @@ export async function importEncryptedBackup(
     const upsertInviteStmt = db.prepare(
       `INSERT INTO invitations (
          id, token_hash, daily_token_limit, quota_reset_mode, enforce_strict_quota, allowed_models_json,
-         expires_at, used_at, created_by, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         expires_at, used_at, used_by_user_id, used_by_username, created_by, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          token_hash = excluded.token_hash,
          daily_token_limit = excluded.daily_token_limit,
@@ -1791,6 +2053,8 @@ export async function importEncryptedBackup(
          allowed_models_json = excluded.allowed_models_json,
          expires_at = excluded.expires_at,
          used_at = excluded.used_at,
+         used_by_user_id = excluded.used_by_user_id,
+         used_by_username = excluded.used_by_username,
          created_by = excluded.created_by,
          created_at = excluded.created_at`,
     );
@@ -1800,6 +2064,10 @@ export async function importEncryptedBackup(
         ? inv.created_by
         : fallbackUserId;
       if (!creatorId) continue;
+      const usedByUserId =
+        inv.used_by_user_id && existingUserIds.has(inv.used_by_user_id)
+          ? inv.used_by_user_id
+          : null;
       db.prepare(`DELETE FROM invitations WHERE token_hash = ? AND id != ?`).run(
         inv.token_hash,
         inv.id,
@@ -1813,34 +2081,37 @@ export async function importEncryptedBackup(
         inv.allowed_models_json,
         inv.expires_at,
         inv.used_at,
+        usedByUserId,
+        inv.used_by_username ?? null,
         creatorId,
         inv.created_at,
       );
       restoredInvitationsCount += 1;
     }
 
-    // 9. Usage Logs, System Logs, and External Cache (when present)
-    const upsertUsageLogStmt = db.prepare(
+    // 9. Usage Logs, System Logs, and External Cache (avoiding blind AUTOINCREMENT ID overwrites!)
+    const findDupUsageStmt = db.prepare(
+      `SELECT 1 FROM usage_logs
+       WHERE user_id = ? AND provider_id = ? AND model_full_id = ?
+         AND COALESCE(internal_api_key_id, '') = COALESCE(?, '')
+         AND created_at = ? AND duration_ms = ?
+         AND prompt_tokens = ? AND completion_tokens = ? AND status = ?
+       LIMIT 1`,
+    );
+    const hasUsageIdStmt = db.prepare(`SELECT 1 FROM usage_logs WHERE id = ? LIMIT 1`);
+    const insertUsageWithIdStmt = db.prepare(
       `INSERT INTO usage_logs (
-         id, user_id, provider_id, provider_key_id, model_full_id,
+         id, user_id, provider_id, provider_key_id, internal_api_key_id, model_full_id,
          prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
          ttft_ms, duration_ms, tokens_per_sec, status, error_type, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         user_id = excluded.user_id,
-         provider_id = excluded.provider_id,
-         provider_key_id = excluded.provider_key_id,
-         model_full_id = excluded.model_full_id,
-         prompt_tokens = excluded.prompt_tokens,
-         completion_tokens = excluded.completion_tokens,
-         reasoning_tokens = excluded.reasoning_tokens,
-         cached_tokens = excluded.cached_tokens,
-         ttft_ms = excluded.ttft_ms,
-         duration_ms = excluded.duration_ms,
-         tokens_per_sec = excluded.tokens_per_sec,
-         status = excluded.status,
-         error_type = excluded.error_type,
-         created_at = excluded.created_at`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const insertUsageAutoIdStmt = db.prepare(
+      `INSERT INTO usage_logs (
+         user_id, provider_id, provider_key_id, internal_api_key_id, model_full_id,
+         prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
+         ttft_ms, duration_ms, tokens_per_sec, status, error_type, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     let restoredUsageLogsCount = 0;
     for (const ul of payload.usageLogs) {
@@ -1848,45 +2119,110 @@ export async function importEncryptedBackup(
         ? ul.user_id
         : fallbackUserId;
       if (!resolvedUserId) continue;
-      upsertUsageLogStmt.run(
-        ul.id,
+      const internalKeyId = ul.internal_api_key_id ?? null;
+      const alreadyExists = findDupUsageStmt.get(
         resolvedUserId,
         ul.provider_id,
-        ul.provider_key_id,
         ul.model_full_id,
+        internalKeyId,
+        ul.created_at,
+        ul.duration_ms,
         ul.prompt_tokens,
         ul.completion_tokens,
-        ul.reasoning_tokens,
-        ul.cached_tokens,
-        ul.ttft_ms,
-        ul.duration_ms,
-        ul.tokens_per_sec,
         ul.status,
-        ul.error_type,
-        ul.created_at,
       );
+      if (alreadyExists) {
+        continue;
+      }
+      const idTaken = hasUsageIdStmt.get(ul.id);
+      if (idTaken) {
+        insertUsageAutoIdStmt.run(
+          resolvedUserId,
+          ul.provider_id,
+          ul.provider_key_id,
+          internalKeyId,
+          ul.model_full_id,
+          ul.prompt_tokens,
+          ul.completion_tokens,
+          ul.reasoning_tokens,
+          ul.cached_tokens,
+          ul.ttft_ms,
+          ul.duration_ms,
+          ul.tokens_per_sec,
+          ul.status,
+          ul.error_type,
+          ul.created_at,
+        );
+      } else {
+        insertUsageWithIdStmt.run(
+          ul.id,
+          resolvedUserId,
+          ul.provider_id,
+          ul.provider_key_id,
+          internalKeyId,
+          ul.model_full_id,
+          ul.prompt_tokens,
+          ul.completion_tokens,
+          ul.reasoning_tokens,
+          ul.cached_tokens,
+          ul.ttft_ms,
+          ul.duration_ms,
+          ul.tokens_per_sec,
+          ul.status,
+          ul.error_type,
+          ul.created_at,
+        );
+      }
       restoredUsageLogsCount += 1;
     }
 
-    const upsertSystemLogStmt = db.prepare(
-      `INSERT INTO system_logs (id, level, category, message, meta_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         level = excluded.level,
-         category = excluded.category,
-         message = excluded.message,
-         meta_json = excluded.meta_json,
-         created_at = excluded.created_at`,
+    const findDupSysLogStmt = db.prepare(
+      `SELECT 1 FROM system_logs
+       WHERE level = ? AND category = ? AND message = ?
+         AND COALESCE(meta_json, '') = COALESCE(?, '') AND created_at = ?
+       LIMIT 1`,
     );
+    const hasSysLogIdStmt = db.prepare(`SELECT 1 FROM system_logs WHERE id = ? LIMIT 1`);
+    const insertSysLogWithIdStmt = db.prepare(
+      `INSERT INTO system_logs (id, level, category, message, meta_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const insertSysLogAutoIdStmt = db.prepare(
+      `INSERT INTO system_logs (level, category, message, meta_json, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    let restoredSystemLogsCount = 0;
     for (const sl of payload.systemLogs) {
-      upsertSystemLogStmt.run(
-        sl.id,
+      const alreadyExists = findDupSysLogStmt.get(
         sl.level,
         sl.category,
         sl.message,
         sl.meta_json,
         sl.created_at,
       );
+      if (alreadyExists) {
+        continue;
+      }
+      const idTaken = hasSysLogIdStmt.get(sl.id);
+      if (idTaken) {
+        insertSysLogAutoIdStmt.run(
+          sl.level,
+          sl.category,
+          sl.message,
+          sl.meta_json,
+          sl.created_at,
+        );
+      } else {
+        insertSysLogWithIdStmt.run(
+          sl.id,
+          sl.level,
+          sl.category,
+          sl.message,
+          sl.meta_json,
+          sl.created_at,
+        );
+      }
+      restoredSystemLogsCount += 1;
     }
 
     const upsertCacheStmt = db.prepare(
@@ -1901,6 +2237,17 @@ export async function importEncryptedBackup(
       upsertCacheStmt.run(ec.cache_key, ec.payload_json, ec.etag, ec.fetched_at);
     }
 
+    // Security invariant: ensure at least 1 administrator account remains before COMMIT
+    // so an imported backup can NEVER reopen unauthenticated /api/setup!
+    const remainingAdminsRow = db
+      .prepare(`SELECT COUNT(*) AS cnt FROM users WHERE role = 'admin'`)
+      .get() as { cnt: number | bigint };
+    if (Number(remainingAdminsRow?.cnt ?? 0) < 1) {
+      throw new BackupValidationError(
+        'Invalid BIFROST1 payload: backup import would leave zero administrator accounts.',
+      );
+    }
+
     const restored: BackupRestoredCounts = {
       users: payload.users.length,
       invitations: restoredInvitationsCount,
@@ -1911,7 +2258,7 @@ export async function importEncryptedBackup(
       providerKeys: restoredProviderKeysCount,
       models: restoredModelsCount,
       usageLogs: restoredUsageLogsCount,
-      systemLogs: payload.systemLogs.length,
+      systemLogs: restoredSystemLogsCount,
       externalCache: payload.externalCache.length,
     };
 

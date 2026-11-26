@@ -19,9 +19,12 @@ const app = createApp({
   panelDistDir: process.env.PANEL_DIST_DIR,
 });
 
+let shuttingDown = false;
+const shutdownAbortController = new AbortController();
+
 let healthTickRunning = false;
 const triggerNodesHealthTick = () => {
-  if (healthTickRunning) return;
+  if (shuttingDown || shutdownAbortController.signal.aborted || healthTickRunning) return;
   healthTickRunning = true;
   void runNodesHealthTick(db, resolved.key)
     .catch(() => {
@@ -40,7 +43,7 @@ nodesHeartbeatInterval.unref();
 // HU-16: Automatic 6-hour free-model catalog sync for enabled API providers
 let modelsSyncTickRunning = false;
 const triggerModelsAutoSyncTick = () => {
-  if (modelsSyncTickRunning) return;
+  if (shuttingDown || shutdownAbortController.signal.aborted || modelsSyncTickRunning) return;
   modelsSyncTickRunning = true;
   void runModelsAutoSyncTick(db, resolved.key)
     .catch(() => {
@@ -54,6 +57,23 @@ const triggerModelsAutoSyncTick = () => {
 const modelsAutoSyncInterval = setInterval(triggerModelsAutoSyncTick, AUTO_SYNC_INTERVAL_MS);
 modelsAutoSyncInterval.unref();
 
+// STB-07: Periodic maintenance (expired sessions cleanup + passive WAL checkpoint ONLY;
+// historical usage_logs and system_logs are NEVER automatically deleted).
+const MAINTENANCE_INTERVAL_MS = 15 * 60 * 1000;
+const triggerSqliteMaintenanceTick = () => {
+  if (shuttingDown || shutdownAbortController.signal.aborted) return;
+  try {
+    const nowSec = Math.floor(Date.now() / 1000);
+    db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(nowSec);
+    db.exec('PRAGMA wal_checkpoint(PASSIVE);');
+  } catch {
+    // Non-fatal periodic maintenance error
+  }
+};
+
+const maintenanceInterval = setInterval(triggerSqliteMaintenanceTick, MAINTENANCE_INTERVAL_MS);
+maintenanceInterval.unref();
+
 const server = startBifrostHttpServer(app, {
   port,
   onListening: (info) => {
@@ -61,18 +81,68 @@ const server = startBifrostHttpServer(app, {
   },
 });
 
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 10_000;
+let dbClosed = false;
+
+function closeDatabaseOnce(): void {
+  if (dbClosed) return;
+  dbClosed = true;
+  try {
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+  } catch {
+    // Best-effort WAL truncate before closing
+  }
+  try {
+    db.close();
+  } catch {
+    // Ignore close errors during shutdown
+  }
+}
+
 function shutdown(signal: string): void {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
   process.stdout.write(`[Bifrost] Received ${signal}, shutting down...\n`);
+
+  shutdownAbortController.abort();
   clearInterval(nodesHeartbeatInterval);
   clearInterval(modelsAutoSyncInterval);
-  server.close(() => {
-    try {
-      db.close();
-    } catch {
-      // Ignore close errors during shutdown
-    }
+  clearInterval(maintenanceInterval);
+
+  let exited = false;
+  const finalizeExit = () => {
+    if (exited) return;
+    exited = true;
+    clearTimeout(forceCloseTimer);
+    closeDatabaseOnce();
     process.exit(0);
+  };
+
+  const forceCloseTimer = setTimeout(() => {
+    try {
+      if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
+    } catch {
+      // Ignore connection termination errors
+    }
+    finalizeExit();
+  }, SHUTDOWN_DRAIN_TIMEOUT_MS);
+  forceCloseTimer.unref();
+
+  server.close(() => {
+    finalizeExit();
   });
+
+  try {
+    if ('closeIdleConnections' in server && typeof server.closeIdleConnections === 'function') {
+      server.closeIdleConnections();
+    }
+  } catch {
+    // Ignore idle connection cleanup errors
+  }
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
