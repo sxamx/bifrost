@@ -52,6 +52,7 @@ jobs:
             { regex: /\.db(?:-(?:wal|shm|journal))?$/i, reason: 'base de datos SQLite (.db)' },
             { regex: /\.sqlite(?:-(?:wal|shm))?$/i, reason: 'base de datos SQLite (.sqlite)' },
             { regex: /\.enc$/i, reason: 'archivo cifrado o respaldo (.enc)' },
+            { regex: /\.pem$/i, reason: 'certificado o clave privada PEM (.pem)' },
             {
               regex: /(?:^|\/)\.env(?:\..+)?$/i,
               allow: /(?:^|\/)\.env\.example$/i,
@@ -129,6 +130,30 @@ jobs:
               regex: /\bsk-bf-[A-Za-z0-9_-]{40,}\b/,
               reason: 'llave interna sk-bf- en texto plano',
             },
+            {
+              regex: /\bsk-proj-[A-Za-z0-9_-]{20,}\b/,
+              reason: 'clave API OpenAI sk-proj- en texto plano',
+            },
+            {
+              regex: /\bgsk_[A-Za-z0-9_-]{20,}\b/,
+              reason: 'clave API Groq gsk_ en texto plano',
+            },
+            {
+              regex: /\bnvapi-[A-Za-z0-9_-]{20,}\b/,
+              reason: 'clave API NVIDIA NIM nvapi- en texto plano',
+            },
+            {
+              regex: /\bAIza[0-9A-Za-z_-]{20,}\b/,
+              reason: 'clave API Google AIza en texto plano',
+            },
+            {
+              regex: /\bbfnode_[A-Za-z0-9_-]{20,}\b/,
+              reason: 'token de nodo bfnode_ en texto plano',
+            },
+            {
+              regex: /\bAKIA[0-9A-Z]{16}\b/,
+              reason: 'clave de acceso AWS AKIA en texto plano',
+            },
           ];
 
           const UI_FILE_EXT = /\.(?:css|scss|sass|less|html|tsx|ts|jsx|js|mjs)$/i;
@@ -153,7 +178,7 @@ jobs:
           for (const file of trackedFiles) {
             if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) continue;
             const isWorkflowFile = file.startsWith('.github/workflows/');
-            const isTestFile = /(?:^|\/)tests\/|\.test\.[cm]?[jt]sx?$/i.test(file);
+            const isTestFile = /(?:^|\/)(?:tests|__tests__)\/|\.test\.[cm]?[jt]sx?$/i.test(file);
 
             const rawBuffer = fs.readFileSync(file);
             if (rawBuffer.includes(0)) continue;
@@ -194,10 +219,11 @@ jobs:
           );
           EOF
 
-      - name: Validar esquemas JSON y sintaxis Bash
+      - name: Validar esquemas JSON y scripts Bash
         run: |
           node scripts/validate-schemas.mjs
-          bash -n scripts/install.sh && bash -n nodes/install-node.sh
+          bash -n scripts/install.sh && bash -n nodes/install-node.sh && bash -n scripts/docker-entrypoint.sh
+          shellcheck -S warning scripts/install.sh nodes/install-node.sh scripts/docker-entrypoint.sh
 
       - name: Instalar dependencias limpias (panel, core, nodes)
         run: |
@@ -205,8 +231,113 @@ jobs:
           npm --prefix core ci
           npm --prefix nodes ci
 
+      - name: Verificar tipos de pruebas (si existe tsconfig.test.json)
+        run: |
+          if [ -f tsconfig.test.json ]; then
+            npx --prefix core tsc -p tsconfig.test.json
+          fi
+
       - name: Compilar TypeScript y aplicación Vite
         run: npm run build
 
       - name: Ejecutar batería completa de pruebas automatizadas
         run: npm test
+
+  docker-smoke:
+    name: Docker build & runtime smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Construir imagen Docker
+        run: docker build --build-arg BIFROST_BUILD_COMMIT="${{ github.sha }}" -t bifrost:smoke .
+
+      - name: Ejecutar smoke test del contenedor
+        run: |
+          set -euo pipefail
+          CONTAINER="bifrost-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          VOLUME="bifrost-smoke-vol-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+            docker volume rm -f "${VOLUME}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker volume create "${VOLUME}" >/dev/null
+          docker run -d \
+            --name "${CONTAINER}" \
+            -p 127.0.0.1:18080:8080 \
+            -v "${VOLUME}:/data" \
+            bifrost:smoke >/dev/null
+
+          READY=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/api/health >/tmp/health.json 2>/dev/null; then
+              READY=1
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || echo false)" != "true" ]; then
+              echo "El contenedor terminó inesperadamente antes de pasar healthcheck:" >&2
+              docker logs "${CONTAINER}" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "${READY}" -ne 1 ]; then
+            echo "Timeout esperando /api/health en el contenedor:" >&2
+            docker logs "${CONTAINER}" >&2 || true
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("node:fs");
+            const body = JSON.parse(fs.readFileSync("/tmp/health.json", "utf8"));
+            if (body.ok !== true) {
+              console.error("Respuesta inesperada en /api/health:", body);
+              process.exit(1);
+            }
+          '
+          echo "[ok] GET /api/health -> $(cat /tmp/health.json)"
+
+          curl -fsS http://127.0.0.1:18080/install-node.sh >/tmp/install-node.sh
+          grep -q "bifrost-node" /tmp/install-node.sh
+          echo "[ok] GET /install-node.sh"
+
+          curl -fsS http://127.0.0.1:18080/manifest.webmanifest >/tmp/manifest.webmanifest
+          node -e '
+            const fs = require("node:fs");
+            const manifest = JSON.parse(fs.readFileSync("/tmp/manifest.webmanifest", "utf8"));
+            if (!manifest.name) {
+              console.error("manifest.webmanifest sin campo name:", manifest);
+              process.exit(1);
+            }
+          '
+          echo "[ok] GET /manifest.webmanifest"
+
+          KEY_STAT="$(docker exec "${CONTAINER}" stat -c '%a %s' /data/master.key)"
+          if [ "${KEY_STAT}" != "600 32" ]; then
+            echo "Permisos o tamaño inesperados para /data/master.key: ${KEY_STAT} (esperado: 600 32)" >&2
+            exit 1
+          fi
+          echo "[ok] /data/master.key -> mode/size ${KEY_STAT}"
+
+          RUNTIME_ENV="$(docker exec "${CONTAINER}" printenv BIFROST_RUNTIME)"
+          if [ "${RUNTIME_ENV}" != "docker" ]; then
+            echo "BIFROST_RUNTIME inesperado: ${RUNTIME_ENV}" >&2
+            exit 1
+          fi
+          echo "[ok] BIFROST_RUNTIME=${RUNTIME_ENV}"
+
+          docker stop --time 15 "${CONTAINER}" >/dev/null
+          EXIT_CODE="$(docker inspect -f '{{.State.ExitCode}}' "${CONTAINER}")"
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "docker stop terminó con código ${EXIT_CODE} (esperado: 0)" >&2
+            docker logs "${CONTAINER}" >&2 || true
+            exit 1
+          fi
+          echo "[ok] docker stop limpio (exit code 0)"

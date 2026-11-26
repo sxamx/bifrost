@@ -17,6 +17,6 @@
     "start": "npm --prefix core run start",
     "dev:core": "npm --prefix core run dev",
     "dev:panel": "npm --prefix panel run dev",
-    "test": "npm --prefix nodes test && npm --prefix core test"
+    "test": "npm --prefix panel test && npm --prefix nodes test && npm --prefix core test"
   }
 }
