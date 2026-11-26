@@ -47,9 +47,10 @@ describe('Phase 6 Backend — Integrated Playground Chat, SSE Failover, Reasonin
     const tmpDir = makeTempDir();
     let clockMs = Date.UTC(2026, 10, 18, 16, 0, 0);
 
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
 
       const capturedBodies: Array<Record<string, unknown>> = [];
       let dropFirstStream = false;
@@ -399,9 +400,8 @@ describe('Phase 6 Backend — Integrated Playground Chat, SSE Failover, Reasonin
       const guestQuotaBody = (await guestQuotaRes.json()) as { error: string; code: string };
       assert.equal(typeof guestQuotaBody.error, 'string');
       assert.equal(guestQuotaBody.code, 'daily_quota_exceeded');
-
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -410,9 +410,10 @@ describe('Phase 6 Backend — Integrated Playground Chat, SSE Failover, Reasonin
     const tmpDir = makeTempDir();
     const clockMs = Date.UTC(2026, 10, 18, 17, 0, 0);
 
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
 
       let directUpstreamFetchCalls = 0;
       let logoUpstreamCalls = 0;
@@ -549,9 +550,8 @@ describe('Phase 6 Backend — Integrated Playground Chat, SSE Failover, Reasonin
         headers: { Cookie: adminCookie },
       });
       assert.equal(logoUpstreamCalls, 2, 'Admin ?refresh=1 may force upstream fetch');
-
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

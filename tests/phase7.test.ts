@@ -22,9 +22,10 @@ describe('Phase 7 Backend — Community Marketplace, Sidecar Adapters, Multi-Acc
     const tmpDir = makeTempDir();
     const clockMs = Date.UTC(2026, 10, 18, 18, 0, 0);
 
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
 
       let remoteMarketplaceOffline = false;
       const sidecarAuthSeen: string[] = [];
@@ -309,18 +310,18 @@ describe('Phase 7 Backend — Community Marketplace, Sidecar Adapters, Multi-Acc
       assert.ok(offlineBody.providers.some((p) => p.id === 'google-ai-studio'));
       assert.ok(offlineBody.providers.some((p) => p.id === 'groq'));
       assert.ok(offlineBody.providers.some((p) => p.id === 'experimental-sidecar-template'));
-
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 
   it('Red-Team Anti-SSRF: blocks cloud metadata (169.254.169.254, fd00:ec2::254, fe80::, 100.100.100.200), CGNAT, RFC1918, NAT64/6to4/Teredo, userinfo, and non-HTTPS official upstreams', async () => {
     const tmpDir = makeTempDir();
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
       const app = createApp({ db, masterKey });
 
       const setupRes = await app.request('http://localhost/api/setup', {
@@ -421,9 +422,8 @@ describe('Phase 7 Backend — Community Marketplace, Sidecar Adapters, Multi-Acc
         if (prevAllow === undefined) delete process.env.BIFROST_ALLOW_LOCAL_UPSTREAMS;
         else process.env.BIFROST_ALLOW_LOCAL_UPSTREAMS = prevAllow;
       }
-
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
