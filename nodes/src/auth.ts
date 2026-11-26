@@ -12,6 +12,8 @@ export interface TokenVerificationResult {
 
 export interface PersistedTokenState {
   activeTokenHashHex: string;
+  prevTokenHashHex?: string | null;
+  prevTokenExpiresAtMs?: number | null;
   updatedAt: number;
 }
 
@@ -62,9 +64,11 @@ export class TokenAuthenticator {
     this.stateFilePath = options.stateFilePath;
     this.now = options.now ?? (() => Date.now());
 
-    const loadedHash = this.loadStateFile();
-    if (loadedHash) {
-      this.activeTokenHash = loadedHash;
+    const loadedState = this.loadStateFile();
+    if (loadedState) {
+      this.activeTokenHash = loadedState.activeTokenHash;
+      this.prevTokenHash = loadedState.prevTokenHash;
+      this.prevTokenExpiresAtMs = loadedState.prevTokenExpiresAtMs;
     } else if (options.initialToken && options.initialToken.trim().length > 0) {
       this.activeTokenHash = sha256Buffer(options.initialToken.trim());
       this.persistStateFile();
@@ -75,19 +79,39 @@ export class TokenAuthenticator {
     }
   }
 
-  private loadStateFile(): Buffer | null {
+  private loadStateFile(): {
+    activeTokenHash: Buffer;
+    prevTokenHash: Buffer | null;
+    prevTokenExpiresAtMs: number | null;
+  } | null {
     if (!this.stateFilePath || !fs.existsSync(this.stateFilePath)) {
       return null;
     }
     const raw = fs.readFileSync(this.stateFilePath, 'utf8');
     const parsed = JSON.parse(raw) as Partial<PersistedTokenState>;
     if (
-      typeof parsed.activeTokenHashHex === 'string' &&
-      /^[0-9a-f]{64}$/i.test(parsed.activeTokenHashHex)
+      typeof parsed.activeTokenHashHex !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(parsed.activeTokenHashHex)
     ) {
-      return Buffer.from(parsed.activeTokenHashHex, 'hex');
+      throw new Error(`Invalid persisted token hash in ${this.stateFilePath}`);
     }
-    throw new Error(`Invalid persisted token hash in ${this.stateFilePath}`);
+
+    const activeTokenHash = Buffer.from(parsed.activeTokenHashHex, 'hex');
+    let prevTokenHash: Buffer | null = null;
+    let prevTokenExpiresAtMs: number | null = null;
+
+    if (
+      typeof parsed.prevTokenHashHex === 'string' &&
+      /^[0-9a-f]{64}$/i.test(parsed.prevTokenHashHex) &&
+      typeof parsed.prevTokenExpiresAtMs === 'number' &&
+      Number.isFinite(parsed.prevTokenExpiresAtMs) &&
+      this.now() < parsed.prevTokenExpiresAtMs
+    ) {
+      prevTokenHash = Buffer.from(parsed.prevTokenHashHex, 'hex');
+      prevTokenExpiresAtMs = parsed.prevTokenExpiresAtMs;
+    }
+
+    return { activeTokenHash, prevTokenHash, prevTokenExpiresAtMs };
   }
 
   private persistStateFile(): void {
@@ -96,13 +120,44 @@ export class TokenAuthenticator {
     }
     const dir = path.dirname(this.stateFilePath);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const currentMs = this.now();
+    this.pruneExpiredGraceToken(currentMs);
     const payload: PersistedTokenState = {
       activeTokenHashHex: this.activeTokenHash.toString('hex'),
-      updatedAt: Math.floor(this.now() / 1000)
+      prevTokenHashHex: this.prevTokenHash ? this.prevTokenHash.toString('hex') : null,
+      prevTokenExpiresAtMs: this.prevTokenHash ? this.prevTokenExpiresAtMs : null,
+      updatedAt: Math.floor(currentMs / 1000)
     };
-    const tmpPath = `${this.stateFilePath}.tmp.${process.pid}`;
-    fs.writeFileSync(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-    fs.renameSync(tmpPath, this.stateFilePath);
+    const serialized = `${JSON.stringify(payload, null, 2)}\n`;
+    const tmpPath = `${this.stateFilePath}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(tmpPath, 'w', 0o600);
+      fs.writeFileSync(fd, serialized, 'utf8');
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = null;
+      if (process.platform !== 'win32') {
+        fs.chmodSync(tmpPath, 0o600);
+      }
+      fs.renameSync(tmpPath, this.stateFilePath);
+    } catch (err) {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Ignore close error on cleanup
+        }
+      }
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {
+        // Ignore cleanup error
+      }
+      throw err;
+    }
   }
 
   private pruneExpiredGraceToken(currentMs: number): void {

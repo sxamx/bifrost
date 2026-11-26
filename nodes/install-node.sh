@@ -24,9 +24,10 @@ Bifrost Egress Node Installer
 
 Usage:
   bash install-node.sh --token <node_token> [--mode tailscale|public_ip] [--port 9443] [--tls-cert <path> --tls-key <path>]
+  BIFROST_NODE_TOKEN=<node_token> sudo -E bash install-node.sh [--mode tailscale|public_ip] [--port 9443]
 
 Options:
-  --token <token>               Initial 32-byte node token from Bifrost Admin Panel
+  --token <token>               Initial 32-byte node token from Bifrost Admin Panel (or env BIFROST_NODE_TOKEN)
   --mode <tailscale|public_ip>  Listener mode (default: tailscale)
   --port <port>                 Listening port (default: 9443)
   --tls-cert <path>             Custom TLS certificate PEM path (public_ip mode)
@@ -45,6 +46,40 @@ warn() {
 
 err() {
   printf '\033[1;31m[bifrost-node][ERROR]\033[0m %s\n' "$*" >&2
+}
+
+validate_safe_path() {
+  local label="$1"
+  local value="$2"
+  local allow_empty="${3:-false}"
+  if [[ -z "${value}" ]]; then
+    if [[ "${allow_empty}" == "true" ]]; then
+      return 0
+    fi
+    err "${label} no puede estar vacío."
+    exit 1
+  fi
+  if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* || "${value}" == *'|'* ]]; then
+    err "Ruta inválida en ${label}: no se permiten saltos de línea ni el carácter '|'."
+    exit 1
+  fi
+  if [[ "${value}" == "/" ]]; then
+    err "Ruta inválida en ${label}: no puede ser '/'."
+    exit 1
+  fi
+}
+
+validate_safe_identifier() {
+  local label="$1"
+  local value="$2"
+  if ! [[ "${value}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    err "Identificador inválido en ${label}: '${value}'."
+    exit 1
+  fi
+}
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
 }
 
 ORIG_ARGS=("$@")
@@ -125,12 +160,24 @@ if [[ -n "${TLS_CERT}" || -n "${TLS_KEY}" ]]; then
   fi
 fi
 
+validate_safe_identifier "NODE_USER" "${NODE_USER}"
+validate_safe_identifier "NODE_GROUP" "${NODE_GROUP}"
+validate_safe_path "INSTALL_DIR" "${INSTALL_DIR}" "false"
+validate_safe_path "DATA_DIR" "${DATA_DIR}" "false"
+validate_safe_path "TLS_CERT" "${TLS_CERT}" "true"
+validate_safe_path "TLS_KEY" "${TLS_KEY}" "true"
+
 if [[ "$(uname -s)" != "Linux" ]]; then
   err "Este instalador requiere Linux (detectado: $(uname -s))."
   exit 1
 fi
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  if [[ ! -f "$0" ]]; then
+    err "Este instalador debe ejecutarse como root cuando se invoca por pipe."
+    err "Usa: curl -fsSL <URL>/install-node.sh | BIFROST_NODE_TOKEN='<token>' sudo -E bash -s -- --mode ${MODE} --port ${PORT}"
+    exit 1
+  fi
   if command -v sudo >/dev/null 2>&1; then
     log "Elevando privilegios con sudo..."
     exec sudo -E bash "$0" "${ORIG_ARGS[@]}"
@@ -156,10 +203,17 @@ if [[ -z "${NODE_MAJOR}" || "${NODE_MAJOR}" -lt 22 ]]; then
   exit 1
 fi
 NODE_BIN="$(command -v node)"
+validate_safe_path "NODE_BIN" "${NODE_BIN}" "false"
+NODE_BIN_REAL="$(readlink -f "${NODE_BIN}" 2>/dev/null || printf '%s' "${NODE_BIN}")"
+if [[ "${NODE_BIN}" == /root/* || "${NODE_BIN}" == /home/* || "${NODE_BIN_REAL}" == /root/* || "${NODE_BIN_REAL}" == /home/* ]]; then
+  err "El binario de Node.js reside en '${NODE_BIN_REAL}' (bajo /root o /home), lo cual falla con systemd ProtectHome=true."
+  err "Instala Node.js a nivel de sistema (ej. /usr/bin/node o /usr/local/bin/node) y vuelve a ejecutar el instalador."
+  exit 1
+fi
 
 STATE_FILE="${DATA_DIR}/token-state.json"
 if [[ -z "${TOKEN}" && ! -f "${STATE_FILE}" ]]; then
-  err "Falta --token <node_token> para la instalación inicial del nodo."
+  err "Falta --token <node_token> o variable de entorno BIFROST_NODE_TOKEN para la instalación inicial del nodo."
   usage
   exit 1
 fi
@@ -201,13 +255,37 @@ chmod 0755 "${INSTALL_DIR}"
 chmod 0700 "${DATA_DIR}"
 chown "${NODE_USER}:${NODE_GROUP}" "${DATA_DIR}"
 
-# Store only SHA-256 digest in token-state.json (0600) so raw token never leaks via ps/env
+# Store only SHA-256 digest in token-state.json (0600) via stdin so raw token never leaks via ps/environ
 if [[ -n "${TOKEN}" ]]; then
-  BIFROST_INIT_TOKEN="${TOKEN}" node -e '
+  printf '%s' "${TOKEN}" | node -e '
     const crypto = require("node:crypto");
     const fs = require("node:fs");
-    const hash = crypto.createHash("sha256").update(process.env.BIFROST_INIT_TOKEN.trim(), "utf8").digest("hex");
-    fs.writeFileSync(process.argv[1], JSON.stringify({ activeTokenHashHex: hash, updatedAt: Math.floor(Date.now() / 1000) }, null, 2) + "\n", { mode: 0o600 });
+    const token = fs.readFileSync(0, "utf8").trim();
+    if (!token) {
+      process.exit(1);
+    }
+    const hash = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+    const target = process.argv[1];
+    const tmp = `${target}.tmp.${process.pid}`;
+    const payload = JSON.stringify(
+      {
+        activeTokenHashHex: hash,
+        prevTokenHashHex: null,
+        prevTokenExpiresAtMs: null,
+        updatedAt: Math.floor(Date.now() / 1000)
+      },
+      null,
+      2
+    ) + "\n";
+    const fd = fs.openSync(tmp, "w", 0o600);
+    try {
+      fs.writeFileSync(fd, payload, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, target);
   ' "${STATE_FILE}"
   chmod 0600 "${STATE_FILE}"
   chown "${NODE_USER}:${NODE_GROUP}" "${STATE_FILE}"
@@ -260,9 +338,9 @@ fi
 
 log "Instalando dependencias y compilando agente en ${NODE_SUBDIR}..."
 if [[ -f "${NODE_SUBDIR}/package-lock.json" ]]; then
-  npm --prefix "${NODE_SUBDIR}" ci
+  npm --prefix "${NODE_SUBDIR}" ci --ignore-scripts
 else
-  npm --prefix "${NODE_SUBDIR}" install
+  npm --prefix "${NODE_SUBDIR}" install --ignore-scripts
 fi
 npm --prefix "${NODE_SUBDIR}" run build
 chown -R "${NODE_USER}:${NODE_GROUP}" "${INSTALL_DIR}"
@@ -300,13 +378,24 @@ fi
 chmod 0600 "${ENV_FILE}"
 
 install -m 0644 "${SERVICE_SOURCE}" "${SERVICE_DEST}"
-if [[ "${NODE_SUBDIR}" == "${INSTALL_DIR}" ]]; then
-  sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_DIR}|" "${SERVICE_DEST}"
-  sed -i "s|${INSTALL_DIR}/nodes/dist/index.js|${INSTALL_DIR}/dist/index.js|" "${SERVICE_DEST}"
-fi
-if [[ "${NODE_BIN}" != "/usr/bin/node" && "${NODE_BIN}" != "/usr/local/bin/node" ]]; then
-  sed -i "s|^ExecStart=.*|ExecStart=${NODE_BIN} ${NODE_SUBDIR}/dist/index.js|" "${SERVICE_DEST}"
-fi
+
+ESC_NODE_USER="$(escape_sed_replacement "${NODE_USER}")"
+ESC_NODE_GROUP="$(escape_sed_replacement "${NODE_GROUP}")"
+ESC_INSTALL_DIR="$(escape_sed_replacement "${INSTALL_DIR}")"
+ESC_NODE_SUBDIR="$(escape_sed_replacement "${NODE_SUBDIR}")"
+ESC_DATA_DIR="$(escape_sed_replacement "${DATA_DIR}")"
+ESC_EXEC_START="$(escape_sed_replacement "${NODE_BIN} ${NODE_SUBDIR}/dist/index.js")"
+
+sed -i \
+  -e "s|^User=.*|User=${ESC_NODE_USER}|" \
+  -e "s|^Group=.*|Group=${ESC_NODE_GROUP}|" \
+  -e "s|^WorkingDirectory=.*|WorkingDirectory=${ESC_NODE_SUBDIR}|" \
+  -e "s|^Environment=BIFROST_NODE_DATA_DIR=.*|Environment=BIFROST_NODE_DATA_DIR=${ESC_DATA_DIR}|" \
+  -e "s|^Environment=BIFROST_NODE_REPO_DIR=.*|Environment=BIFROST_NODE_REPO_DIR=${ESC_INSTALL_DIR}|" \
+  -e "s|^Environment=NPM_CONFIG_CACHE=.*|Environment=NPM_CONFIG_CACHE=${ESC_DATA_DIR}/.npm|" \
+  -e "s|^ExecStart=.*|ExecStart=${ESC_EXEC_START}|" \
+  -e "s|^ReadWritePaths=.*|ReadWritePaths=${ESC_DATA_DIR} ${ESC_INSTALL_DIR}|" \
+  "${SERVICE_DEST}"
 
 systemctl daemon-reload
 systemctl enable bifrost-node
