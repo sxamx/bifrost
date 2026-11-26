@@ -16,6 +16,32 @@ const SCRYPT_KEYLEN = 64;
 const SCRYPT_MAXMEM = 32 * 1024 * 1024;
 const SALT_BYTES = 16;
 
+const MIN_SCRYPT_N = 16384;
+const MAX_SCRYPT_N = 65536;
+const MIN_SCRYPT_R = 1;
+const MAX_SCRYPT_R = 16;
+const MIN_SCRYPT_P = 1;
+const MAX_SCRYPT_P = 4;
+const MIN_SCRYPT_SALT_BYTES = 16;
+const MAX_SCRYPT_SALT_BYTES = 64;
+const MIN_SCRYPT_HASH_BYTES = 32;
+const MAX_SCRYPT_HASH_BYTES = 128;
+const STRICT_UINT_RE = /^[0-9]+$/;
+const STRICT_HEX_RE = /^[0-9a-fA-F]+$/;
+
+export const MAX_USERNAME_LENGTH = 64;
+export const MAX_PASSWORD_LENGTH = 1024;
+
+/**
+ * Valid precomputed scrypt hash (N=16384, r=8, p=1, 16-byte salt, 64-byte derived key)
+ * used on unknown usernames during login to equalize verification latency and mitigate
+ * user-enumeration timing oracles (SEC-15).
+ */
+export const DUMMY_SCRYPT_HASH =
+  'scrypt$16384$8$1$0123456789abcdef0123456789abcdef$' +
+  '0000000000000000000000000000000000000000000000000000000000000000' +
+  '0000000000000000000000000000000000000000000000000000000000000000';
+
 const GCM_IV_BYTES = 12;
 const GCM_TAG_BYTES = 16;
 const MASTER_KEY_BYTES = 32;
@@ -159,41 +185,85 @@ export async function hashPassword(password: string): Promise<string> {
 }
 
 export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
+  if (
+    typeof password !== 'string' ||
+    typeof storedHash !== 'string' ||
+    password.length > MAX_PASSWORD_LENGTH
+  ) {
+    return false;
+  }
+
   const parts = storedHash.split('$');
   if (parts.length !== 6 || parts[0] !== 'scrypt') {
     return false;
   }
-  const N = Number(parts[1]);
-  const r = Number(parts[2]);
-  const p = Number(parts[3]);
-  const saltHex = parts[4];
-  const expectedHex = parts[5];
+
+  const [, rawN, rawR, rawP, saltHex, expectedHex] = parts;
+  if (
+    !rawN ||
+    !rawR ||
+    !rawP ||
+    !saltHex ||
+    !expectedHex ||
+    !STRICT_UINT_RE.test(rawN) ||
+    !STRICT_UINT_RE.test(rawR) ||
+    !STRICT_UINT_RE.test(rawP)
+  ) {
+    return false;
+  }
+
+  const N = Number(rawN);
+  const r = Number(rawR);
+  const p = Number(rawP);
+
+  // Strict scrypt bounds to prevent CPU/memory DoS (SEC-04 / DEEP-13):
+  // N must be a power of 2 in [16384, 65536], r in [1, 16], p in [1, 4].
+  if (
+    !Number.isSafeInteger(N) ||
+    !Number.isSafeInteger(r) ||
+    !Number.isSafeInteger(p) ||
+    N < MIN_SCRYPT_N ||
+    N > MAX_SCRYPT_N ||
+    (N & (N - 1)) !== 0 ||
+    r < MIN_SCRYPT_R ||
+    r > MAX_SCRYPT_R ||
+    p < MIN_SCRYPT_P ||
+    p > MAX_SCRYPT_P
+  ) {
+    return false;
+  }
 
   if (
-    !Number.isInteger(N) ||
-    !Number.isInteger(r) ||
-    !Number.isInteger(p) ||
-    N <= 1 ||
-    r <= 0 ||
-    p <= 0 ||
-    !saltHex ||
-    !expectedHex
+    saltHex.length % 2 !== 0 ||
+    expectedHex.length % 2 !== 0 ||
+    !STRICT_HEX_RE.test(saltHex) ||
+    !STRICT_HEX_RE.test(expectedHex)
   ) {
     return false;
   }
 
   const salt = Buffer.from(saltHex, 'hex');
   const expected = Buffer.from(expectedHex, 'hex');
-  if (salt.length === 0 || expected.length === 0) {
+  if (
+    salt.length < MIN_SCRYPT_SALT_BYTES ||
+    salt.length > MAX_SCRYPT_SALT_BYTES ||
+    expected.length < MIN_SCRYPT_HASH_BYTES ||
+    expected.length > MAX_SCRYPT_HASH_BYTES
+  ) {
     return false;
   }
+
+  // OpenSSL requires maxmem strictly larger than 128 * N * r.
+  // Since N <= 65536 and r <= 16, this is bounded safely below 136 MiB.
+  const requiredMem = 128 * N * r;
+  const maxmem = Math.max(SCRYPT_MAXMEM, requiredMem + 1024 * 1024);
 
   try {
     const derived = await scryptAsync(password, salt, expected.length, {
       N,
       r,
       p,
-      maxmem: SCRYPT_MAXMEM,
+      maxmem,
     });
     if (derived.length !== expected.length) {
       return false;
