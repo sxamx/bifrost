@@ -448,6 +448,11 @@ export async function callNodeControlPlane(params: {
         resolve({ status: res.statusCode ?? 0, data, peerFingerprint: observedPeerFingerprint });
       });
       res.on('error', finishReject);
+      res.once('close', () => {
+        if (!settled && !res.complete) {
+          finishReject(new Error('Node closed HTTP response prematurely'));
+        }
+      });
     };
 
     let req: http.ClientRequest;
@@ -1018,9 +1023,16 @@ type PendingReconcileResult =
       peerFingerprint: string | null;
     }
   | {
+      outcome: 'cleared_corrupt';
+      nodeCommit: null;
+      peerFingerprint: null;
+    }
+  | {
       outcome: 'unreachable';
       nodeCommit: null;
       peerFingerprint: null;
+      lastError?: string;
+      httpStatus?: number | null;
     };
 
 async function reconcilePendingNodeTokenUnlocked(params: {
@@ -1044,7 +1056,7 @@ async function reconcilePendingNodeTokenUnlocked(params: {
         : String(nodeRow.tls_fingerprint);
 
   if (!nodeRow.pending_encrypted_token) {
-    return { outcome: 'cleared_stale', nodeCommit: null, peerFingerprint: null };
+    return { outcome: 'cleared_corrupt', nodeCommit: null, peerFingerprint: null };
   }
 
   let pendingRawToken: string;
@@ -1054,12 +1066,20 @@ async function reconcilePendingNodeTokenUnlocked(params: {
     db.exec('BEGIN IMMEDIATE');
     try {
       db.prepare(`UPDATE nodes SET pending_encrypted_token = NULL WHERE id = ?`).run(nodeId);
+      writeSystemLog(
+        db,
+        'warn',
+        'node',
+        `Cleared unreadable pending_encrypted_token for node "${nodeName}"; health check required`,
+        { nodeId },
+        nowSec,
+      );
       db.exec('COMMIT');
     } catch (err) {
       db.exec('ROLLBACK');
       throw err;
     }
-    return { outcome: 'cleared_stale', nodeCommit: null, peerFingerprint: null };
+    return { outcome: 'cleared_corrupt', nodeCommit: null, peerFingerprint: null };
   }
 
   // 1. Test pending token FIRST — if the node already rotated (even inside grace window), it accepts this token
@@ -1075,8 +1095,14 @@ async function reconcilePendingNodeTokenUnlocked(params: {
       path: '/_bifrost/health',
       timeoutMs,
     });
-  } catch {
-    return { outcome: 'unreachable', nodeCommit: null, peerFingerprint: null };
+  } catch (err) {
+    return {
+      outcome: 'unreachable',
+      nodeCommit: null,
+      peerFingerprint: null,
+      lastError: err instanceof Error ? err.message : String(err),
+      httpStatus: null,
+    };
   }
 
   if (pendingRes.status === 200 && pendingRes.data?.ok === true) {
@@ -1102,12 +1128,20 @@ async function reconcilePendingNodeTokenUnlocked(params: {
   }
 
   // 2. Node rejected pending token (e.g. 401); check if it still accepts the old active token
+  let fallbackHttpStatus: number | null = pendingRes.status;
+  let fallbackError: string | undefined;
   if (nodeRow.encrypted_token) {
     let activeRawToken: string;
     try {
       activeRawToken = decryptSecret(nodeRow.encrypted_token as Uint8Array, masterKey);
     } catch {
-      return { outcome: 'unreachable', nodeCommit: null, peerFingerprint: null };
+      return {
+        outcome: 'unreachable',
+        nodeCommit: null,
+        peerFingerprint: null,
+        lastError: 'Failed to decrypt node credentials.',
+        httpStatus: null,
+      };
     }
 
     try {
@@ -1148,12 +1182,21 @@ async function reconcilePendingNodeTokenUnlocked(params: {
           peerFingerprint: oldRes.peerFingerprint ?? null,
         };
       }
-    } catch {
+      fallbackHttpStatus = oldRes.status;
+    } catch (err) {
       // Keep pending_encrypted_token if the node became unreachable during old-token check
+      fallbackError = err instanceof Error ? err.message : String(err);
+      fallbackHttpStatus = null;
     }
   }
 
-  return { outcome: 'unreachable', nodeCommit: null, peerFingerprint: null };
+  return {
+    outcome: 'unreachable',
+    nodeCommit: null,
+    peerFingerprint: null,
+    lastError: fallbackError,
+    httpStatus: fallbackHttpStatus,
+  };
 }
 
 /**
@@ -1451,6 +1494,9 @@ export async function runNodesHealthTick(
         } else if (reconciled.outcome === 'cleared_stale') {
           healthy = true;
           nodeCommit = reconciled.nodeCommit;
+        } else if (reconciled.outcome === 'cleared_corrupt') {
+          healthy = false;
+          row = { ...row, pending_encrypted_token: null };
         } else {
           healthy = false;
         }
@@ -1647,7 +1693,7 @@ export async function testNodeConnectivity(params: {
   const nowFn = params.now ?? (() => Date.now());
   const timeoutMs = params.timeoutMs ?? 5000;
 
-  const row = db
+  let row = db
     .prepare(
       `SELECT id, name, mode, endpoint, encrypted_token, pending_encrypted_token, tls_fingerprint, status
        FROM nodes
@@ -1710,30 +1756,78 @@ export async function testNodeConnectivity(params: {
     let nodeCommit: string | null = null;
     let httpStatus = 200;
     let promotedPending = false;
+    let skipRedundantHealthCheck = false;
 
     if (row.pending_encrypted_token) {
       const nowSecForReconcile = Math.floor(nowFn() / 1000);
-      const reconciled = await withNodeRotationLock(nodeId, async () =>
-        reconcilePendingNodeTokenUnlocked({
+      const reconciled = await withNodeRotationLock(nodeId, async () => {
+        const freshRow = db
+          .prepare(
+            `SELECT id, name, mode, endpoint, encrypted_token, pending_encrypted_token, tls_fingerprint, status
+             FROM nodes
+             WHERE id = ?`,
+          )
+          .get(nodeId) as Record<string, unknown> | undefined;
+
+        if (!freshRow) {
+          throw new NodeOperationError(`Node "${nodeId}" not found.`, 404);
+        }
+
+        row = freshRow;
+        if (freshRow.encrypted_token) {
+          try {
+            rawToken = decryptSecret(freshRow.encrypted_token as Uint8Array, masterKey);
+          } catch {
+            return {
+              outcome: 'unreachable' as const,
+              nodeCommit: null,
+              peerFingerprint: null,
+              lastError: 'Failed to decrypt node credentials.',
+              httpStatus: null,
+            };
+          }
+        }
+        if (freshRow.tls_fingerprint && !effectiveTlsFingerprint) {
+          effectiveTlsFingerprint = String(freshRow.tls_fingerprint);
+        }
+
+        if (!freshRow.pending_encrypted_token) {
+          return null;
+        }
+
+        return reconcilePendingNodeTokenUnlocked({
           db,
           masterKey,
-          nodeRow: row,
+          nodeRow: freshRow,
           nowSec: nowSecForReconcile,
           timeoutMs,
           tlsFingerprintOverride: effectiveTlsFingerprint,
-        }),
-      );
-      if (reconciled.outcome === 'promoted') {
-        healthy = true;
-        promotedPending = true;
-        nodeCommit = reconciled.nodeCommit;
-      } else if (reconciled.outcome === 'cleared_stale') {
-        healthy = true;
-        nodeCommit = reconciled.nodeCommit;
+        });
+      });
+
+      if (reconciled !== null) {
+        if (reconciled.outcome === 'promoted') {
+          healthy = true;
+          promotedPending = true;
+          nodeCommit = reconciled.nodeCommit;
+        } else if (reconciled.outcome === 'cleared_stale') {
+          healthy = true;
+          nodeCommit = reconciled.nodeCommit;
+        } else if (reconciled.outcome === 'cleared_corrupt') {
+          healthy = false;
+          row = { ...row, pending_encrypted_token: null };
+        } else {
+          // Both pending and active tokens failed during reconciliation; avoid a redundant 3rd probe
+          skipRedundantHealthCheck = true;
+          if (reconciled.lastError) {
+            throw new Error(reconciled.lastError);
+          }
+          httpStatus = reconciled.httpStatus ?? 0;
+        }
       }
     }
 
-    if (!healthy) {
+    if (!healthy && !skipRedundantHealthCheck) {
       const res = await callNodeControlPlane({
         mode,
         endpoint: String(row.endpoint),
@@ -1839,6 +1933,9 @@ export async function testNodeConnectivity(params: {
       error: errorMessage,
     };
   } catch (err) {
+    if (err instanceof NodeOperationError) {
+      throw err;
+    }
     const nowSec = Math.floor(nowFn() / 1000);
     const msg = err instanceof Error ? err.message : 'Node connectivity test failed.';
     const safeError = redactToken(msg);

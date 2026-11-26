@@ -703,4 +703,228 @@ describe('Ola 4 — Nodes TLS Pinning, 2-Phase Rotation & Tunnel Resilience', ()
     assert.ok(names.has('tls_fingerprint'));
     assert.ok(names.has('last_commit'));
   });
+
+  it('clears corrupt pending_encrypted_token without falsely marking an unhealthy node online (runNodesHealthTick & testNodeConnectivity)', async () => {
+    const db = openDatabase(':memory:');
+    cleanupCallbacks.push(() => db.close());
+    const masterKey = randomBytes(32);
+
+    let healthOk = false;
+    let healthCalls = 0;
+    const token = 'corrupt_pending_active_token_0123456789';
+
+    const mockNode = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/_bifrost/health') {
+        healthCalls += 1;
+        if (!healthOk) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => mockNode.listen(0, '127.0.0.1', resolve));
+    const port = (mockNode.address() as net.AddressInfo).port;
+    cleanupCallbacks.push(() => new Promise<void>((r) => mockNode.close(() => r())));
+
+    const nodeId = insertTestNode({
+      db,
+      masterKey,
+      name: 'Corrupt Pending Node',
+      mode: 'tailscale',
+      endpoint: `127.0.0.1:${port}`,
+      rawToken: token,
+      tlsFingerprint: null,
+      status: 'offline',
+    });
+
+    const corruptBlob = Buffer.from('corrupted-not-valid-aes-gcm-blob');
+
+    // 1. runNodesHealthTick with corrupt pending token against 503 node: MUST clear column, probe health, and NOT mark online
+    db.prepare(`UPDATE nodes SET pending_encrypted_token = ? WHERE id = ?`).run(corruptBlob, nodeId);
+    const tick1 = await runNodesHealthTick(db, masterKey, {
+      now: () => 1_770_000_050_000,
+    });
+    assert.equal(tick1.onlineCount, 0);
+    assert.equal(healthCalls, 1, 'Expected real /_bifrost/health check after clearing corrupt pending token');
+    const afterTick1 = db
+      .prepare(`SELECT status, pending_encrypted_token FROM nodes WHERE id = ?`)
+      .get(nodeId) as { status: string; pending_encrypted_token: Uint8Array | null };
+    assert.equal(afterTick1.status, 'offline');
+    assert.equal(afterTick1.pending_encrypted_token, null);
+
+    // 2. testNodeConnectivity with corrupt pending token against 503 node: MUST clear column, probe health, and return ok:false
+    db.prepare(`UPDATE nodes SET pending_encrypted_token = ? WHERE id = ?`).run(corruptBlob, nodeId);
+    const test1 = await testNodeConnectivity({ db, masterKey, nodeId });
+    assert.equal(test1.ok, false);
+    assert.equal(test1.status, 'offline');
+    assert.equal(healthCalls, 2);
+    const afterTest1 = db
+      .prepare(`SELECT status, pending_encrypted_token FROM nodes WHERE id = ?`)
+      .get(nodeId) as { status: string; pending_encrypted_token: Uint8Array | null };
+    assert.equal(afterTest1.status, 'offline');
+    assert.equal(afterTest1.pending_encrypted_token, null);
+
+    // 3. Once node is actually healthy (200 OK), corrupt pending token is cleared and real health check marks it online
+    healthOk = true;
+    db.prepare(`UPDATE nodes SET pending_encrypted_token = ? WHERE id = ?`).run(corruptBlob, nodeId);
+    const test2 = await testNodeConnectivity({ db, masterKey, nodeId });
+    assert.equal(test2.ok, true);
+    assert.equal(test2.status, 'online');
+    assert.equal(healthCalls, 3);
+  });
+
+  it('refreshes freshRow & rawToken inside testNodeConnectivity lock during concurrent rotation and avoids redundant 3rd probe when unreachable', async () => {
+    const db = openDatabase(':memory:');
+    cleanupCallbacks.push(() => db.close());
+    const masterKey = randomBytes(32);
+
+    const initialToken = 'race_test_initial_token_0123456789abcd';
+    let fakeNowMs = 1_770_000_000_000;
+    const auth = new TokenAuthenticator({
+      initialToken,
+      graceWindowMs: 1, // Expire old token immediately when clock advances so stale token fails 401!
+      now: () => fakeNowMs,
+    });
+
+    let rotateStartedResolve!: () => void;
+    const rotateStarted = new Promise<void>((r) => {
+      rotateStartedResolve = r;
+    });
+    let releaseRotate!: () => void;
+    const rotateGate = new Promise<void>((r) => {
+      releaseRotate = r;
+    });
+
+    let rejectAllHealth = false;
+    let healthProbeCount = 0;
+    const healthAuthSlots: Array<string | undefined> = [];
+
+    const mockNode = http.createServer((req, res) => {
+      if (req.method === 'POST' && req.url === '/_bifrost/rotate') {
+        const chunks: Buffer[] = [];
+        req.on('data', (c: Buffer) => chunks.push(c));
+        req.on('end', () => {
+          rotateStartedResolve();
+          void rotateGate.then(() => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { newToken: string };
+            auth.rotate(body.newToken);
+            // Advance clock past 1ms grace window so the old token would immediately 401
+            fakeNowMs += 100;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+          });
+        });
+        return;
+      }
+
+      if (req.method === 'GET' && req.url === '/_bifrost/health') {
+        healthProbeCount += 1;
+        if (rejectAllHealth) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false }));
+          return;
+        }
+        const ver = auth.verifyHeaders(req.headers);
+        healthAuthSlots.push(ver.matchedSlot);
+        if (!ver.authenticated) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => mockNode.listen(0, '127.0.0.1', resolve));
+    const port = (mockNode.address() as net.AddressInfo).port;
+    cleanupCallbacks.push(() => new Promise<void>((r) => mockNode.close(() => r())));
+
+    const nodeId = insertTestNode({
+      db,
+      masterKey,
+      name: 'Concurrent Race Node',
+      mode: 'tailscale',
+      endpoint: `127.0.0.1:${port}`,
+      rawToken: initialToken,
+      tlsFingerprint: null,
+      status: 'online',
+    });
+
+    // 1. Start rotateNodeToken (writes pending_encrypted_token and pauses inside lock waiting on rotateGate)
+    const rotatePromise = rotateNodeToken({
+      db,
+      masterKey,
+      nodeId,
+      nowSec: Math.floor(fakeNowMs / 1000),
+    });
+    await rotateStarted;
+
+    // 2. While rotateNodeToken holds the lock and pending_encrypted_token is set in DB, launch testNodeConnectivity
+    const testPromise = testNodeConnectivity({ db, masterKey, nodeId });
+
+    // Give testNodeConnectivity a tick to read initial row & block on withNodeRotationLock, then finish rotation
+    await new Promise((r) => setTimeout(r, 25));
+    releaseRotate();
+
+    const [rotRes, testRes] = await Promise.all([rotatePromise, testPromise]);
+    assert.equal(rotRes.ok, true);
+    assert.equal(testRes.ok, true, 'testNodeConnectivity must refresh rawToken from freshRow after acquiring lock');
+    assert.deepEqual(healthAuthSlots, ['active']);
+
+    // 3. Verify no redundant 3rd probe when pending reconciliation already probed both pending & active tokens (503)
+    healthProbeCount = 0;
+    rejectAllHealth = true;
+    const fakePending = encryptSecret('some_unapplied_pending_token_0123456789', masterKey);
+    db.prepare(`UPDATE nodes SET pending_encrypted_token = ? WHERE id = ?`).run(fakePending, nodeId);
+
+    const failRes = await testNodeConnectivity({ db, masterKey, nodeId });
+    assert.equal(failRes.ok, false);
+    assert.equal(
+      healthProbeCount,
+      2,
+      `Expected exactly 2 health probes (pending + active) without a redundant 3rd call, got ${healthProbeCount}`,
+    );
+  });
+
+  it('rejects promptly in callNodeControlPlane when node closes HTTP response prematurely before Content-Length completes', async () => {
+    const truncatedServer = net.createServer((sock) => {
+      sock.once('data', () => {
+        sock.write(
+          'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{"ok":true,"trunc',
+        );
+        sock.destroy();
+      });
+    });
+    await new Promise<void>((resolve) => truncatedServer.listen(0, '127.0.0.1', resolve));
+    const port = (truncatedServer.address() as net.AddressInfo).port;
+    cleanupCallbacks.push(() => new Promise<void>((r) => truncatedServer.close(() => r())));
+
+    const startedMs = Date.now();
+    await assert.rejects(
+      () =>
+        callNodeControlPlane({
+          mode: 'tailscale',
+          endpoint: `127.0.0.1:${port}`,
+          rawToken: 'premature_close_test_token_0123456789',
+          method: 'GET',
+          path: '/_bifrost/health',
+          timeoutMs: 5000,
+        }),
+      /prematurely|closed|reset|aborted|hang up/i,
+    );
+    const elapsedMs = Date.now() - startedMs;
+    assert.ok(elapsedMs < 2000, `Expected prompt rejection on premature close, took ${elapsedMs}ms`);
+  });
 });

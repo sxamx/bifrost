@@ -219,10 +219,21 @@ export class TokenAuthenticator {
       };
     }
 
+    const prevActiveHash = this.activeTokenHash;
+    const prevGraceHash = this.prevTokenHash;
+    const prevGraceExpiresAtMs = this.prevTokenExpiresAtMs;
+
     this.prevTokenHash = this.activeTokenHash;
     this.prevTokenExpiresAtMs = currentMs + this.graceWindowMs;
     this.activeTokenHash = nextHash;
-    this.persistStateFile();
+    try {
+      this.persistStateFile();
+    } catch (err) {
+      this.activeTokenHash = prevActiveHash;
+      this.prevTokenHash = prevGraceHash;
+      this.prevTokenExpiresAtMs = prevGraceExpiresAtMs;
+      throw err;
+    }
 
     return {
       graceWindowMs: this.graceWindowMs,

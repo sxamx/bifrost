@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_GRACE_WINDOW_MS,
   NODE_AGENT_VERSION,
+  TokenAuthenticator,
   createBifrostNodeServer
 } from './dist/index.js';
 
@@ -387,6 +388,33 @@ describe('Bifrost Egress Node Resilience (Ola 4)', () => {
     }
   });
 
+  it('rolls back in-memory token state in TokenAuthenticator.rotate when persistStateFile fails', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-node-auth-rollback-'));
+    const stateFilePath = path.join(tmpDir, 'token-state.json');
+    const tokenV1 = 'rollback_initial_token_0123456789abcdef';
+    const tokenV2 = 'rollback_failed_token_fedcba9876543210';
+
+    try {
+      const auth = new TokenAuthenticator({
+        initialToken: tokenV1,
+        stateFilePath
+      });
+      assert.equal(auth.verifyToken(tokenV1).matchedSlot, 'active');
+
+      // Replace stateFilePath with a directory so fs.renameSync fails during rotate()
+      fs.unlinkSync(stateFilePath);
+      fs.mkdirSync(stateFilePath);
+
+      assert.throws(() => auth.rotate(tokenV2));
+
+      // In-memory state MUST be restored to tokenV1 (and tokenV2 must NOT be accepted)
+      assert.equal(auth.verifyToken(tokenV1).matchedSlot, 'active');
+      assert.equal(auth.verifyToken(tokenV2).authenticated, false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('validates hardened systemd service files and install-node.sh protections', () => {
     const nodeService = fs.readFileSync(path.join(__dirname, 'bifrost-node.service'), 'utf8');
     for (const directive of [
@@ -394,7 +422,7 @@ describe('Bifrost Egress Node Resilience (Ola 4)', () => {
       'ProtectClock=true',
       'RestrictNamespaces=true',
       'RestrictRealtime=true',
-      'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX'
+      'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK'
     ]) {
       assert.ok(nodeService.includes(directive), `Missing ${directive} in nodes/bifrost-node.service`);
     }
@@ -417,10 +445,14 @@ describe('Bifrost Egress Node Resilience (Ola 4)', () => {
     const installScript = fs.readFileSync(installScriptPath, 'utf8');
     assert.ok(!installScript.includes('BIFROST_INIT_TOKEN'), 'install-node.sh must pass token via stdin, not env');
     assert.ok(installScript.includes('BIFROST_NODE_TOKEN'), 'install-node.sh must support BIFROST_NODE_TOKEN');
+    assert.ok(installScript.includes('unset BIFROST_NODE_TOKEN'), 'install-node.sh must scrub BIFROST_NODE_TOKEN from env after root check');
     assert.ok(installScript.includes('[[ ! -f "$0" ]]'), 'install-node.sh must guard pipe execution without root');
     assert.ok(installScript.includes('ProtectHome=true'), 'install-node.sh must validate NODE_BIN against ProtectHome');
     assert.ok(installScript.includes('escape_sed_replacement'), 'install-node.sh must escape sed replacements');
-    assert.ok(installScript.includes('ci --ignore-scripts'), 'install-node.sh must install deps with --ignore-scripts');
+    assert.ok(
+      installScript.includes('ci --include=dev --ignore-scripts'),
+      'install-node.sh must install devDeps with --include=dev --ignore-scripts'
+    );
 
     // Validate bash syntax
     execFileSync('bash', ['-n', installScriptPath]);

@@ -186,6 +186,9 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 1
 fi
 
+# Scrub raw token from process environment once running as root so child processes do not inherit it
+unset BIFROST_NODE_TOKEN || true
+
 if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
   err "Se requiere systemd activo para registrar ${SERVICE_NAME}."
   exit 1
@@ -338,9 +341,9 @@ fi
 
 log "Instalando dependencias y compilando agente en ${NODE_SUBDIR}..."
 if [[ -f "${NODE_SUBDIR}/package-lock.json" ]]; then
-  npm --prefix "${NODE_SUBDIR}" ci --ignore-scripts
+  npm --prefix "${NODE_SUBDIR}" ci --include=dev --ignore-scripts
 else
-  npm --prefix "${NODE_SUBDIR}" install --ignore-scripts
+  npm --prefix "${NODE_SUBDIR}" install --include=dev --ignore-scripts
 fi
 npm --prefix "${NODE_SUBDIR}" run build
 chown -R "${NODE_USER}:${NODE_GROUP}" "${INSTALL_DIR}"
