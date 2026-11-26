@@ -60,6 +60,7 @@
         },
         "header": {
           "type": "string",
+          "pattern": "^[A-Za-z0-9-]+$",
           "default": "Authorization"
         },
         "prefix": {
@@ -78,7 +79,8 @@
     },
     "modelsEndpoint": {
       "type": "string",
-      "description": "Ruta relativa o URL para listar modelos si modelsSource es 'api' (ej. /models)."
+      "pattern": "^/(?!/)[^\\s\\\\?#]*$",
+      "description": "Ruta relativa estricta para listar modelos si modelsSource es 'api' (ej. /models)."
     },
     "freeRule": {
       "type": "object",
@@ -126,7 +128,11 @@
       "required": ["defaultPort", "healthPath"],
       "properties": {
         "defaultPort": { "type": "integer" },
-        "healthPath": { "type": "string", "default": "/health" },
+        "healthPath": {
+          "type": "string",
+          "pattern": "^/(?!/)[^\\s\\\\?#]*$",
+          "default": "/health"
+        },
         "accountLabel": { "type": "string", "default": "Token / Sesión" }
       }
     },

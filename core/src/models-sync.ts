@@ -19,7 +19,15 @@ import {
   type ProviderManifest,
   type ProviderPrivacyConfig,
   buildProviderAuthHeaders,
+  isSafeRelativeEndpointPath,
 } from './schema.js';
+import {
+  type DnsLookupFn,
+  UpstreamSsrfError,
+  assertSafeUpstreamUrlSync,
+  safeFetch,
+} from './ssrf.js';
+import { allowLocalOfficialUpstreams } from './url-security.js';
 
 export const AUTO_SYNC_INTERVAL_SEC = 6 * 3600; // 6 hours (HU-16)
 export const AUTO_SYNC_INTERVAL_MS = AUTO_SYNC_INTERVAL_SEC * 1000;
@@ -538,6 +546,8 @@ export async function syncProviderModels(options: {
   drainingKeys: ReadonlySet<string>;
   drainingProviders: ReadonlySet<string>;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
   upstreamTls?: UpstreamTlsOptions;
   nowSec: number;
   modelsDevSnapshot?: ModelsDevSnapshot;
@@ -549,6 +559,8 @@ export async function syncProviderModels(options: {
     drainingKeys,
     drainingProviders,
     fetchImpl,
+    allowLocalhost,
+    dnsLookup,
     upstreamTls,
     nowSec,
   } = options;
@@ -602,13 +614,12 @@ export async function syncProviderModels(options: {
     );
   }
 
-  const snapshot =
-    options.modelsDevSnapshot ??
-    (await loadModelsDevSnapshot(db, { fetchFn: fetchImpl, nowSec }));
-
   let candidates: NormalizedCandidateModel[] = [];
 
   if (manifest.modelsSource === 'static') {
+    const snapshot =
+      options.modelsDevSnapshot ??
+      (await loadModelsDevSnapshot(db, { fetchFn: fetchImpl, nowSec }));
     decryptSecret(keyRows[0]!.encrypted_secret as Uint8Array, masterKey);
 
     candidates = (manifest.staticModels ?? []).map((sm) => {
@@ -633,6 +644,13 @@ export async function syncProviderModels(options: {
       };
     });
   } else {
+    const upstreamMode =
+      providerRow.package_type === 'experimental-adapter'
+        ? ('experimental-adapter' as const)
+        : ('official-json' as const);
+    const effectiveAllowLocalhost =
+      allowLocalhost !== undefined ? allowLocalhost : allowLocalOfficialUpstreams();
+
     const effectiveBaseUrl =
       providerRow.package_type === 'experimental-adapter' &&
       typeof providerRow.adapter_url === 'string' &&
@@ -640,16 +658,54 @@ export async function syncProviderModels(options: {
         ? providerRow.adapter_url
         : manifest.baseUrl;
 
-    const endpoint = manifest.modelsEndpoint ?? '/models';
-    const modelsUrl = /^https?:\/\//i.test(endpoint)
-      ? endpoint
-      : `${effectiveBaseUrl.replace(/\/+$/, '')}/${endpoint.replace(/^\/+/, '')}`;
+    const endpoint =
+      typeof manifest.modelsEndpoint === 'string' && manifest.modelsEndpoint.trim().length > 0
+        ? manifest.modelsEndpoint.trim()
+        : '/models';
+
+    if (!isSafeRelativeEndpointPath(endpoint)) {
+      throw new ModelSyncHttpError(
+        `Manifest modelsEndpoint "${endpoint}" is invalid: expected a strict relative path starting with "/".`,
+        400,
+      );
+    }
+
+    let baseParsed: URL;
+    let modelsParsed: URL;
+    try {
+      baseParsed = new URL(effectiveBaseUrl);
+      const joined = `${effectiveBaseUrl.replace(/\/+$/, '')}${endpoint}`;
+      modelsParsed = new URL(joined);
+    } catch {
+      throw new ModelSyncHttpError('Invalid provider baseUrl or modelsEndpoint URL.', 400);
+    }
+
+    if (modelsParsed.origin !== baseParsed.origin) {
+      throw new ModelSyncHttpError(
+        'Manifest modelsEndpoint cannot change origin from provider baseUrl.',
+        400,
+      );
+    }
+
+    let modelsUrl: string;
+    try {
+      modelsUrl = assertSafeUpstreamUrlSync(modelsParsed.href, {
+        mode: upstreamMode,
+        allowLocalhost: effectiveAllowLocalhost,
+      });
+    } catch (err) {
+      throw new ModelSyncHttpError(
+        err instanceof Error ? err.message : 'Upstream models URL blocked by SSRF policy.',
+        400,
+      );
+    }
 
     let upstreamList: unknown[] | null = null;
     let lastErrMessage = 'Unknown upstream error';
 
     for (const kRow of keyRows) {
       const rawSecret = decryptSecret(kRow.encrypted_secret as Uint8Array, masterKey);
+      let nodeToken: string | null = null;
       const headers = buildProviderAuthHeaders(manifest.auth, rawSecret);
       try {
         let res: Response;
@@ -659,7 +715,7 @@ export async function syncProviderModels(options: {
               `Assigned exit node "${kRow.node_id}" is missing tunnel credentials`,
             );
           }
-          const nodeToken = decryptSecret(kRow.node_encrypted_token as Uint8Array, masterKey);
+          nodeToken = decryptSecret(kRow.node_encrypted_token as Uint8Array, masterKey);
           res = await fetchViaExitNode(
             modelsUrl,
             { method: 'GET', headers },
@@ -677,11 +733,21 @@ export async function syncProviderModels(options: {
             upstreamTls,
           );
         } else {
-          res = await fetchImpl(modelsUrl, {
-            method: 'GET',
-            headers,
-            redirect: 'error',
-          });
+          res = await safeFetch(
+            modelsUrl,
+            {
+              method: 'GET',
+              headers,
+              redirect: 'error',
+            },
+            {
+              mode: upstreamMode,
+              allowLocalhost: effectiveAllowLocalhost,
+              fetchImpl,
+              dnsLookup,
+              upstreamTls,
+            },
+          );
         }
 
         if (!res.ok) {
@@ -704,8 +770,14 @@ export async function syncProviderModels(options: {
         }
         lastErrMessage = 'Upstream response did not contain a models array';
       } catch (err) {
+        if (err instanceof UpstreamSsrfError) {
+          throw new ModelSyncHttpError(
+            redactSecretsInText(err.message, [rawSecret, nodeToken]),
+            400,
+          );
+        }
         const rawMsg = err instanceof Error ? err.message : String(err);
-        lastErrMessage = redactSecretsInText(rawMsg);
+        lastErrMessage = redactSecretsInText(rawMsg, [rawSecret, nodeToken]);
       }
     }
 
@@ -723,6 +795,10 @@ export async function syncProviderModels(options: {
         502,
       );
     }
+
+    const snapshot =
+      options.modelsDevSnapshot ??
+      (await loadModelsDevSnapshot(db, { fetchFn: fetchImpl, nowSec }));
 
     const seenFullIds = new Set<string>();
     for (const item of upstreamList) {
@@ -904,6 +980,8 @@ export interface RunModelsAutoSyncOptions {
   drainingProviders?: ReadonlySet<string>;
   fetchImpl?: typeof fetch;
   fetchFn?: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
   upstreamTls?: UpstreamTlsOptions;
   nowSec?: number;
   modelsDevSnapshot?: ModelsDevSnapshot;
@@ -980,6 +1058,8 @@ export async function runModelsAutoSyncTick(
         drainingKeys,
         drainingProviders,
         fetchImpl,
+        allowLocalhost: opts.allowLocalhost,
+        dnsLookup: opts.dnsLookup,
         upstreamTls: opts.upstreamTls,
         nowSec,
         modelsDevSnapshot: snapshot,

@@ -9,7 +9,14 @@ import {
   validateProviderManifest,
 } from './schema.js';
 import {
+  type DnsLookupFn,
+  safeFetch,
+  validateSafeUpstreamUrl,
+  validateSafeUpstreamUrlSync,
+} from './ssrf.js';
+import {
   type UrlSecurityValidationResult,
+  allowLocalOfficialUpstreams,
   validateProviderTargetUrl,
 } from './url-security.js';
 
@@ -125,24 +132,57 @@ export function computeManifestHash(manifest: unknown): string {
 
 export interface MarketplaceSsrfOptions {
   allowLocalhostForTests?: boolean;
+  dnsLookup?: DnsLookupFn;
+  resolveDns?: boolean;
+}
+
+/**
+ * Synchronous Marketplace repository index URL validator with strict SSRF protection
+ * (`official-json` mode: strict HTTPS, blocks RFC1918/loopback/CGNAT/IMDS/single-label/IPv6 transition/userinfo).
+ */
+export function validateMarketplaceSourceUrlSync(
+  rawUrl: string,
+  ssrfOpts?: MarketplaceSsrfOptions,
+): { ok: true; url: string } | { ok: false; error: string } {
+  const allowLoopback = Boolean(ssrfOpts?.allowLocalhostForTests);
+  const check = validateSafeUpstreamUrlSync(rawUrl, {
+    mode: 'official-json',
+    allowLocalhostForTests: allowLoopback,
+  });
+  if (!check.allowed || !check.normalizedUrl) {
+    return { ok: false, error: check.reason ?? 'Invalid marketplace source URL.' };
+  }
+  return { ok: true, url: check.normalizedUrl.replace(/\/+$/, '') };
 }
 
 /**
  * Validates a Marketplace repository index URL with strict SSRF protection
- * (`official-json` mode: strict HTTPS, blocks RFC1918/loopback/CGNAT/IMDS/IPv6 transition/userinfo).
+ * (`official-json` mode: strict HTTPS, blocks RFC1918/loopback/CGNAT/IMDS/single-label/IPv6 transition/userinfo,
+ * plus DNS validation when `dnsLookup` or `resolveDns: true` is provided).
  */
 export async function validateMarketplaceSourceUrl(
   rawUrl: string,
   ssrfOpts?: MarketplaceSsrfOptions,
 ): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
-  const allowLoopback = Boolean(ssrfOpts?.allowLocalhostForTests);
-  const check = validateProviderTargetUrl(rawUrl, 'official-json', 'baseUrl', {
-    allowLoopback,
-  });
-  if (!check.valid || !check.normalizedUrl) {
-    return { ok: false, error: check.error ?? 'Invalid marketplace source URL.' };
+  const syncCheck = validateMarketplaceSourceUrlSync(rawUrl, ssrfOpts);
+  if (!syncCheck.ok) {
+    return syncCheck;
   }
-  return { ok: true, url: check.normalizedUrl };
+
+  if (ssrfOpts?.dnsLookup || ssrfOpts?.resolveDns === true) {
+    const dnsCheck = await validateSafeUpstreamUrl(syncCheck.url, {
+      mode: 'official-json',
+      allowLocalhostForTests: Boolean(ssrfOpts.allowLocalhostForTests),
+      dnsLookup: ssrfOpts.dnsLookup,
+      resolveDns: true,
+    });
+    if (!dnsCheck.allowed || !dnsCheck.normalizedUrl) {
+      return { ok: false, error: dnsCheck.reason ?? 'Invalid marketplace source URL.' };
+    }
+    return { ok: true, url: dnsCheck.normalizedUrl.replace(/\/+$/, '') };
+  }
+
+  return syncCheck;
 }
 
 function mapSourceRow(row: Record<string, unknown>): MarketplaceSourceRecord {
@@ -393,19 +433,32 @@ async function fetchSingleSourceCatalog(options: {
   marketplaceUrl: string;
   schemasDir: string;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
 }): Promise<SingleSourceFetchOutput> {
-  const { marketplaceUrl, schemasDir, fetchImpl } = options;
+  const { marketplaceUrl, schemasDir, fetchImpl, allowLocalhost, dnsLookup } = options;
+  const effectiveAllowLocalhost =
+    allowLocalhost !== undefined ? allowLocalhost : allowLocalOfficialUpstreams();
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
   let res: Response;
   try {
-    res = await fetchImpl(marketplaceUrl, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      redirect: 'error',
-      signal: controller.signal,
-    });
+    res = await safeFetch(
+      marketplaceUrl,
+      {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        redirect: 'error',
+        signal: controller.signal,
+      },
+      {
+        mode: 'official-json',
+        allowLocalhost: effectiveAllowLocalhost,
+        fetchImpl,
+        dnsLookup,
+      },
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -472,12 +525,21 @@ async function fetchSingleSourceCatalog(options: {
       }
 
       try {
-        const mRes = await fetchImpl(resolvedUrl.href, {
-          method: 'GET',
-          headers: { Accept: 'application/json' },
-          redirect: 'error',
-          signal: AbortSignal.timeout(4000),
-        });
+        const mRes = await safeFetch(
+          resolvedUrl.href,
+          {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+            redirect: 'error',
+            signal: AbortSignal.timeout(4000),
+          },
+          {
+            mode: 'official-json',
+            allowLocalhost: effectiveAllowLocalhost,
+            fetchImpl,
+            dnsLookup,
+          },
+        );
         if (!mRes.ok) continue;
         const rawManifest = (await mRes.json()) as unknown;
         if (
@@ -539,13 +601,21 @@ export async function fetchRemoteMarketplaceCatalog(options: {
   marketplaceUrl: string;
   schemasDir: string;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
   nowSec: number;
 }): Promise<{
   manifests: MarketplaceCatalogManifest[];
   unapprovedIds: string[];
 }> {
-  const { db, marketplaceUrl, schemasDir, fetchImpl, nowSec } = options;
-  const result = await fetchSingleSourceCatalog({ marketplaceUrl, schemasDir, fetchImpl });
+  const { db, marketplaceUrl, schemasDir, fetchImpl, allowLocalhost, dnsLookup, nowSec } = options;
+  const result = await fetchSingleSourceCatalog({
+    marketplaceUrl,
+    schemasDir,
+    fetchImpl,
+    allowLocalhost,
+    dnsLookup,
+  });
 
   db.prepare(
     `INSERT INTO external_cache (cache_key, payload_json, etag, fetched_at)
@@ -632,12 +702,21 @@ export async function fetchAndMergeMarketplaceCatalog(
   db: DatabaseSync,
   options: {
     fetchImpl: typeof fetch;
+    allowLocalhost?: boolean;
+    dnsLookup?: DnsLookupFn;
     forceRefresh?: boolean;
     nowSec: number;
     bundledDir: string;
   },
 ): Promise<MergedMarketplaceCatalogResult> {
-  const { fetchImpl, forceRefresh = false, nowSec, bundledDir } = options;
+  const {
+    fetchImpl,
+    allowLocalhost,
+    dnsLookup,
+    forceRefresh = false,
+    nowSec,
+    bundledDir,
+  } = options;
 
   const allSources = listMarketplaceSources(db);
   const enabledSources = allSources.filter((s) => s.enabled);
@@ -715,6 +794,8 @@ export async function fetchAndMergeMarketplaceCatalog(
           marketplaceUrl: src.url,
           schemasDir: bundledDir,
           fetchImpl,
+          allowLocalhost,
+          dnsLookup,
         });
 
         db.prepare(

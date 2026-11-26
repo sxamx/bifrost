@@ -64,6 +64,7 @@ import {
   readCachedOrBundledMarketplaceCatalog,
   stripMarketplaceWrapperFields,
   updateMarketplaceSource,
+  validateMarketplaceSourceUrlSync,
   validateProviderTargetUrl,
 } from './marketplace.js';
 import {
@@ -96,6 +97,7 @@ import {
   runNodesHealthTick,
   testNodeConnectivity,
   triggerNodeUpdate,
+  validateNodeEndpoint,
 } from './nodes.js';
 import {
   DrainingRegistry,
@@ -106,10 +108,18 @@ import {
 import {
   type ProviderManifest,
   buildProviderAuthHeaders,
+  isSafeRelativeEndpointPath,
   isValidHttpUri,
   loadSeedManifests,
   validateProviderManifest,
 } from './schema.js';
+import {
+  type DnsLookupFn,
+  UpstreamSsrfError,
+  assertSafeUpstreamUrlSync,
+  safeFetch,
+} from './ssrf.js';
+import { allowLocalOfficialUpstreams } from './url-security.js';
 import {
   SystemUpdateError,
   type SystemUpdateStatus,
@@ -168,6 +178,8 @@ export interface CreateAppOptions {
   schemasDir?: string;
   marketplaceUrl?: string;
   allowLocalhostUpstreamsForTests?: boolean;
+  allowLoopbackNodes?: boolean;
+  dnsLookup?: DnsLookupFn;
   fetchImpl?: typeof fetch;
   upstreamTls?: UpstreamTlsOptions;
   maxBackupUncompressedBytes?: number;
@@ -326,6 +338,12 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     options.schemasDir ?? path.resolve(import.meta.dirname, '../../schemas'),
   );
   const allowLocalhostUpstreamsForTests = Boolean(options.allowLocalhostUpstreamsForTests);
+  const effectiveAllowLocalhostUpstreams =
+    options.allowLocalhostUpstreamsForTests !== undefined
+      ? Boolean(options.allowLocalhostUpstreamsForTests)
+      : allowLocalOfficialUpstreams();
+  const allowLoopbackNodes = options.allowLoopbackNodes;
+  const dnsLookup = options.dnsLookup;
   const rawExplicitMarketplaceUrl =
     (options.marketplaceUrl ?? process.env.BIFROST_MARKETPLACE_URL)?.trim() || undefined;
   const explicitMarketplaceUrl =
@@ -339,11 +357,21 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   const nowSeconds = () => Math.floor(now() / 1000);
 
   // Backward compatibility: if marketplaceUrl is explicitly passed (e.g., tests or env override),
-  // configure and enable the official source to point to that URL. Normal startup keeps official opt-in (enabled = 0).
+  // validate it against SSRF rules before configuring and enabling the official source.
   if (explicitMarketplaceUrl) {
+    const mpValidation = validateMarketplaceSourceUrlSync(explicitMarketplaceUrl, {
+      allowLocalhostForTests: effectiveAllowLocalhostUpstreams,
+    });
+    if (!mpValidation.ok) {
+      throw new UpstreamSsrfError(
+        `Invalid BIFROST_MARKETPLACE_URL: ${mpValidation.error}`,
+      );
+    }
+    const validatedMarketplaceUrl = mpValidation.url;
+
     const conflictingSource = db
       .prepare(`SELECT id FROM marketplace_sources WHERE url = ? AND id != ?`)
-      .get(explicitMarketplaceUrl, OFFICIAL_MARKETPLACE_SOURCE_ID) as
+      .get(validatedMarketplaceUrl, OFFICIAL_MARKETPLACE_SOURCE_ID) as
       | { id: string }
       | undefined;
 
@@ -362,7 +390,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       ).run(
         OFFICIAL_MARKETPLACE_SOURCE_ID,
         OFFICIAL_MARKETPLACE_SOURCE_NAME,
-        explicitMarketplaceUrl,
+        validatedMarketplaceUrl,
         nowSeconds(),
       );
     }
@@ -782,6 +810,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
     const catalog = await fetchAndMergeMarketplaceCatalog(db, {
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       forceRefresh,
       nowSec,
       bundledDir: resolvedSchemasDir,
@@ -820,7 +850,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
       },
       nowSec,
-      { allowLocalhostForTests: allowLocalhostUpstreamsForTests },
+      { allowLocalhostForTests: allowLocalhostUpstreamsForTests, dnsLookup },
     );
 
     if (!result.ok) {
@@ -1029,9 +1059,25 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       manifest.adapter?.healthPath
     ) {
       try {
+        if (!isSafeRelativeEndpointPath(manifest.adapter.healthPath)) {
+          throw new UpstreamSsrfError('Invalid adapter healthPath: expected a strict relative path.');
+        }
         const parsedAdapter = new URL(adapterUrl);
-        const healthUrl = new URL(manifest.adapter.healthPath, parsedAdapter.origin).href;
-        const hRes = await fetchImpl(healthUrl, { method: 'GET', redirect: 'error' });
+        const healthUrlObj = new URL(manifest.adapter.healthPath, parsedAdapter.origin);
+        if (healthUrlObj.origin !== parsedAdapter.origin) {
+          throw new UpstreamSsrfError('Adapter healthPath cannot change origin from adapterUrl.');
+        }
+        const hRes = await safeFetch(
+          healthUrlObj.href,
+          { method: 'GET', redirect: 'error' },
+          {
+            mode: 'experimental-adapter',
+            allowLocalhost: effectiveAllowLocalhostUpstreams,
+            fetchImpl,
+            dnsLookup,
+            upstreamTls: options.upstreamTls,
+          },
+        );
         adapterHealth = { reachable: hRes.ok, status: hRes.status };
       } catch {
         adapterHealth = { reachable: false, status: null };
@@ -1127,10 +1173,13 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       typeof body.providerId === 'string' && body.providerId.trim().length > 0
         ? body.providerId.trim()
         : undefined;
+    const confirmSensitiveChange = body.confirmSensitiveChange === true;
 
     const nowSec = nowSeconds();
     const catalog = await fetchAndMergeMarketplaceCatalog(db, {
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       forceRefresh: true,
       nowSec,
       bundledDir: resolvedSchemasDir,
@@ -1140,26 +1189,64 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     const updated: string[] = [];
     const skipped: string[] = [];
 
-    let targetRows: Array<{ id: string; schema_json: string }>;
+    let targetRows: Array<{ id: string; schema_json: string; source_id: string | null }>;
     if (requestedProviderId) {
       const row = db
-        .prepare(`SELECT id, schema_json FROM providers WHERE id = ?`)
-        .get(requestedProviderId) as { id: string; schema_json: string } | undefined;
+        .prepare(`SELECT id, schema_json, source_id FROM providers WHERE id = ?`)
+        .get(requestedProviderId) as
+        | { id: string; schema_json: string; source_id: string | null }
+        | undefined;
       if (!row) {
         return c.json({ error: `Installed provider "${requestedProviderId}" not found.` }, 404);
       }
       targetRows = [row];
     } else {
       targetRows = db
-        .prepare(`SELECT id, schema_json FROM providers ORDER BY created_at ASC`)
-        .all() as Array<{ id: string; schema_json: string }>;
+        .prepare(`SELECT id, schema_json, source_id FROM providers ORDER BY created_at ASC`)
+        .all() as Array<{ id: string; schema_json: string; source_id: string | null }>;
     }
 
-    const updateStmt = db.prepare(
-      `UPDATE providers
-       SET name = ?, package_type = ?, models_source = ?, schema_json = ?, source_id = ?, manifest_hash = ?
-       WHERE id = ?`,
-    );
+    const extractOrigin = (rawUrl: string | undefined): string => {
+      if (typeof rawUrl !== 'string') return '';
+      try {
+        return new URL(rawUrl).origin;
+      } catch {
+        return rawUrl.trim();
+      }
+    };
+
+    const normalizeAuthPrefix = (auth: ProviderManifest['auth'] | undefined): string => {
+      if (!auth) return '';
+      if (auth.prefix !== undefined) return auth.prefix;
+      return auth.type === 'bearer' ? 'Bearer ' : '';
+    };
+
+    const normalizeExtraHeaders = (
+      extra: Record<string, string> | undefined,
+    ): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (!extra || typeof extra !== 'object') return out;
+      const entries = Object.entries(extra)
+        .map(([k, v]) => [k.trim().toLowerCase(), String(v)] as const)
+        .sort(([a], [b]) => a.localeCompare(b));
+      for (const [k, v] of entries) {
+        out[k] = v;
+      }
+      return out;
+    };
+
+    const pendingUpdates: Array<{
+      id: string;
+      nextManifest: ProviderManifest;
+      nextSourceId: string;
+      nextHash: string;
+    }> = [];
+    const sensitiveChanges: Array<{
+      providerId: string;
+      field: string;
+      previous: unknown;
+      next: unknown;
+    }> = [];
 
     for (const row of targetRows) {
       const entry = catalogById.get(row.id);
@@ -1180,17 +1267,119 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       const nextManifest = validation.manifest;
       const nextHash = computeManifestHash(nextManifest);
 
+      const keysCount = Number(
+        (
+          db
+            .prepare(`SELECT COUNT(*) AS count FROM provider_keys WHERE provider_id = ?`)
+            .get(row.id) as { count: number | bigint }
+        ).count,
+      );
+
+      if (keysCount >= 1 && !confirmSensitiveChange) {
+        let prevManifest: ProviderManifest | null = null;
+        try {
+          prevManifest = JSON.parse(row.schema_json) as ProviderManifest;
+        } catch {
+          prevManifest = null;
+        }
+
+        if (prevManifest) {
+          const prevOrigin = extractOrigin(prevManifest.baseUrl);
+          const nextOrigin = extractOrigin(nextManifest.baseUrl);
+          if (prevOrigin !== nextOrigin) {
+            sensitiveChanges.push({
+              providerId: row.id,
+              field: 'baseUrl',
+              previous: prevOrigin,
+              next: nextOrigin,
+            });
+          }
+
+          const prevHeader = (prevManifest.auth?.header ?? '').trim().toLowerCase();
+          const nextHeader = (nextManifest.auth?.header ?? '').trim().toLowerCase();
+          if (prevHeader !== nextHeader) {
+            sensitiveChanges.push({
+              providerId: row.id,
+              field: 'auth.header',
+              previous: prevManifest.auth?.header ?? '',
+              next: nextManifest.auth?.header ?? '',
+            });
+          }
+
+          const prevPrefix = normalizeAuthPrefix(prevManifest.auth);
+          const nextPrefix = normalizeAuthPrefix(nextManifest.auth);
+          if (prevPrefix !== nextPrefix || prevManifest.auth?.type !== nextManifest.auth?.type) {
+            sensitiveChanges.push({
+              providerId: row.id,
+              field: 'auth.prefix',
+              previous: prevPrefix,
+              next: nextPrefix,
+            });
+          }
+
+          const prevExtra = normalizeExtraHeaders(prevManifest.auth?.extraHeaders);
+          const nextExtra = normalizeExtraHeaders(nextManifest.auth?.extraHeaders);
+          if (JSON.stringify(prevExtra) !== JSON.stringify(nextExtra)) {
+            sensitiveChanges.push({
+              providerId: row.id,
+              field: 'auth.extraHeaders',
+              previous: prevExtra,
+              next: nextExtra,
+            });
+          }
+        }
+
+        const prevSourceId = row.source_id ?? null;
+        const nextSourceId = entry.sourceId ?? null;
+        if (prevSourceId !== nextSourceId) {
+          sensitiveChanges.push({
+            providerId: row.id,
+            field: 'sourceId',
+            previous: prevSourceId,
+            next: nextSourceId,
+          });
+        }
+      }
+
+      pendingUpdates.push({
+        id: row.id,
+        nextManifest,
+        nextSourceId: entry.sourceId,
+        nextHash,
+      });
+    }
+
+    if (sensitiveChanges.length > 0 && !confirmSensitiveChange) {
+      return c.json(
+        {
+          code: 'MANIFEST_SENSITIVE_CHANGE',
+          requiresConfirmation: true,
+          changes: sensitiveChanges,
+          message:
+            'Manifest update modifies sensitive destination, authentication, or source fields for a provider with registered API keys. Re-submit with confirmSensitiveChange: true to apply.',
+        },
+        409,
+      );
+    }
+
+    const updateStmt = db.prepare(
+      `UPDATE providers
+       SET name = ?, package_type = ?, models_source = ?, schema_json = ?, source_id = ?, manifest_hash = ?
+       WHERE id = ?`,
+    );
+
+    for (const item of pendingUpdates) {
       // In-place update ONLY on `providers` — NEVER touches `provider_keys`, `models`, or `usage_logs`.
       updateStmt.run(
-        nextManifest.name,
-        nextManifest.packageType,
-        nextManifest.modelsSource,
-        JSON.stringify(nextManifest),
-        entry.sourceId,
-        nextHash,
-        row.id,
+        item.nextManifest.name,
+        item.nextManifest.packageType,
+        item.nextManifest.modelsSource,
+        JSON.stringify(item.nextManifest),
+        item.nextSourceId,
+        item.nextHash,
+        item.id,
       );
-      updated.push(row.id);
+      updated.push(item.id);
     }
 
     writeSystemLog(
@@ -1940,6 +2129,10 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       });
     }
 
+    const upstreamMode =
+      provRow.package_type === 'experimental-adapter'
+        ? ('experimental-adapter' as const)
+        : ('official-json' as const);
     const effectiveBaseUrl =
       provRow.package_type === 'experimental-adapter' &&
       typeof provRow.adapter_url === 'string' &&
@@ -1950,7 +2143,51 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       typeof manifest.modelsEndpoint === 'string' && manifest.modelsEndpoint.trim().length > 0
         ? manifest.modelsEndpoint.trim()
         : '/models';
-    const targetUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}${modelsPath.startsWith('/') ? modelsPath : `/${modelsPath}`}`;
+    if (!isSafeRelativeEndpointPath(modelsPath)) {
+      return c.json(
+        {
+          ok: false,
+          httpStatus: null,
+          latencyMs: 0,
+          status: currentKeyStatus,
+          message: 'Manifest modelsEndpoint must be a strict relative path starting with "/".',
+        },
+        400,
+      );
+    }
+    let targetUrl: string;
+    try {
+      const baseParsed = new URL(effectiveBaseUrl);
+      const targetParsed = new URL(`${effectiveBaseUrl.replace(/\/+$/, '')}${modelsPath}`);
+      if (targetParsed.origin !== baseParsed.origin) {
+        return c.json(
+          {
+            ok: false,
+            httpStatus: null,
+            latencyMs: 0,
+            status: currentKeyStatus,
+            message: 'Manifest modelsEndpoint cannot change origin from baseUrl.',
+          },
+          400,
+        );
+      }
+      targetUrl = assertSafeUpstreamUrlSync(targetParsed.href, {
+        mode: upstreamMode,
+        allowLocalhost: effectiveAllowLocalhostUpstreams,
+      });
+    } catch (err) {
+      return c.json(
+        {
+          ok: false,
+          httpStatus: null,
+          latencyMs: 0,
+          status: currentKeyStatus,
+          message:
+            err instanceof Error ? err.message : 'Upstream test URL blocked by SSRF policy.',
+        },
+        400,
+      );
+    }
 
     let rawSecret: string;
     try {
@@ -2002,12 +2239,22 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           options.upstreamTls,
         );
       } else {
-        res = await fetchImpl(targetUrl, {
-          method: 'GET',
-          headers,
-          redirect: 'error',
-          signal: AbortSignal.timeout(8000),
-        });
+        res = await safeFetch(
+          targetUrl,
+          {
+            method: 'GET',
+            headers,
+            redirect: 'error',
+            signal: AbortSignal.timeout(8000),
+          },
+          {
+            mode: upstreamMode,
+            allowLocalhost: effectiveAllowLocalhostUpstreams,
+            fetchImpl,
+            dnsLookup,
+            upstreamTls: options.upstreamTls,
+          },
+        );
       }
 
       const latencyMs = Math.max(0, now() - startMs);
@@ -2031,9 +2278,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       }
 
       const rawText = await res.text().catch(() => '');
-      const safeSnippet = redactSecretsInText(rawText.slice(0, 160))
-        .split(rawSecret)
-        .join('[REDACTED]');
+      const safeSnippet = redactSecretsInText(rawText, [rawSecret]).slice(0, 160);
       const errorMessage = safeSnippet
         ? `Upstream returned HTTP ${res.status}: ${safeSnippet}`
         : `Upstream returned HTTP ${res.status}.`;
@@ -2063,7 +2308,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     } catch (err) {
       const latencyMs = Math.max(0, now() - startMs);
       const rawErr = err instanceof Error ? err.message : 'Upstream key test failed.';
-      const safeMsg = redactSecretsInText(rawErr).split(rawSecret).join('[REDACTED]');
+      const safeMsg = redactSecretsInText(rawErr, [rawSecret]);
       const nextStatus = currentKeyStatus === 'active' ? 'rate_limited' : currentKeyStatus;
 
       db.prepare(`UPDATE provider_keys SET status = ?, last_error = ? WHERE id = ?`).run(
@@ -2132,6 +2377,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       drainingKeys: registry.getDrainingKeys(),
       drainingProviders: registry.getDrainingProviders(),
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       upstreamTls: options.upstreamTls,
       nowSec: nowSeconds(),
     });
@@ -2773,16 +3020,16 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json({ error: 'Node mode must be "tailscale" or "public_ip".' }, 400);
     }
 
-    const parsedEndpoint = parseNodeEndpoint(rawEndpoint);
-    if (!parsedEndpoint) {
+    const endpointCheck = validateNodeEndpoint(rawEndpoint, mode, { allowLoopbackNodes });
+    if (!endpointCheck.valid) {
       return c.json(
         {
-          error:
-            'Invalid node endpoint. Expected "<host>:<port>" or "<host>" (default port 9443).',
+          error: endpointCheck.error,
         },
         400,
       );
     }
+    const parsedEndpoint = endpointCheck.parsed;
 
     let tlsFingerprint: string | null = null;
     if (typeof body.tlsFingerprint === 'string' && body.tlsFingerprint.trim().length > 0) {
@@ -3968,6 +4215,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       masterKey,
       registry,
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       upstreamTls: options.upstreamTls,
       now,
       userId: user.id,
@@ -4080,6 +4329,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       masterKey,
       registry,
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       upstreamTls: options.upstreamTls,
       now,
       userId: user.id,
