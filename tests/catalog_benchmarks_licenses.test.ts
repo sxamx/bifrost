@@ -208,6 +208,44 @@ describe('Ola 6 — Benchmarks Matching (Nemotron & Short Models), Licenses, Cac
       });
       assert.equal(m112.lmarena, null);
 
+      // 8b. Dense sizes & distinct MoE sizes NEVER collide (qwen2.5-omni-3b vs 7b, nemotron-3-super-49b vs 120b-a12b, 200b-a20b vs 120b-a12b)
+      const sizeGuardSnap = filterLmArenaPayload(
+        {
+          rows: [
+            { row: { model_name: 'qwen2.5-omni-7b', score: 0.18 } },
+            { row: { model_name: 'nvidia/nemotron-3-super-120b-a12b', score: 0.27 } },
+          ],
+        },
+        '2026-11-26T00:00:00.000Z',
+      );
+      writeExternalCache(db, CACHE_KEY_LMARENA_AGENT, sizeGuardSnap, null, nowSec);
+
+      const qwenOmni3b = getCachedModelBenchmarks(db, {
+        canonicalModelId: 'qwen/qwen2.5-omni-3b',
+        modelId: 'qwen/qwen2.5-omni-3b',
+      });
+      assert.equal(qwenOmni3b.lmarena, null, 'qwen2.5-omni-3b must NOT match qwen2.5-omni-7b');
+
+      const nemotronSuper49b = getCachedModelBenchmarks(db, {
+        canonicalModelId: 'nvidia/nemotron-3-super-49b',
+        modelId: 'nvidia/nemotron-3-super-49b',
+      });
+      assert.equal(
+        nemotronSuper49b.lmarena,
+        null,
+        'nvidia/nemotron-3-super-49b must NOT collide with nvidia/nemotron-3-super-120b-a12b',
+      );
+
+      const nemotronSuper200b = getCachedModelBenchmarks(db, {
+        canonicalModelId: 'nvidia/nemotron-3-super-200b-a20b',
+        modelId: 'nvidia/nemotron-3-super-200b-a20b',
+      });
+      assert.equal(
+        nemotronSuper200b.lmarena,
+        null,
+        'distinct MoE sizes (200b-a20b vs 120b-a12b) must NOT collide via secondary keys',
+      );
+
       // 9. Exact match takes priority over secondary quant-stripped match
       const exactPlusQuantSnap = filterLmArenaPayload(
         {
@@ -253,6 +291,29 @@ describe('Ola 6 — Benchmarks Matching (Nemotron & Short Models), Licenses, Cac
       });
       assert.deepEqual(fetchedOffsets, [0, 100, 200]);
       assert.equal(paginatedSnap?.entries.length, 3);
+
+      // 12. Truncated pagination (failure on offset >= 100) must NOT persist page-0 ETag
+      const truncSnap = await syncLmArenaAgentBenchmarks(db, {
+        forceRefresh: true,
+        nowSec: nowSec + 20,
+        fetchFn: async (input) => {
+          const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+          const offset = Number(url.searchParams.get('offset') ?? '0');
+          if (offset === 0) {
+            return new Response(
+              JSON.stringify({
+                num_rows_total: 200,
+                rows: [{ row: { model_name: 'model-page-0', score: 0.4, rank: 1 } }],
+              }),
+              { status: 200, headers: { etag: '"should-not-persist"' } },
+            );
+          }
+          return new Response('Upstream Timeout', { status: 504 });
+        },
+      });
+      assert.equal(truncSnap?.entries.length, 1);
+      const cachedTrunc = readExternalCache(db, CACHE_KEY_LMARENA_AGENT);
+      assert.equal(cachedTrunc?.etag, null, 'Truncated LMArena snapshot must not save ETag');
     } finally {
       db.close();
     }
@@ -463,6 +524,16 @@ describe('Ola 6 — Benchmarks Matching (Nemotron & Short Models), Licenses, Cac
             family: 'nemotron-3.5',
             open_weights: true,
           },
+          'qwen/qwen2.5-omni-7b': {
+            id: 'qwen/qwen2.5-omni-7b',
+            name: 'Qwen 2.5 Omni 7B',
+            cost: { input: 0.3, output: 0.9 },
+          },
+          'nvidia/nemotron-3-super-120b-a12b': {
+            id: 'nvidia/nemotron-3-super-120b-a12b',
+            name: 'Nemotron 3 Super 120B A12B',
+            cost: { input: 0.5, output: 1.5 },
+          },
         },
       };
 
@@ -491,6 +562,39 @@ describe('Ola 6 — Benchmarks Matching (Nemotron & Short Models), Licenses, Cac
       );
       assert.equal(moeLinkedLongToShort.family, 'nemotron-3.5');
       assert.equal(moeLinkedLongToShort.openWeights, true);
+
+      // Negative guards: dense sizes, distinct MoE sizes, and conflicting vendors must NOT cross-link
+      const qwen3bEnriched = resolveCanonicalAndEnrichModel(
+        'openrouter',
+        'qwen/qwen2.5-omni-3b',
+        snapshot,
+      );
+      assert.equal(qwen3bEnriched.canonicalModelId, null);
+      assert.deepEqual(qwen3bEnriched.priceUsdPerMillion, { input: null, output: null });
+
+      const super49bEnriched = resolveCanonicalAndEnrichModel(
+        'nvidia-nim',
+        'nvidia/nemotron-3-super-49b',
+        snapshot,
+      );
+      assert.equal(super49bEnriched.canonicalModelId, null);
+      assert.deepEqual(super49bEnriched.priceUsdPerMillion, { input: null, output: null });
+
+      const super200bEnriched = resolveCanonicalAndEnrichModel(
+        'nvidia-nim',
+        'nvidia/nemotron-3-super-200b-a20b',
+        snapshot,
+      );
+      assert.equal(super200bEnriched.canonicalModelId, null);
+      assert.deepEqual(super200bEnriched.priceUsdPerMillion, { input: null, output: null });
+
+      const crossVendorEnriched = resolveCanonicalAndEnrichModel(
+        'openrouter',
+        'acme/nemotron-3.5-super-vl',
+        snapshot,
+      );
+      assert.equal(crossVendorEnriched.canonicalModelId, null);
+      assert.deepEqual(crossVendorEnriched.priceUsdPerMillion, { input: null, output: null });
 
       // Optional models/ prefix stripping (Google AI Studio)
       const googleModel = resolveCanonicalAndEnrichModel(

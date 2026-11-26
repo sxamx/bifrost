@@ -201,7 +201,7 @@ if [[ -f "${INSTALL_DIR}/panel/package-lock.json" ]]; then
 else
   NODE_ENV=development npm --prefix "${INSTALL_DIR}/panel" install
 fi
-NODE_ENV=development npm --prefix "${INSTALL_DIR}/panel" run build
+NODE_ENV=production npm --prefix "${INSTALL_DIR}/panel" run build
 rm -rf "${INSTALL_DIR}/panel/node_modules"
 
 log "Instalando dependencias y compilando núcleo (${INSTALL_DIR}/core)..."
@@ -210,7 +210,7 @@ if [[ -f "${INSTALL_DIR}/core/package-lock.json" ]]; then
 else
   NODE_ENV=development npm --prefix "${INSTALL_DIR}/core" install
 fi
-NODE_ENV=development npm --prefix "${INSTALL_DIR}/core" run build
+npm --prefix "${INSTALL_DIR}/core" run build
 npm --prefix "${INSTALL_DIR}/core" prune --omit=dev
 
 chown -R "${BIFROST_USER}:${BIFROST_GROUP}" "${INSTALL_DIR}"
@@ -262,5 +262,13 @@ systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
 
+EFFECTIVE_PORT="${PORT}"
+if [[ "${PORT_EXPLICIT}" -eq 0 && -f "${ENV_FILE}" ]]; then
+  ENV_PORT="$(grep -E '^[[:space:]]*PORT=' "${ENV_FILE}" | tail -n 1 | cut -d '=' -f 2- | tr -d '[:space:]"'\''')" || true
+  if [[ "${ENV_PORT}" =~ ^[0-9]+$ ]] && [[ "${ENV_PORT}" -ge 1 && "${ENV_PORT}" -le 65535 ]]; then
+    EFFECTIVE_PORT="${ENV_PORT}"
+  fi
+fi
+
 log "Bifrost instalado y ejecutándose correctamente."
-log "Panel y API disponibles en: http://localhost:${PORT}"
+log "Panel y API disponibles en: http://localhost:${EFFECTIVE_PORT}"

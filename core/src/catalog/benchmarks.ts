@@ -723,6 +723,7 @@ export async function syncLmArenaAgentBenchmarks(
 
     const totalRaw =
       firstRaw && typeof firstRaw === 'object' ? firstRaw.num_rows_total : undefined;
+    let paginationIncomplete = false;
     if (typeof totalRaw === 'number' && Number.isFinite(totalRaw) && totalRaw > 100) {
       const pageSize = 100;
       const cappedTotal = Math.min(Math.floor(totalRaw), MAX_LMARENA_PAGES * pageSize);
@@ -739,15 +740,18 @@ export async function syncLmArenaAgentBenchmarks(
             signal: AbortSignal.timeout(4000),
           });
           if (!pageRes.ok) {
+            paginationIncomplete = true;
             break;
           }
           const pageRaw = (await pageRes.json()) as Record<string, unknown> | null;
           if (pageRaw && typeof pageRaw === 'object' && Array.isArray(pageRaw.rows) && pageRaw.rows.length > 0) {
             allRows.push(...pageRaw.rows);
           } else {
+            paginationIncomplete = true;
             break;
           }
         } catch {
+          paginationIncomplete = true;
           break;
         }
       }
@@ -757,7 +761,8 @@ export async function syncLmArenaAgentBenchmarks(
       { rows: allRows },
       new Date(nowSec * 1000).toISOString(),
     );
-    writeExternalCache(db, CACHE_KEY_LMARENA_AGENT, filtered, res.headers.get('etag'), nowSec);
+    const etagToStore = paginationIncomplete ? null : res.headers.get('etag');
+    writeExternalCache(db, CACHE_KEY_LMARENA_AGENT, filtered, etagToStore, nowSec);
     return filtered;
   } catch {
     return existing ? existing.data : null;
@@ -887,9 +892,9 @@ const KNOWN_ORG_PREFIX_RE =
   /^(?:nvidia|meta|google|openai|anthropic|mistralai|deepseek|qwen)[:\s-]+/i;
 const KNOWN_ORG_COLON_PREFIX_RE =
   /^(?:nvidia|meta|google|openai|anthropic|mistralai|deepseek|qwen)\s*:\s*/i;
-const BENCHMARK_TIER_QUALIFIER_RE = /\b(?:ultra|super|lightning|omni|pro|mini|flash)\b/i;
+const BENCHMARK_TIER_QUALIFIER_RE = /\b(?:ultra|super|lightning)\b/i;
 const BENCHMARK_MOE_SUFFIX_RE =
-  /[-_\s]+\d+(?:\.\d+)?b(?:[-_\s]+a\d+(?:\.\d+)?b)?(?:[-_\s]+reasoning)?$/i;
+  /[-_\s]+\d+(?:\.\d+)?b[-_\s]+a\d+(?:\.\d+)?b(?:[-_\s]+reasoning)?$/i;
 
 function isAllowedMatchToken(token: string, allowShortKnownId: boolean): boolean {
   if (token.length >= 3) return true;
@@ -931,7 +936,7 @@ function stripTieredMoeSuffix(raw: string): string | null {
 function extractMatchCandidates(
   idOrName: string,
   allowShortKnownId: boolean,
-): { primary: string[]; secondary: string[] } {
+): { primary: string[]; quantSecondary: string[]; moeSecondary: string[] } {
   const base = idOrName
     .trim()
     .toLowerCase()
@@ -942,7 +947,7 @@ function extractMatchCandidates(
     .trim();
 
   if (!base) {
-    return { primary: [], secondary: [] };
+    return { primary: [], quantSecondary: [], moeSecondary: [] };
   }
 
   const variants: string[] = [base];
@@ -960,7 +965,8 @@ function extractMatchCandidates(
   }
 
   const primarySet = new Set<string>();
-  const secondarySet = new Set<string>();
+  const quantSecondarySet = new Set<string>();
+  const moeSecondarySet = new Set<string>();
 
   for (const variant of variants) {
     const primaryTok = normalizeToMatchToken(variant);
@@ -972,7 +978,7 @@ function extractMatchCandidates(
     if (quantStripped && quantStripped !== variant) {
       const quantTok = normalizeToMatchToken(quantStripped);
       if (isAllowedMatchToken(quantTok, allowShortKnownId) && !primarySet.has(quantTok)) {
-        secondarySet.add(quantTok);
+        quantSecondarySet.add(quantTok);
       }
     }
 
@@ -980,15 +986,20 @@ function extractMatchCandidates(
     const moeStripped = stripTieredMoeSuffix(moeSource);
     if (moeStripped) {
       const moeTok = normalizeToMatchToken(moeStripped);
-      if (isAllowedMatchToken(moeTok, allowShortKnownId) && !primarySet.has(moeTok)) {
-        secondarySet.add(moeTok);
+      if (
+        isAllowedMatchToken(moeTok, allowShortKnownId) &&
+        !primarySet.has(moeTok) &&
+        !quantSecondarySet.has(moeTok)
+      ) {
+        moeSecondarySet.add(moeTok);
       }
     }
   }
 
   return {
     primary: Array.from(primarySet),
-    secondary: Array.from(secondarySet),
+    quantSecondary: Array.from(quantSecondarySet),
+    moeSecondary: Array.from(moeSecondarySet),
   };
 }
 
@@ -1030,7 +1041,8 @@ export function getCachedModelBenchmarks(
   modelLookup: { canonicalModelId?: string | null; modelId: string; name?: string | null },
 ) {
   const primaryKeys = new Set<string>();
-  const secondaryKeys = new Set<string>();
+  const quantSecondaryKeys = new Set<string>();
+  const moeSecondaryKeys = new Set<string>();
 
   const lookupSources: Array<{ value: string | null | undefined; fromId: boolean }> = [
     { value: modelLookup.canonicalModelId, fromId: true },
@@ -1044,21 +1056,28 @@ export function getCachedModelBenchmarks(
     for (const p of extracted.primary) {
       primaryKeys.add(p);
     }
-    for (const s of extracted.secondary) {
-      secondaryKeys.add(s);
+    for (const q of extracted.quantSecondary) {
+      quantSecondaryKeys.add(q);
+    }
+    for (const m of extracted.moeSecondary) {
+      moeSecondaryKeys.add(m);
     }
   }
-  // Ensure secondaryKeys never shadow primaryKeys
+  // Ensure secondary sets never shadow higher-specificity keys
   for (const p of primaryKeys) {
-    secondaryKeys.delete(p);
+    quantSecondaryKeys.delete(p);
+    moeSecondaryKeys.delete(p);
+  }
+  for (const q of quantSecondaryKeys) {
+    moeSecondaryKeys.delete(q);
   }
 
   /**
    * Returns match quality tier:
    *  1 = exact primary-to-primary
-   *  2 = primary-to-secondary or secondary-to-primary
-   *  3 = secondary-to-secondary
-   *  0 = no match
+   *  2 = primary-to-secondary or secondary-to-primary (size-stripped MoE only ever matches un-sized primary!)
+   *  3 = quantSecondary-to-quantSecondary (same exact parameter size, different quant/date suffix)
+   *  0 = no match (moeSecondary NEVER matches moeSecondary, preventing sizeA <-> sizeB collisions)
    */
   const matchTier = (...candidates: Array<string | null | undefined>): number => {
     let bestTier = 0;
@@ -1069,15 +1088,20 @@ export function getCachedModelBenchmarks(
         if (primaryKeys.has(p)) {
           return 1;
         }
-        if (secondaryKeys.has(p) && (bestTier === 0 || bestTier > 2)) {
+        if ((quantSecondaryKeys.has(p) || moeSecondaryKeys.has(p)) && (bestTier === 0 || bestTier > 2)) {
           bestTier = 2;
         }
       }
-      for (const s of extracted.secondary) {
-        if (primaryKeys.has(s) && (bestTier === 0 || bestTier > 2)) {
+      for (const q of extracted.quantSecondary) {
+        if (primaryKeys.has(q) && (bestTier === 0 || bestTier > 2)) {
           bestTier = 2;
-        } else if (secondaryKeys.has(s) && bestTier === 0) {
+        } else if (quantSecondaryKeys.has(q) && bestTier === 0) {
           bestTier = 3;
+        }
+      }
+      for (const m of extracted.moeSecondary) {
+        if (primaryKeys.has(m) && (bestTier === 0 || bestTier > 2)) {
+          bestTier = 2;
         }
       }
     }

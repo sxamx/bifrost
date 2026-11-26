@@ -226,8 +226,8 @@ function normalizeProviderAliases(providerId: string): string[] {
   return [slug];
 }
 
-const TIER_QUALIFIER_RE = /\b(?:ultra|super|lightning|omni|pro|mini|flash)\b/i;
-const MOE_SUFFIX_RE = /-\d+(?:\.\d+)?b(?:-a\d+(?:\.\d+)?b)?(?:-reasoning)?$/i;
+const TIER_QUALIFIER_RE = /\b(?:ultra|super|lightning)\b/i;
+const MOE_SUFFIX_RE = /-\d+(?:\.\d+)?b-a\d+(?:\.\d+)?b(?:-reasoning)?$/i;
 
 function stripMoeSuffixIfTiered(id: string): string | null {
   const slashIdx = id.indexOf('/');
@@ -400,28 +400,44 @@ export function resolveCanonicalAndEnrichModel(
     }
   }
 
-  // Bidirectional tiered MoE alias link (e.g., `nemotron-3.5-super-vl` <-> `nemotron-3.5-super-vl-120b-a12b`)
+  // Bidirectional tiered MoE alias link (short unstripped <-> long explicit MoE, e.g.,
+  // `nvidia/nemotron-3.5-super-vl` <-> `nvidia/nemotron-3.5-super-vl-120b-a12b`).
+  // Never links sizeA <-> sizeB and never ignores conflicting vendor/ prefixes.
   if (!canonicalHit || !providerHit) {
-    const tieredLookupSet = new Set<string>();
-    for (const cand of candidateCanonicalIds) {
-      if (TIER_QUALIFIER_RE.test(cand)) {
-        tieredLookupSet.add(cand.toLowerCase());
-        const slashIdx = cand.indexOf('/');
-        if (slashIdx > 0) {
-          tieredLookupSet.add(cand.slice(slashIdx + 1).toLowerCase());
-        }
+    const parseVendorAndSlug = (raw: string): { vendor: string | null; slug: string } => {
+      const lower = raw.toLowerCase();
+      const idx = lower.indexOf('/');
+      if (idx > 0) {
+        return { vendor: lower.slice(0, idx), slug: lower.slice(idx + 1) };
       }
-    }
+      return { vendor: null, slug: lower };
+    };
 
-    if (tieredLookupSet.size > 0) {
+    const shortTieredCandidates = baseCandidatesSnapshot
+      .filter((cand) => {
+        const { slug } = parseVendorAndSlug(cand);
+        return TIER_QUALIFIER_RE.test(slug) && !MOE_SUFFIX_RE.test(slug);
+      })
+      .map(parseVendorAndSlug);
+
+    const matchesShortTieredCandidate = (strippedKey: string): boolean => {
+      const keyParts = parseVendorAndSlug(strippedKey);
+      for (const cand of shortTieredCandidates) {
+        if (keyParts.slug !== cand.slug) continue;
+        if (keyParts.vendor !== null && cand.vendor !== null && keyParts.vendor !== cand.vendor) {
+          continue;
+        }
+        return true;
+      }
+      return false;
+    };
+
+    if (shortTieredCandidates.length > 0) {
       if (!canonicalHit) {
         for (const [canonKey, canonEntry] of Object.entries(snapshot.canonical)) {
           const strippedKey = stripMoeSuffixIfTiered(canonKey);
           if (!strippedKey) continue;
-          const lowerStripped = strippedKey.toLowerCase();
-          const slashIdx = lowerStripped.indexOf('/');
-          const slugOnly = slashIdx > 0 ? lowerStripped.slice(slashIdx + 1) : lowerStripped;
-          if (tieredLookupSet.has(lowerStripped) || tieredLookupSet.has(slugOnly)) {
+          if (matchesShortTieredCandidate(strippedKey)) {
             canonicalHit = canonEntry;
             if (canonicalModelId === null) {
               canonicalModelId = canonKey;
@@ -433,7 +449,7 @@ export function resolveCanonicalAndEnrichModel(
 
       if (!providerHit) {
         const searchVendors = new Set<string>(providerAliases);
-        for (const cand of candidateCanonicalIds) {
+        for (const cand of baseCandidatesSnapshot) {
           const slashIdx = cand.indexOf('/');
           if (slashIdx > 0) {
             searchVendors.add(cand.slice(0, slashIdx).toLowerCase());
@@ -445,10 +461,7 @@ export function resolveCanonicalAndEnrichModel(
           for (const [mKey, mEntry] of Object.entries(modelsMap)) {
             const strippedKey = stripMoeSuffixIfTiered(mKey);
             if (!strippedKey) continue;
-            const lowerStripped = strippedKey.toLowerCase();
-            const slashIdx = lowerStripped.indexOf('/');
-            const slugOnly = slashIdx > 0 ? lowerStripped.slice(slashIdx + 1) : lowerStripped;
-            if (tieredLookupSet.has(lowerStripped) || tieredLookupSet.has(slugOnly)) {
+            if (matchesShortTieredCandidate(strippedKey)) {
               providerHit = mEntry;
               if (canonicalModelId === null) {
                 canonicalModelId = mKey;
