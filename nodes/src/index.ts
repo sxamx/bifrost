@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import {
   type BifrostNodeOptions,
   DEFAULT_NODE_PORT,
+  NODE_AGENT_VERSION,
   type NodeMode,
   createBifrostNodeServer
 } from './server.js';
@@ -115,7 +116,7 @@ export function parseCliArgs(argv: string[], env: NodeJS.ProcessEnv = process.en
 }
 
 function printHelp(): void {
-  console.log(`Bifrost Egress Node Agent (v0.1.0)
+  console.log(`Bifrost Egress Node Agent (v${NODE_AGENT_VERSION})
 
 Usage:
   bifrost-node [options]

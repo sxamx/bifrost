@@ -7,6 +7,7 @@ import { afterEach, describe, it } from 'node:test';
 import { createApp } from '../core/src/app.js';
 import { decryptSecret, hashPassword } from '../core/src/crypto.js';
 import { openDatabase } from '../core/src/db.js';
+import { closeHttpServer, createOfflineFetch } from './helpers/test-app.js';
 
 const openServers: http.Server[] = [];
 
@@ -64,7 +65,7 @@ function createDeferred<T = void>() {
 afterEach(async () => {
   while (openServers.length > 0) {
     const srv = openServers.pop()!;
-    await new Promise<void>((resolve) => srv.close(() => resolve()));
+    await closeHttpServer(srv);
   }
 });
 
@@ -112,6 +113,7 @@ describe('Phase 2 Backend Acceptance Tests (HU-06, HU-06b, HU-06c, HU-07, HU-09,
           db,
           masterKey,
           marketplaceUrl: `${mockCatalog.url}/index.json`,
+          fetchImpl: createOfflineFetch(),
         });
 
         const setupRes = await app.request('/api/setup', {
@@ -149,6 +151,7 @@ describe('Phase 2 Backend Acceptance Tests (HU-06, HU-06b, HU-06c, HU-07, HU-09,
             db: dbOffline,
             masterKey,
             marketplaceUrl: 'http://127.0.0.1:1/unreachable-catalog.json',
+            fetchImpl: createOfflineFetch(),
           });
           const sRes = await offlineApp.request('/api/setup', {
             method: 'POST',
@@ -235,7 +238,7 @@ describe('Phase 2 Backend Acceptance Tests (HU-06, HU-06b, HU-06c, HU-07, HU-09,
       const masterKey = randomBytes(32);
 
       try {
-        const app = createApp({ db, masterKey });
+        const app = createApp({ db, masterKey, fetchImpl: createOfflineFetch() });
         const setupRes = await app.request('/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -435,7 +438,7 @@ describe('Phase 2 Backend Acceptance Tests (HU-06, HU-06b, HU-06c, HU-07, HU-09,
         });
 
         let clockMs = Date.parse('2026-11-17T18:00:00.000Z');
-        const app = createApp({ db, masterKey, now: () => clockMs });
+        const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
 
         const setupRes = await app.request('/api/setup', {
           method: 'POST',
@@ -747,7 +750,7 @@ describe('Phase 2 Backend Acceptance Tests (HU-06, HU-06b, HU-06c, HU-07, HU-09,
           res.end();
         });
 
-        const app = createApp({ db, masterKey });
+        const app = createApp({ db, masterKey, fetchImpl: createOfflineFetch() });
 
         // Setup admin + internal API key sk-bf-...
         const setupRes = await app.request('/api/setup', {
@@ -979,7 +982,7 @@ describe('Phase 2 Backend Acceptance Tests (HU-06, HU-06b, HU-06c, HU-07, HU-09,
           res.end();
         });
 
-        const app = createApp({ db, masterKey });
+        const app = createApp({ db, masterKey, fetchImpl: createOfflineFetch() });
 
         const setupRes = await app.request('/api/setup', {
           method: 'POST',

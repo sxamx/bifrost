@@ -7,6 +7,7 @@ import { afterEach, describe, it } from 'node:test';
 import { createApp } from '../core/src/app.js';
 import { encryptSecret } from '../core/src/crypto.js';
 import { openDatabase } from '../core/src/db.js';
+import { closeHttpServer, createOfflineFetch } from './helpers/test-app.js';
 
 const openServers: http.Server[] = [];
 
@@ -38,7 +39,7 @@ async function startMockHttpServer(
 afterEach(async () => {
   while (openServers.length > 0) {
     const srv = openServers.pop()!;
-    await new Promise<void>((resolve) => srv.close(() => resolve()));
+    await closeHttpServer(srv);
   }
 });
 
@@ -72,7 +73,7 @@ async function setupAdminAndProvider(options: {
   const app = createApp({
     db,
     masterKey,
-    fetchImpl: options.fetchImpl,
+    fetchImpl: createOfflineFetch(options.fetchImpl),
     now: options.now,
   });
 
@@ -589,7 +590,7 @@ describe('Bifrost v1.1 Features (P0-P2)', () => {
         assert.equal(keyAfterTest.last_error, null);
 
         // Unreachable node after server stops -> ok:false, latencyMs:null
-        await new Promise<void>((resolve) => mockNodeServer.server.close(() => resolve()));
+        await closeHttpServer(mockNodeServer.server);
         const downRes = await app.request(`http://localhost/api/nodes/${node.id}/test`, {
           method: 'POST',
           headers: { Cookie: adminCookie },
@@ -1214,7 +1215,7 @@ describe('Bifrost v1.1 Features (P0-P2)', () => {
           );
         }
       } finally {
-        await new Promise<void>((resolve) => mockNodeServer.server.close(() => resolve()));
+        await closeHttpServer(mockNodeServer.server);
         db.close();
       }
     });

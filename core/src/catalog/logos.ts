@@ -3,11 +3,14 @@ import {
   BIFROST_USER_AGENT,
   type FetchLike,
   readExternalCache,
+  readResponseBufferWithLimit,
+  touchExternalCacheTimestamp,
   writeExternalCache,
 } from './cache.js';
 
 export const MODELS_DEV_LOGOS_BASE_URL = 'https://models.dev/logos';
 export const LOGO_CACHE_TTL_SEC = 7 * 86400; // 7 days (persisted offline in SQLite)
+export const MAX_LOGO_DOWNLOAD_BYTES = 256 * 1024;
 
 export type ProviderLogoResult =
   | {
@@ -134,7 +137,7 @@ function decodeXmlEntities(input: string): string {
     .replace(/&gt;/gi, '>')
     .replace(/&amp;/gi, '&')
     // Strip ASCII control characters / zero-width chars used to obfuscate scheme names
-    .replace(/[\u0000-\u001f\u007f]+/g, '');
+    .replace(/[\u0000-\u001f\u007f\u200b-\u200d\ufeff]+/g, '');
 }
 
 /**
@@ -182,6 +185,7 @@ export function sanitizeAndMonochromeSvg(rawSvg: string): string | null {
   const openStack: string[] = [];
   let rootSvgOpened = false;
   let rootSvgClosed = false;
+  let ignoredNestedSvgDepth = 0;
 
   let tagMatch: RegExpExecArray | null;
   while ((tagMatch = TAG_RE.exec(svg)) !== null) {
@@ -203,13 +207,20 @@ export function sanitizeAndMonochromeSvg(rawSvg: string): string | null {
     if (canonicalTag === 'svg') {
       if (!isClosing) {
         if (rootSvgOpened) {
-          // Ignore nested <svg> openings to keep structure flat and predictable
+          // Ignore nested <svg> openings without letting their matching </svg> close the root
+          if (!isSelfClosing) {
+            ignoredNestedSvgDepth += 1;
+          }
           continue;
         }
         rootSvgOpened = true;
       } else {
         if (!rootSvgOpened) {
           return null;
+        }
+        if (ignoredNestedSvgDepth > 0) {
+          ignoredNestedSvgDepth -= 1;
+          continue;
         }
         while (openStack.length > 1) {
           const dangling = openStack.pop()!;
@@ -429,13 +440,26 @@ export async function getProviderLogo(
 
   try {
     const url = `${MODELS_DEV_LOGOS_BASE_URL}/${normalizedSlug}.svg`;
+    const headers: Record<string, string> = {
+      'User-Agent': BIFROST_USER_AGENT,
+      Accept: 'image/svg+xml,text/plain,*/*',
+    };
+    if (cached?.etag) {
+      headers['If-None-Match'] = cached.etag;
+    }
+
     const res = await fetchFn(url, {
-      headers: {
-        'User-Agent': BIFROST_USER_AGENT,
-        Accept: 'image/svg+xml,text/plain,*/*',
-      },
+      headers,
       signal: AbortSignal.timeout(3000),
     });
+
+    if (res.status === 304 && cached) {
+      touchExternalCacheTimestamp(db, cacheKey, nowSec);
+      if (!cached.data.hasLogo) {
+        return { hasLogo: false, slug: normalizedSlug, initial };
+      }
+      return cached.data;
+    }
 
     if (res.status === 404) {
       const notFoundResult: ProviderLogoResult = {
@@ -452,7 +476,8 @@ export async function getProviderLogo(
       return { hasLogo: false, slug: normalizedSlug, initial };
     }
 
-    const rawText = await res.text();
+    const rawBuf = await readResponseBufferWithLimit(res, MAX_LOGO_DOWNLOAD_BYTES);
+    const rawText = rawBuf.toString('utf8');
     const sanitized = sanitizeAndMonochromeSvg(rawText);
     if (!sanitized) {
       const invalidResult: ProviderLogoResult = {
