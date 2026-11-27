@@ -58,6 +58,7 @@ import {
   getUptime60Days,
   querySystemLogs,
   round2,
+  scrubSecretsFromText,
 } from './metrics/index.js';
 import {
   addMarketplaceSource,
@@ -109,6 +110,7 @@ import {
   checkUserDailyQuotaUtc,
   executeChatCompletions,
   executeEmbeddings,
+  parseRateLimitHeaders,
 } from './router.js';
 import {
   type ProviderManifest,
@@ -1200,7 +1202,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
               `SELECT m.full_id, m.provider_id
                FROM models m
                JOIN providers p ON p.id = m.provider_id
-               WHERE m.active = 1 AND p.enabled = 1`,
+               WHERE m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1`,
             )
             .all() as Array<{ full_id: string; provider_id: string }>)
         : (db
@@ -1211,7 +1213,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
                JOIN user_model_access uma
                  ON uma.user_id = ?
                 AND (uma.model_full_id = m.full_id OR uma.model_full_id = '*' OR uma.model_full_id = m.provider_id || '/*')
-               WHERE m.active = 1 AND p.enabled = 1`,
+               WHERE m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1`,
             )
             .all(user.id) as Array<{ full_id: string; provider_id: string }>);
 
@@ -1219,13 +1221,16 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       (m) => !isProviderOrAllKeysDraining(m.provider_id),
     ).length;
 
+    const nowSec = nowSeconds();
     const keysRow = db
       .prepare(
         `SELECT COUNT(*) AS count
          FROM internal_api_keys
-         WHERE user_id = ? AND revoked_at IS NULL`,
+         WHERE user_id = ?
+           AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?)`,
       )
-      .get(user.id) as { count: number | bigint } | undefined;
+      .get(user.id, nowSec) as { count: number | bigint } | undefined;
 
     return c.json({
       user: {
@@ -2420,7 +2425,9 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     let nextStatus = existingKey.status;
     let nextLastError = existingKey.last_error;
 
-    if (targetNode.status !== 'online') {
+    if (existingKey.status === 'disabled') {
+      nextStatus = 'disabled';
+    } else if (targetNode.status !== 'online') {
       nextStatus = 'no_node';
       nextLastError = `Assigned exit node "${targetNode.name}" is ${targetNode.status}`;
     } else if (existingKey.status === 'no_node') {
@@ -2795,11 +2802,22 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         }
       }
 
-      db.prepare(`UPDATE provider_keys SET status = ?, last_error = ? WHERE id = ?`).run(
-        nextStatus,
-        errorMessage,
-        keyId,
-      );
+      const failNowSec = nowSeconds();
+      if (nextStatus === 'rate_limited') {
+        const parsedRl = parseRateLimitHeaders(res.headers, failNowSec, manifest.rateLimitKind);
+        const resetAt = parsedRl.resetAt ?? failNowSec + 60;
+        db.prepare(
+          `UPDATE provider_keys
+           SET status = ?, last_error = ?, ratelimit_remaining = 0, ratelimit_reset_at = ?
+           WHERE id = ?`,
+        ).run(nextStatus, errorMessage, resetAt, keyId);
+      } else {
+        db.prepare(`UPDATE provider_keys SET status = ?, last_error = ? WHERE id = ?`).run(
+          nextStatus,
+          errorMessage,
+          keyId,
+        );
+      }
 
       return c.json({
         ok: false,
@@ -2814,11 +2832,21 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       const safeMsg = redactSecretsInText(rawErr, [rawSecret]);
       const nextStatus = currentKeyStatus === 'active' ? 'rate_limited' : currentKeyStatus;
 
-      db.prepare(`UPDATE provider_keys SET status = ?, last_error = ? WHERE id = ?`).run(
-        nextStatus,
-        safeMsg,
-        keyId,
-      );
+      const failNowSec = nowSeconds();
+      if (nextStatus === 'rate_limited') {
+        const resetAt = failNowSec + 60;
+        db.prepare(
+          `UPDATE provider_keys
+           SET status = ?, last_error = ?, ratelimit_remaining = 0, ratelimit_reset_at = ?
+           WHERE id = ?`,
+        ).run(nextStatus, safeMsg, resetAt, keyId);
+      } else {
+        db.prepare(`UPDATE provider_keys SET status = ?, last_error = ? WHERE id = ?`).run(
+          nextStatus,
+          safeMsg,
+          keyId,
+        );
+      }
 
       return c.json({
         ok: false,
@@ -3862,17 +3890,19 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     });
     const totalDailyLimit = summary.quotaToday.configuredDailyLimit;
     const quotaPercentageRemaining =
-      totalDailyLimit !== null && totalDailyLimit > 0
-        ? round2(
-            Math.max(
-              0,
-              Math.min(
-                100,
-                ((totalDailyLimit - summary.quotaToday.usedTokensToday) / totalDailyLimit) * 100,
+      summary.quotaToday.quotaPercentageRemaining !== undefined
+        ? summary.quotaToday.quotaPercentageRemaining
+        : totalDailyLimit !== null && totalDailyLimit > 0
+          ? round2(
+              Math.max(
+                0,
+                Math.min(
+                  100,
+                  ((totalDailyLimit - summary.quotaToday.usedTokensToday) / totalDailyLimit) * 100,
+                ),
               ),
-            ),
-          )
-        : null;
+            )
+          : null;
 
     return c.json({
       ...summary,
@@ -4827,6 +4857,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       modelId: modelRow.model_id,
       providerRow,
       requestBody: body,
+      signal: c.req.raw.signal,
     });
   });
 
@@ -4941,6 +4972,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       modelId: modelRow.model_id,
       providerRow,
       requestBody: body,
+      signal: c.req.raw.signal,
     });
   });
 
