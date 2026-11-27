@@ -956,6 +956,7 @@ describe('Ola 6 — Benchmarks Matching (Nemotron & Short Models), Licenses, Cac
   });
 
   it('validate-schemas.mjs validates marketplace-repo/index.json and rejects invalid manifests', async () => {
+    // @ts-expect-error ESM script without .d.ts declaration file
     const validatorModule = await import('../scripts/validate-schemas.mjs');
     const providerSchema = JSON.parse(
       fs.readFileSync(path.join(SCHEMAS_DIR, 'provider.schema.json'), 'utf8'),

@@ -15,26 +15,32 @@ dist
 build
 **/build
 *.tsbuildinfo
+**/*.tsbuildinfo
 coverage
+**/coverage
 *.log
+**/*.log
 
 # Datos locales, bases de datos y secretos (nunca entran al contexto Docker)
 data
 **/data
 secrets
+**/secrets
 .env
-*.env
-*.key
-*.enc
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-*.sqlite
-*.sqlite-wal
-*.sqlite-shm
-keys.json
-state.json
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+**/*.key
+**/*.enc
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+**/keys.json
+**/state.json
+**/*.pem
 
 # Sistema operativo
 .DS_Store

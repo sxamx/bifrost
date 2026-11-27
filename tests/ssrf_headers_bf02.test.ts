@@ -102,7 +102,7 @@ describe('Ola 1 Security Hardening — SSRF DNS/IP-pinning, Endpoint/Header Sani
 
     // Runtime defense-in-depth: legacy DB row with malicious absolute modelsEndpoint MUST NOT invoke fetchImpl or leak secret
     const tmpDir = makeTempDir();
-    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, env: {} });
+    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: '' });
     const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
     try {
       let fetchCalled = false;
@@ -222,7 +222,7 @@ describe('Ola 1 Security Hardening — SSRF DNS/IP-pinning, Endpoint/Header Sani
 
     // 2d. Startup BIFROST_MARKETPLACE_URL validation in createApp
     const tmpDir = makeTempDir();
-    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, env: {} });
+    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: '' });
     const db = openDatabase(path.join(tmpDir, 'startup-ssrf.db'));
     try {
 
@@ -502,7 +502,7 @@ describe('Ola 1 Security Hardening — SSRF DNS/IP-pinning, Endpoint/Header Sani
 
   it('4. POST /api/nodes blocks IMDS (169.254.169.254, 192.0.0.192, 100.100.100.200, fd00:ec2::254), 0.0.0.0/8, link-local, and enforces mode constraints', async () => {
     const tmpDir = makeTempDir();
-    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, env: {} });
+    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: '' });
     const db = openDatabase(path.join(tmpDir, 'nodes-ssrf.db'));
     try {
       const app = createApp({
@@ -587,7 +587,7 @@ describe('Ola 1 Security Hardening — SSRF DNS/IP-pinning, Endpoint/Header Sani
 
   it('5. BF-02: POST /api/marketplace/update-installed returns 409 MANIFEST_SENSITIVE_CHANGE when baseUrl/auth changes with registered keys, and applies with confirmSensitiveChange: true', async () => {
     const tmpDir = makeTempDir();
-    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, env: {} });
+    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: '' });
     const db = openDatabase(path.join(tmpDir, 'bf02.db'));
     try {
 
@@ -732,7 +732,7 @@ describe('Ola 1 Security Hardening — SSRF DNS/IP-pinning, Endpoint/Header Sani
     assert.ok(scrubbed.includes('[REDACTED]'));
 
     const tmpDir = makeTempDir();
-    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, env: {} });
+    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: '' });
     const db = openDatabase(path.join(tmpDir, 'bf04.db'));
     try {
 
@@ -921,7 +921,7 @@ describe('Ola 1 Security Hardening — SSRF DNS/IP-pinning, Endpoint/Header Sani
 
   it('8. B2: POST /api/nodes (public_ip) rejects octal, hex, and short-form obfuscated IPv4 endpoints', async () => {
     const tmpDir = makeTempDir();
-    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, env: {} });
+    const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: '' });
     const db = openDatabase(path.join(tmpDir, 'nodes-obfuscated.db'));
     try {
       const app = createApp({

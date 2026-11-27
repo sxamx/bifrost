@@ -5,15 +5,17 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: bifrost
+    init: true
     restart: unless-stopped
     stop_grace_period: 15s
     ports:
-      - "${BIFROST_PORT:-8080}:8080"
+      - "${BIFROST_BIND_HOST:-127.0.0.1}:${BIFROST_PORT:-8080}:8080"
     environment:
       NODE_ENV: production
       PORT: "8080"
       DATA_DIR: /data
       PANEL_DIST_DIR: /app/panel/dist
+      BIFROST_RUNTIME: docker
       BIFROST_MASTER_KEY: "${BIFROST_MASTER_KEY:-}"
       BIFROST_MARKETPLACE_URL: "${BIFROST_MARKETPLACE_URL:-https://raw.githubusercontent.com/mazzapata/providers/main/index.json}"
       BIFROST_WATCHTOWER_URL: "${BIFROST_WATCHTOWER_URL:-}"
@@ -36,7 +38,8 @@ services:
       start_period: 10s
 
   watchtower:
-    image: containrrr/watchtower:latest
+    # Pinned to the latest stable Watchtower release tag; override via BIFROST_WATCHTOWER_IMAGE if needed.
+    image: ${BIFROST_WATCHTOWER_IMAGE:-containrrr/watchtower:1.7.1}
     container_name: bifrost-watchtower
     restart: unless-stopped
     profiles:
@@ -45,7 +48,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       WATCHTOWER_HTTP_API_UPDATE: "true"
-      WATCHTOWER_HTTP_API_TOKEN: "${BIFROST_WATCHTOWER_TOKEN:-change-me}"
+      WATCHTOWER_HTTP_API_TOKEN: "${BIFROST_WATCHTOWER_TOKEN:?Define BIFROST_WATCHTOWER_TOKEN para usar el perfil auto-update}"
       WATCHTOWER_LABEL_ENABLE: "true"
       WATCHTOWER_CLEANUP: "true"
 

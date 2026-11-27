@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   test:
-    name: Build & Test (Node.js 24)
+    name: Validate, Build, Test & Smoke (Node.js 24)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,11 +32,23 @@ jobs:
             core/package-lock.json
             nodes/package-lock.json
 
+      - name: Validate JSON schemas and Bash scripts
+        run: |
+          node scripts/validate-schemas.mjs
+          bash -n scripts/install.sh && bash -n nodes/install-node.sh && bash -n scripts/docker-entrypoint.sh
+          shellcheck -S warning scripts/install.sh nodes/install-node.sh scripts/docker-entrypoint.sh
+
       - name: Install dependencies (panel, core, nodes)
         run: |
           npm --prefix panel ci
           npm --prefix core ci
           npm --prefix nodes ci
+
+      - name: Type-check tests (if tsconfig.test.json exists)
+        run: |
+          if [ -f tsconfig.test.json ]; then
+            npx --prefix core tsc -p tsconfig.test.json
+          fi
 
       - name: Build all workspaces
         run: npm run build
@@ -44,17 +56,80 @@ jobs:
       - name: Run full test suite
         run: npm test
 
+      - name: Docker build & container smoke test
+        run: |
+          set -euo pipefail
+          docker build --build-arg BIFROST_BUILD_COMMIT="${{ github.sha }}" -t bifrost:publish-smoke .
+
+          CONTAINER="bifrost-pub-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          VOLUME="bifrost-pub-vol-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+            docker volume rm -f "${VOLUME}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker volume create "${VOLUME}" >/dev/null
+          docker run -d \
+            --name "${CONTAINER}" \
+            -p 127.0.0.1:18081:8080 \
+            -v "${VOLUME}:/data" \
+            bifrost:publish-smoke >/dev/null
+
+          READY=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18081/api/health >/tmp/pub-health.json 2>/dev/null; then
+              READY=1
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || echo false)" != "true" ]; then
+              docker logs "${CONTAINER}" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "${READY}" -ne 1 ]; then
+            docker logs "${CONTAINER}" >&2 || true
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("node:fs");
+            const body = JSON.parse(fs.readFileSync("/tmp/pub-health.json", "utf8"));
+            if (body.ok !== true) process.exit(1);
+          '
+          curl -fsS http://127.0.0.1:18081/install-node.sh >/tmp/pub-install-node.sh
+          grep -q "bifrost-node" /tmp/pub-install-node.sh
+          curl -fsS http://127.0.0.1:18081/manifest.webmanifest >/tmp/pub-manifest.webmanifest
+          node -e '
+            const fs = require("node:fs");
+            const m = JSON.parse(fs.readFileSync("/tmp/pub-manifest.webmanifest", "utf8"));
+            if (!m.name) process.exit(1);
+          '
+
+          KEY_STAT="$(docker exec "${CONTAINER}" stat -c '%a %s' /data/master.key)"
+          test "${KEY_STAT}" = "600 32"
+          test "$(docker exec "${CONTAINER}" printenv BIFROST_RUNTIME)" = "docker"
+
+          docker stop --time 15 "${CONTAINER}" >/dev/null
+          test "$(docker inspect -f '{{.State.ExitCode}}' "${CONTAINER}")" = "0"
+
   publish:
-    name: Build & Push GHCR Image
+    name: Build & Push Multi-Arch GHCR Image
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch emulation)
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -66,15 +141,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Extract Docker metadata (lowercase image name)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+            type=sha,prefix=,format=long
+
+      - name: Build and push multi-arch Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
+          provenance: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BIFROST_BUILD_COMMIT=${{ github.sha }}
           cache-from: type=gha
