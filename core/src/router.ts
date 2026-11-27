@@ -8,7 +8,18 @@ import {
   type UpstreamTlsOptions,
   fetchViaExitNode,
 } from './nodes.js';
-import { type ProviderManifest, buildProviderAuthHeaders } from './schema.js';
+import {
+  type ProviderManifest,
+  buildProviderAuthHeaders,
+  mergeHeadersCaseInsensitive,
+} from './schema.js';
+import {
+  type DnsLookupFn,
+  UpstreamSsrfError,
+  assertSafeUpstreamUrlSync,
+  safeFetch,
+} from './ssrf.js';
+import { allowLocalOfficialUpstreams } from './url-security.js';
 
 export class DrainingRegistry {
   private readonly drainingKeys = new Set<string>();
@@ -1345,6 +1356,8 @@ export async function executeChatCompletions(options: {
   masterKey: Buffer;
   registry: DrainingRegistry;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
   upstreamTls?: UpstreamTlsOptions;
   now: () => number;
   userId: string;
@@ -1363,6 +1376,8 @@ export async function executeChatCompletions(options: {
     masterKey,
     registry,
     fetchImpl,
+    allowLocalhost,
+    dnsLookup,
     upstreamTls,
     now,
     userId,
@@ -1421,6 +1436,12 @@ export async function executeChatCompletions(options: {
   const contractFlags = detectRequestContractFlags(sanitizedBody);
 
   const manifest = JSON.parse(String(providerRow.schema_json)) as ProviderManifest;
+  const upstreamMode =
+    providerRow.package_type === 'experimental-adapter'
+      ? ('experimental-adapter' as const)
+      : ('official-json' as const);
+  const effectiveAllowLocalhost =
+    allowLocalhost !== undefined ? allowLocalhost : allowLocalOfficialUpstreams();
   const effectiveBaseUrl =
     providerRow.package_type === 'experimental-adapter' &&
     typeof providerRow.adapter_url === 'string' &&
@@ -1428,7 +1449,21 @@ export async function executeChatCompletions(options: {
       ? providerRow.adapter_url
       : manifest.baseUrl;
 
-  const chatUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/chat/completions`;
+  const rawChatUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/chat/completions`;
+  let chatUrl: string;
+  try {
+    chatUrl = assertSafeUpstreamUrlSync(rawChatUrl, {
+      mode: upstreamMode,
+      allowLocalhost: effectiveAllowLocalhost,
+    });
+  } catch (err) {
+    return openAiErrorJson(
+      err instanceof Error ? err.message : 'Upstream URL blocked by SSRF policy.',
+      'invalid_request_error',
+      'ssrf_blocked',
+      400,
+    );
+  }
 
   const candidates = loadCandidateKeys(db, providerId, registry, nowSec);
   if (candidates.length === 0) {
@@ -1590,7 +1625,17 @@ export async function executeChatCompletions(options: {
               upstreamTls,
             );
           }
-          return await fetchImpl(chatUrl, { ...initWithSignal, redirect: 'error' });
+          return await safeFetch(
+            chatUrl,
+            { ...initWithSignal, redirect: 'error' },
+            {
+              mode: upstreamMode,
+              allowLocalhost: effectiveAllowLocalhost,
+              fetchImpl,
+              dnsLookup,
+              upstreamTls,
+            },
+          );
         } finally {
           clearTimeout(headersTimer);
         }
@@ -1620,7 +1665,17 @@ export async function executeChatCompletions(options: {
           upstreamTls,
         );
       }
-      return fetchImpl(chatUrl, { ...initWithSignal, redirect: 'error' });
+      return safeFetch(
+        chatUrl,
+        { ...initWithSignal, redirect: 'error' },
+        {
+          mode: upstreamMode,
+          allowLocalhost: effectiveAllowLocalhost,
+          fetchImpl,
+          dnsLookup,
+          upstreamTls,
+        },
+      );
     };
 
     const applyStrictMaxTokens = (
@@ -1677,10 +1732,10 @@ export async function executeChatCompletions(options: {
         const releaseLease = registry.acquireLease(providerId, key.id);
         try {
           const rawSecret = decryptSecret(key.encrypted_secret, masterKey);
-          const headers: Record<string, string> = {
-            ...buildProviderAuthHeaders(manifest.auth, rawSecret),
-            'Content-Type': 'application/json',
-          };
+          const headers = mergeHeadersCaseInsensitive(
+            buildProviderAuthHeaders(manifest.auth, rawSecret),
+            { 'Content-Type': 'application/json' },
+          );
           const upstreamBody = applyStrictMaxTokens({
             ...sanitizedBody,
             model: modelId,
@@ -1695,6 +1750,14 @@ export async function executeChatCompletions(options: {
               body: JSON.stringify(upstreamBody),
             });
           } catch (err) {
+            if (err instanceof UpstreamSsrfError) {
+              return openAiErrorJson(
+                redactWithRawSecret(err.message, rawSecret),
+                'invalid_request_error',
+                'ssrf_blocked',
+                400,
+              );
+            }
             if (clientSignal?.aborted) {
               return openAiErrorJson(
                 'Client closed the request before upstream completed.',
@@ -2035,15 +2098,14 @@ export async function executeChatCompletions(options: {
         const releaseLease = registry.acquireLease(providerId, key.id);
         try {
           const rawSecret = decryptSecret(key.encrypted_secret, masterKey);
-          const rawAuthHeaders = buildProviderAuthHeaders(manifest.auth, rawSecret);
-          const headers: Record<string, string> = {};
-          for (const [k, v] of Object.entries(rawAuthHeaders)) {
-            if (k.toLowerCase() === 'accept-encoding') continue;
-            headers[k] = v;
-          }
-          headers['Content-Type'] = 'application/json';
-          headers.Accept = 'text/event-stream';
-          headers['Accept-Encoding'] = 'identity';
+          const headers = mergeHeadersCaseInsensitive(
+            buildProviderAuthHeaders(manifest.auth, rawSecret),
+            {
+              'Content-Type': 'application/json',
+              Accept: 'text/event-stream',
+              'Accept-Encoding': 'identity',
+            },
+          );
 
           const baseStreamBody: Record<string, unknown> = {
             ...sanitizedBody,
@@ -2082,6 +2144,14 @@ export async function executeChatCompletions(options: {
                 'stream',
               );
             } catch (err) {
+              if (err instanceof UpstreamSsrfError) {
+                nonRetryableStreamFailure = {
+                  status: 400,
+                  message: redactWithRawSecret(err.message, rawSecret),
+                  keyId: key.id,
+                };
+                return null;
+              }
               if (clientSignal?.aborted) {
                 clientAbortedBeforeOpen = true;
                 return null;
@@ -2123,7 +2193,7 @@ export async function executeChatCompletions(options: {
           let res = await sendAttempt(upstreamBody);
           if (res === null) {
             releaseLease();
-            if (clientAbortedBeforeOpen) return null;
+            if (clientAbortedBeforeOpen || nonRetryableStreamFailure) return null;
             continue;
           }
 
@@ -2143,7 +2213,7 @@ export async function executeChatCompletions(options: {
               res = await sendAttempt(upstreamBody);
               if (res === null) {
                 releaseLease();
-                if (clientAbortedBeforeOpen) return null;
+                if (clientAbortedBeforeOpen || nonRetryableStreamFailure) return null;
                 continue;
               }
             }
@@ -3071,6 +3141,8 @@ export async function executeEmbeddings(options: {
   masterKey: Buffer;
   registry: DrainingRegistry;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
   upstreamTls?: UpstreamTlsOptions;
   now: () => number;
   userId: string;
@@ -3087,6 +3159,8 @@ export async function executeEmbeddings(options: {
     masterKey,
     registry,
     fetchImpl,
+    allowLocalhost,
+    dnsLookup,
     upstreamTls,
     now,
     userId,
@@ -3118,6 +3192,12 @@ export async function executeEmbeddings(options: {
   }
 
   const manifest = JSON.parse(String(providerRow.schema_json)) as ProviderManifest;
+  const upstreamMode =
+    providerRow.package_type === 'experimental-adapter'
+      ? ('experimental-adapter' as const)
+      : ('official-json' as const);
+  const effectiveAllowLocalhost =
+    allowLocalhost !== undefined ? allowLocalhost : allowLocalOfficialUpstreams();
   const effectiveBaseUrl =
     providerRow.package_type === 'experimental-adapter' &&
     typeof providerRow.adapter_url === 'string' &&
@@ -3125,7 +3205,21 @@ export async function executeEmbeddings(options: {
       ? providerRow.adapter_url
       : manifest.baseUrl;
 
-  const embeddingsUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/embeddings`;
+  const rawEmbeddingsUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/embeddings`;
+  let embeddingsUrl: string;
+  try {
+    embeddingsUrl = assertSafeUpstreamUrlSync(rawEmbeddingsUrl, {
+      mode: upstreamMode,
+      allowLocalhost: effectiveAllowLocalhost,
+    });
+  } catch (err) {
+    return openAiErrorJson(
+      err instanceof Error ? err.message : 'Upstream URL blocked by SSRF policy.',
+      'invalid_request_error',
+      'ssrf_blocked',
+      400,
+    );
+  }
 
   const candidates = loadCandidateKeys(db, providerId, registry, nowSec);
   if (candidates.length === 0) {
@@ -3229,7 +3323,17 @@ export async function executeEmbeddings(options: {
           upstreamTls,
         );
       }
-      return fetchImpl(embeddingsUrl, { ...initWithSignal, redirect: 'error' });
+      return safeFetch(
+        embeddingsUrl,
+        { ...initWithSignal, redirect: 'error' },
+        {
+          mode: upstreamMode,
+          allowLocalhost: effectiveAllowLocalhost,
+          fetchImpl,
+          dnsLookup,
+          upstreamTls,
+        },
+      );
     };
 
     const triedKeyIds = new Set<string>();
@@ -3249,10 +3353,10 @@ export async function executeEmbeddings(options: {
       const releaseLease = registry.acquireLease(providerId, key.id);
       try {
         const rawSecret = decryptSecret(key.encrypted_secret, masterKey);
-        const headers: Record<string, string> = {
-          ...buildProviderAuthHeaders(manifest.auth, rawSecret),
-          'Content-Type': 'application/json',
-        };
+        const headers = mergeHeadersCaseInsensitive(
+          buildProviderAuthHeaders(manifest.auth, rawSecret),
+          { 'Content-Type': 'application/json' },
+        );
         const upstreamBody: Record<string, unknown> = {
           ...requestBody,
           model: modelId,
@@ -3266,6 +3370,14 @@ export async function executeEmbeddings(options: {
             body: JSON.stringify(upstreamBody),
           });
         } catch (err) {
+          if (err instanceof UpstreamSsrfError) {
+            return openAiErrorJson(
+              redactWithRawSecret(err.message, rawSecret),
+              'invalid_request_error',
+              'ssrf_blocked',
+              400,
+            );
+          }
           if (clientSignal?.aborted) {
             return openAiErrorJson(
               'Client closed the request before upstream completed.',
@@ -3424,7 +3536,6 @@ export async function executeEmbeddings(options: {
             502,
           );
         }
-
         const endMs = now();
         const durationMs = Math.max(1, endMs - startMs);
         const endSec = Math.floor(endMs / 1000);

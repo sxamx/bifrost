@@ -1,7 +1,21 @@
 import dns from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
+import tls from 'node:tls';
+import zlib from 'node:zlib';
 
 export type UpstreamUrlMode = 'official-json' | 'experimental-adapter';
+
+export type DnsLookupFn = (
+  hostname: string,
+) => Promise<Array<{ address: string; family: number }>>;
+
+export interface SafeFetchTlsOptions {
+  ca?: string | Buffer | Array<string | Buffer>;
+  rejectUnauthorized?: boolean;
+  pinnedFingerprintSha256?: string;
+}
 
 export interface ValidateUpstreamUrlOptions {
   /**
@@ -15,7 +29,7 @@ export interface ValidateUpstreamUrlOptions {
   mode?: UpstreamUrlMode;
   /**
    * Explicit opt-in flag for local unit/integration tests running mock HTTP servers on `127.0.0.1` / `::1` / `localhost`.
-   * NEVER bypasses Cloud IMDS (`169.254.0.0/16`, `100.100.100.200`, `fd00:ec2::254`), `0.0.0.0/8`,
+   * NEVER bypasses Cloud IMDS (`169.254.0.0/16`, `192.0.0.192/32`, `100.100.100.200`, `fd00:ec2::254`), `0.0.0.0/8`,
    * IPv6 link-local (`fe80::/10`), ULA (`fc00::/7`), IPv6 transition ranges (`2002::/16`, `2001:0000::/32`,
    * `64:ff9b::/96`, `64:ff9b:1::/48`, `::ffff:0:0:0/96`), or RFC1918 LAN (`10/8`, `172.16/12`, `192.168/16`).
    */
@@ -27,7 +41,16 @@ export interface ValidateUpstreamUrlOptions {
   /** Whether `validateSafeUpstreamUrl` resolves DNS records to prevent DNS rebinding (default: `true`). */
   resolveDns?: boolean;
   /** Injectable DNS lookup function for deterministic unit tests. */
-  lookupFn?: (hostname: string) => Promise<Array<{ address: string; family: number }>>;
+  lookupFn?: DnsLookupFn;
+  /** Alias for `lookupFn` for readability in test suites. */
+  dnsLookup?: DnsLookupFn;
+}
+
+export interface SafeFetchOptions extends ValidateUpstreamUrlOptions {
+  /** Optional fetch implementation (when a mocked function is passed in tests, DNS resolution is skipped unless `dnsLookup`/`lookupFn` is also passed). */
+  fetchImpl?: typeof fetch;
+  /** Optional TLS options (e.g. custom CA or fingerprint pinning). */
+  upstreamTls?: SafeFetchTlsOptions;
 }
 
 export interface UpstreamUrlValidationResult {
@@ -54,7 +77,20 @@ const BLOCKED_METADATA_HOSTNAMES = new Set([
   'metadata.goog',
   'instance-data',
   'instance-data.ec2.internal',
+  'metadata.azure.internal',
+  'metadata.tencentyun.com',
 ]);
+
+export function isBlockedMetadataHostname(rawHostname: string): boolean {
+  const host = normalizeUrlHostname(rawHostname);
+  if (!host) return true;
+  return (
+    BLOCKED_METADATA_HOSTNAMES.has(host) ||
+    host.endsWith('.internal') ||
+    host.endsWith('.local') ||
+    host.includes('%')
+  );
+}
 
 function parseIpv4Octets(ip: string): [number, number, number, number] | null {
   const parts = ip.split('.');
@@ -155,6 +191,8 @@ export function isUnconditionallyBlockedIp(ip: string): boolean {
     if (a === 0) return true;
     if (a === 169 && b === 254) return true;
     if (a === 100 && b === 100 && c === 100 && d === 200) return true;
+    // Oracle Cloud IMDS (192.0.0.192/32) and IETF protocol assignments (192.0.0.0/24) / TEST-NET-1 (192.0.2.0/24)
+    if (a === 192 && b === 0 && c === 0 && d === 192) return true;
     if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
     if (a === 192 && b === 88 && c === 99) return true;
     if (a >= 224) return true;
@@ -240,6 +278,24 @@ export function isPrivateOrReservedIpv4(ip: string): boolean {
   return false;
 }
 
+export function isTailscaleCgnatIpv4(ip: string): boolean {
+  if (net.isIP(ip) !== 4) return false;
+  const octets = parseIpv4Octets(ip);
+  if (!octets) return false;
+  const [a, b, c, d] = octets;
+  // Exclude Alibaba Cloud IMDS (100.100.100.200) inside 100.64.0.0/10
+  if (a === 100 && b === 100 && c === 100 && d === 200) return false;
+  return a === 100 && b >= 64 && b <= 127;
+}
+
+export function isExactAdapterLoopbackHost(rawHost: string): boolean {
+  const host = normalizeUrlHostname(rawHost);
+  if (host === 'localhost') return true;
+  if (host === '127.0.0.1') return true;
+  if (net.isIP(host) === 6 && isStrictLoopbackIp(host)) return true;
+  return false;
+}
+
 export function isPrivateOrReservedIp(ip: string): boolean {
   const family = net.isIP(ip);
   if (family === 4) {
@@ -256,7 +312,7 @@ function normalizeUrlHostname(rawHostname: string): string {
   if (lower.startsWith('[') && lower.endsWith(']')) {
     return lower.slice(1, -1);
   }
-  return lower.replace(/\.$/, '');
+  return lower.replace(/\.+$/, '');
 }
 
 function isLoopbackPermitted(options: ValidateUpstreamUrlOptions): boolean {
@@ -305,6 +361,17 @@ export function validateSafeUpstreamUrlSync(
     return {
       allowed: false,
       reason: 'Embedded credentials in upstream URLs are forbidden.',
+    };
+  }
+
+  const rawHostNoBrackets =
+    parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+      ? parsed.hostname.slice(1, -1)
+      : parsed.hostname;
+  if (rawHostNoBrackets.includes('..') || rawHostNoBrackets.startsWith('.')) {
+    return {
+      allowed: false,
+      reason: `Upstream hostname "${parsed.hostname}" contains empty DNS labels and is blocked by SSRF policy.`,
     };
   }
 
@@ -393,6 +460,21 @@ export function validateSafeUpstreamUrlSync(
     };
   }
 
+  // Reject numeric/hex IP obfuscation and single-label hostnames (e.g. Docker service names like "watchtower", "redis", "postgres")
+  if (/^(0x[0-9a-f]+|\d+)$/i.test(host)) {
+    return {
+      allowed: false,
+      reason: `Numeric/hex IP obfuscation hostname "${host}" is blocked by SSRF policy.`,
+    };
+  }
+
+  if (!host.includes('.')) {
+    return {
+      allowed: false,
+      reason: `Single-label hostname "${host}" is blocked by SSRF policy.`,
+    };
+  }
+
   // Non-loopback domain names must always use HTTPS
   if (parsed.protocol !== 'https:') {
     return {
@@ -410,7 +492,7 @@ export function validateSafeUpstreamUrlSync(
 
 /**
  * Full async SSRF validator with DNS resolution check (prevents DNS rebinding / nip.io to IMDS or LAN).
- * Ready for `core/src/app.ts`, `core/src/router.ts`, and `core/src/models-sync.ts`.
+ * Ready for `core/src/app.ts`, `core/src/router.ts`, `core/src/marketplace.ts`, and `core/src/models-sync.ts`.
  */
 export async function validateSafeUpstreamUrl(
   rawUrl: unknown,
@@ -427,15 +509,43 @@ export async function validateSafeUpstreamUrl(
   }
 
   const loopbackAllowed = isLoopbackPermitted(options);
+  const customLookup = options.lookupFn ?? options.dnsLookup;
   if (host === 'localhost' || host.endsWith('.localhost')) {
+    if (customLookup) {
+      let localRecords: Array<{ address: string; family: number }>;
+      try {
+        localRecords = await customLookup(host);
+      } catch {
+        return {
+          allowed: false,
+          hostname: host,
+          reason: `Unable to resolve upstream hostname "${host}".`,
+        };
+      }
+      const validLoopbacks = localRecords
+        .map((r) => r.address)
+        .filter((ip) => isStrictLoopbackIp(ip));
+      if (validLoopbacks.length === 0 || validLoopbacks.length !== localRecords.length) {
+        return {
+          allowed: false,
+          hostname: host,
+          resolvedIps: localRecords.map((r) => r.address),
+          reason: `Loopback hostname "${host}" resolved to a non-loopback address.`,
+        };
+      }
+      return {
+        ...syncCheck,
+        resolvedIps: validLoopbacks,
+      };
+    }
     return {
       ...syncCheck,
-      resolvedIps: ['127.0.0.1'],
+      resolvedIps: ['127.0.0.1', '::1'],
     };
   }
 
   const lookup =
-    options.lookupFn ?? ((h: string) => dns.lookup(h, { all: true, verbatim: true }));
+    customLookup ?? ((h: string) => dns.lookup(h, { all: true, verbatim: true }));
 
   let records: Array<{ address: string; family: number }>;
   try {
@@ -518,4 +628,439 @@ export function assertSafeUpstreamUrlSync(
     throw new UpstreamSsrfError(check.reason ?? 'Upstream URL blocked by SSRF policy.');
   }
   return check.normalizedUrl;
+}
+
+function normalizeTlsFingerprint(fp: string): string {
+  return fp.replace(/:/g, '').replace(/\s+/g, '').toUpperCase();
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+async function bodyInitToBuffer(body: RequestInit['body']): Promise<Buffer | undefined> {
+  if (body === undefined || body === null) return undefined;
+  if (typeof body === 'string') return Buffer.from(body, 'utf8');
+  if (Buffer.isBuffer(body)) return body;
+  if (ArrayBuffer.isView(body)) {
+    return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  }
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (body instanceof URLSearchParams) {
+    return Buffer.from(body.toString(), 'utf8');
+  }
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    return Buffer.from(await body.arrayBuffer());
+  }
+  throw new TypeError('Unsupported request body type for safeFetch.');
+}
+
+export interface PinnedAddressRecord {
+  address: string;
+  family: 4 | 6;
+}
+
+export function createPinnedLookup(
+  pinnedIps: ReadonlyArray<string | PinnedAddressRecord>,
+): NonNullable<http.RequestOptions['lookup']> {
+  const normalized: PinnedAddressRecord[] = [];
+  const seen = new Set<string>();
+  for (const entry of pinnedIps) {
+    const address = typeof entry === 'string' ? entry : entry.address;
+    if (seen.has(address)) continue;
+    const detected = net.isIP(address);
+    const family: 4 | 6 | 0 =
+      typeof entry === 'string'
+        ? detected === 6
+          ? 6
+          : detected === 4
+            ? 4
+            : 0
+        : entry.family;
+    if (family !== 4 && family !== 6) continue;
+    seen.add(address);
+    normalized.push({ address, family });
+  }
+
+  return (hostname, opts, callback) => {
+    const optsObj = typeof opts === 'object' && opts !== null ? opts : undefined;
+    const requestedFamily =
+      typeof opts === 'number'
+        ? opts
+        : typeof optsObj?.family === 'number'
+          ? optsObj.family
+          : 0;
+    const matching =
+      requestedFamily === 4 || requestedFamily === 6
+        ? normalized.filter((r) => r.family === requestedFamily)
+        : normalized;
+
+    if (matching.length === 0) {
+      const err = new Error(
+        `No pinned IP address available for "${hostname}" (family=${requestedFamily}).`,
+      ) as NodeJS.ErrnoException;
+      err.code = 'ENOTFOUND';
+      callback(err, '', 0);
+      return;
+    }
+
+    if (optsObj?.all === true) {
+      (callback as (err: NodeJS.ErrnoException | null, addresses: PinnedAddressRecord[]) => void)(
+        null,
+        matching.map((r) => ({ address: r.address, family: r.family })),
+      );
+      return;
+    }
+
+    const first = matching[0]!;
+    callback(null, first.address, first.family);
+  };
+}
+
+/**
+ * Executes an HTTP/HTTPS request strictly pinned to pre-validated IP addresses
+ * (mitigating DNS rebinding / TOCTOU while preserving Happy Eyeballs fallback,
+ * original Host header, and TLS SNI).
+ */
+async function pinnedHttpFetch(
+  normalizedUrl: string,
+  pinnedIps: ReadonlyArray<string>,
+  init: RequestInit | undefined,
+  upstreamTls?: SafeFetchTlsOptions,
+): Promise<Response> {
+  const parsed = new URL(normalizedUrl);
+  const isHttps = parsed.protocol === 'https:';
+  const rawHost = parsed.hostname.replace(/^\[|\]$/g, '');
+  const targetPort = parsed.port ? Number(parsed.port) : isHttps ? 443 : 80;
+  const method = (init?.method ?? 'GET').toUpperCase();
+
+  const reqHeaders: Record<string, string> = {};
+  const seenLower = new Set<string>();
+  if (init?.headers) {
+    const h = new Headers(init.headers);
+    h.forEach((value, key) => {
+      const lower = key.toLowerCase();
+      if (lower === 'host') return;
+      seenLower.add(lower);
+      reqHeaders[key] = value;
+    });
+  }
+  if (!seenLower.has('connection')) {
+    reqHeaders.Connection = 'close';
+  }
+
+  const bodyBuffer = await bodyInitToBuffer(init?.body);
+  if (bodyBuffer !== undefined && !seenLower.has('content-length')) {
+    reqHeaders['Content-Length'] = String(bodyBuffer.byteLength);
+  }
+
+  const pathWithQuery = `${parsed.pathname || '/'}${parsed.search || ''}`;
+  const pinnedLookup = createPinnedLookup(pinnedIps);
+  const redirectMode = init?.redirect ?? 'error';
+
+  const getAbortError = (): Error =>
+    init?.signal?.reason instanceof Error
+      ? init.signal.reason
+      : new Error('The operation was aborted.');
+
+  if (init?.signal?.aborted) {
+    throw getAbortError();
+  }
+
+  return new Promise<Response>((resolve, reject) => {
+    let headersResolved = false;
+    let clientReq: http.ClientRequest;
+    let bodyAbortHandler: ((reason: Error) => void) | null = null;
+
+    const cleanupAbort = () => {
+      if (init?.signal) {
+        init.signal.removeEventListener('abort', onAbort);
+      }
+    };
+
+    const failEarly = (err: Error) => {
+      cleanupAbort();
+      if (!headersResolved) {
+        headersResolved = true;
+        reject(err);
+      }
+    };
+
+    const onAbort = () => {
+      const reason = getAbortError();
+      if (bodyAbortHandler) {
+        bodyAbortHandler(reason);
+        return;
+      }
+      clientReq?.destroy(reason);
+      failEarly(reason);
+    };
+
+    const onIncomingResponse = (res: http.IncomingMessage) => {
+      const status = res.statusCode ?? 502;
+
+      if (redirectMode === 'error' && isRedirectStatus(status)) {
+        res.destroy();
+        failEarly(new Error(`Upstream returned redirect HTTP ${status} (redirect: error).`));
+        return;
+      }
+
+      headersResolved = true;
+
+      // Return early for bodyless responses BEFORE instantiating any zlib transform
+      // so an empty body with Content-Encoding never triggers an uncaught zlib error.
+      if (status === 204 || status === 205 || status === 304 || method === 'HEAD') {
+        cleanupAbort();
+        const emptyHeaders = new Headers();
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (v === undefined) continue;
+          if (Array.isArray(v)) {
+            for (const item of v) emptyHeaders.append(k, item);
+          } else {
+            emptyHeaders.set(k, v);
+          }
+        }
+        res.resume();
+        resolve(new Response(null, { status, headers: emptyHeaders }));
+        return;
+      }
+
+      const rawEncoding = String(res.headers['content-encoding'] ?? '')
+        .trim()
+        .toLowerCase();
+      let zlibStream: zlib.Gunzip | zlib.Inflate | zlib.BrotliDecompress | null = null;
+      let decodedStream: NodeJS.ReadableStream = res;
+      let decompressed = false;
+      if (rawEncoding === 'gzip' || rawEncoding === 'x-gzip') {
+        zlibStream = zlib.createGunzip();
+        res.pipe(zlibStream);
+        decodedStream = zlibStream;
+        decompressed = true;
+      } else if (rawEncoding === 'deflate') {
+        zlibStream = zlib.createInflate();
+        res.pipe(zlibStream);
+        decodedStream = zlibStream;
+        decompressed = true;
+      } else if (rawEncoding === 'br') {
+        zlibStream = zlib.createBrotliDecompress();
+        res.pipe(zlibStream);
+        decodedStream = zlibStream;
+        decompressed = true;
+      }
+
+      const responseHeaders = new Headers();
+      for (const [k, v] of Object.entries(res.headers)) {
+        if (v === undefined) continue;
+        const lower = k.toLowerCase();
+        if (decompressed && (lower === 'content-encoding' || lower === 'content-length')) {
+          continue;
+        }
+        if (Array.isArray(v)) {
+          for (const item of v) responseHeaders.append(k, item);
+        } else {
+          responseHeaders.set(k, v);
+        }
+      }
+
+      const destroyStreams = (err?: Error) => {
+        if (zlibStream && !zlibStream.destroyed) {
+          zlibStream.destroy(err);
+        }
+        if (!res.destroyed) {
+          res.destroy(err);
+        }
+        if (!clientReq.destroyed) {
+          clientReq.destroy(err);
+        }
+      };
+
+      let streamClosed = false;
+      const webStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const finishError = (err: Error) => {
+            if (streamClosed) return;
+            streamClosed = true;
+            bodyAbortHandler = null;
+            cleanupAbort();
+            try {
+              controller.error(err);
+            } catch {
+              // Ignore already closed controller
+            }
+            destroyStreams();
+          };
+
+          bodyAbortHandler = (reason: Error) => {
+            finishError(reason);
+          };
+
+          if (init?.signal?.aborted) {
+            finishError(getAbortError());
+            return;
+          }
+
+          const onData = (chunk: Buffer | string) => {
+            if (streamClosed) return;
+            try {
+              const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+              controller.enqueue(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+            } catch {
+              streamClosed = true;
+              bodyAbortHandler = null;
+              cleanupAbort();
+              destroyStreams();
+            }
+          };
+          const onEnd = () => {
+            if (streamClosed) return;
+            streamClosed = true;
+            bodyAbortHandler = null;
+            cleanupAbort();
+            try {
+              controller.close();
+            } catch {
+              // Ignore already closed controller
+            }
+          };
+          const onErr = (err: Error) => {
+            finishError(err);
+          };
+          const onClose = () => {
+            if (!streamClosed && !res.complete) {
+              finishError(new Error('Upstream stream closed prematurely'));
+            }
+          };
+          decodedStream.on('data', onData);
+          decodedStream.once('end', onEnd);
+          decodedStream.once('error', onErr);
+          res.once('error', onErr);
+          res.once('close', onClose);
+        },
+        cancel() {
+          streamClosed = true;
+          bodyAbortHandler = null;
+          cleanupAbort();
+          destroyStreams();
+        },
+      });
+
+      resolve(new Response(webStream, { status, headers: responseHeaders }));
+    };
+
+    if (isHttps) {
+      const pinnedTargetFp = upstreamTls?.pinnedFingerprintSha256
+        ? normalizeTlsFingerprint(upstreamTls.pinnedFingerprintSha256)
+        : null;
+      const shouldVerifyCa =
+        pinnedTargetFp !== null ? false : (upstreamTls?.rejectUnauthorized ?? true);
+
+      clientReq = https.request(
+        {
+          hostname: rawHost,
+          port: targetPort,
+          path: pathWithQuery,
+          method,
+          headers: reqHeaders,
+          agent: false,
+          lookup: pinnedLookup,
+          servername: net.isIP(rawHost) ? undefined : rawHost,
+          ca: upstreamTls?.ca,
+          rejectUnauthorized: shouldVerifyCa,
+        },
+        onIncomingResponse,
+      );
+
+      if (pinnedTargetFp !== null) {
+        clientReq.once('socket', (sock) => {
+          sock.setNoDelay(true);
+          if (sock instanceof tls.TLSSocket) {
+            sock.once('secureConnect', () => {
+              const peer = sock.getPeerCertificate();
+              const actualFp = peer?.fingerprint256
+                ? normalizeTlsFingerprint(peer.fingerprint256)
+                : '';
+              if (!actualFp || actualFp !== pinnedTargetFp) {
+                sock.destroy(new Error('Upstream TLS certificate fingerprint mismatch'));
+              }
+            });
+          }
+        });
+      } else {
+        clientReq.once('socket', (sock) => {
+          sock.setNoDelay(true);
+        });
+      }
+    } else {
+      clientReq = http.request(
+        {
+          hostname: rawHost,
+          port: targetPort,
+          path: pathWithQuery,
+          method,
+          headers: reqHeaders,
+          agent: false,
+          lookup: pinnedLookup,
+        },
+        onIncomingResponse,
+      );
+      clientReq.once('socket', (sock) => {
+        sock.setNoDelay(true);
+      });
+    }
+
+    if (init?.signal) {
+      init.signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    clientReq.on('error', failEarly);
+    if (bodyBuffer) {
+      clientReq.write(bodyBuffer);
+    }
+    clientReq.end();
+  });
+}
+
+/**
+ * SSRF-hardened `fetch` wrapper with DNS validation and resolved IP pinning.
+ * - Always validates the target URL against `ssrf.ts` policy before any outbound request.
+ * - When `fetchImpl` is a mocked function injected by tests (and no `dnsLookup`/`lookupFn` is provided),
+ *   runs synchronous SSRF validation and delegates to the mocked `fetchImpl` without real OS DNS.
+ * - When `dnsLookup`/`lookupFn` is injected OR when executing a real network request (`globalThis.fetch`),
+ *   runs full async DNS validation (`validateSafeUpstreamUrl`), and for real network requests pins the
+ *   TCP/TLS connection directly to the approved IPs (preserving Happy Eyeballs fallback) to prevent DNS rebinding.
+ */
+export async function safeFetch(
+  rawUrl: string,
+  init?: RequestInit,
+  options: SafeFetchOptions = {},
+): Promise<Response> {
+  const customFetch =
+    options.fetchImpl && options.fetchImpl !== globalThis.fetch ? options.fetchImpl : undefined;
+  const effectiveLookup = options.lookupFn ?? options.dnsLookup;
+
+  if (customFetch && !effectiveLookup) {
+    const normalizedUrl = assertSafeUpstreamUrlSync(rawUrl, options);
+    return customFetch(normalizedUrl, { ...init, redirect: 'error' });
+  }
+
+  const check = await validateSafeUpstreamUrl(rawUrl, {
+    ...options,
+    lookupFn: effectiveLookup,
+  });
+  if (!check.allowed || !check.normalizedUrl) {
+    throw new UpstreamSsrfError(check.reason ?? 'Upstream URL blocked by SSRF policy.');
+  }
+
+  if (customFetch) {
+    return customFetch(check.normalizedUrl, { ...init, redirect: 'error' });
+  }
+
+  const pinnedIps = check.resolvedIps ?? [];
+  if (pinnedIps.length === 0) {
+    throw new UpstreamSsrfError(
+      `Unable to pin resolved IP for upstream "${check.hostname ?? rawUrl}".`,
+    );
+  }
+
+  return pinnedHttpFetch(check.normalizedUrl, pinnedIps, init, options.upstreamTls);
 }

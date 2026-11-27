@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { type Context, Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import {
   BackupValidationError,
@@ -15,12 +16,16 @@ import {
   deriveFallbackInitial,
   getProviderLogo,
   loadModelsDevSnapshot,
+  normalizeLogoSlug,
   readCachedModelsDevSnapshot,
   resolveAndSyncModelBenchmarks,
 } from './catalog/index.js';
 import { readExternalCache } from './catalog/cache.js';
 import { MIN_VALID_MODEL_TIMESTAMP_SEC } from './catalog/models-dev.js';
 import {
+  DUMMY_SCRYPT_HASH,
+  MAX_PASSWORD_LENGTH,
+  MAX_USERNAME_LENGTH,
   decryptSecret,
   encryptSecret,
   generateInternalApiKey,
@@ -65,6 +70,7 @@ import {
   readCachedOrBundledMarketplaceCatalog,
   stripMarketplaceWrapperFields,
   updateMarketplaceSource,
+  validateMarketplaceSourceUrlSync,
   validateProviderTargetUrl,
 } from './marketplace.js';
 import {
@@ -97,6 +103,7 @@ import {
   runNodesHealthTick,
   testNodeConnectivity,
   triggerNodeUpdate,
+  validateNodeEndpoint,
 } from './nodes.js';
 import {
   DrainingRegistry,
@@ -108,10 +115,18 @@ import {
 import {
   type ProviderManifest,
   buildProviderAuthHeaders,
+  isSafeRelativeEndpointPath,
   isValidHttpUri,
   loadSeedManifests,
   validateProviderManifest,
 } from './schema.js';
+import {
+  type DnsLookupFn,
+  UpstreamSsrfError,
+  assertSafeUpstreamUrlSync,
+  safeFetch,
+} from './ssrf.js';
+import { allowLocalOfficialUpstreams } from './url-security.js';
 import {
   SystemUpdateError,
   type SystemUpdateStatus,
@@ -145,6 +160,40 @@ export {
 
 const SESSION_COOKIE_NAME = 'bifrost_session';
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+const DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const DEFAULT_AUTH_RATE_LIMIT_MAX_ATTEMPTS = 10;
+const DEFAULT_AUTH_RATE_LIMIT_MAX_ENTRIES = 10_000;
+const DEFAULT_API_BODY_LIMIT_BYTES = 2 * 1024 * 1024; // 2 MiB
+const DEFAULT_V1_BODY_LIMIT_BYTES = 16 * 1024 * 1024; // 16 MiB
+const MUTATING_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const SAFE_HOST_AUTHORITY_RE = /^(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:]+\])(?::[0-9]{1,5})?$/;
+
+const DEFAULT_CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  "img-src 'self' data: blob:",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'self'",
+  "object-src 'none'",
+].join('; ');
+
+export interface AuthRateLimitOptions {
+  /** Set to false to disable auth rate limiting (defaults to true). */
+  enabled?: boolean;
+  /** Sliding window duration in milliseconds (default: 15 minutes). */
+  windowMs?: number;
+  /** Max failed login attempts per IP and per username within windowMs (default: 10). */
+  loginMaxAttempts?: number;
+  /** Max setup attempts per IP within windowMs (default: 10). */
+  setupMaxAttempts?: number;
+  /** Max failed invitation-accept attempts per IP and per token within windowMs (default: 10). */
+  inviteAcceptMaxAttempts?: number;
+  /** Max tracked buckets before pruning oldest entries (default: 10000). */
+  maxEntries?: number;
+}
 
 export interface AuthUser {
   id: string;
@@ -170,10 +219,209 @@ export interface CreateAppOptions {
   schemasDir?: string;
   marketplaceUrl?: string;
   allowLocalhostUpstreamsForTests?: boolean;
+  allowLoopbackNodes?: boolean;
+  dnsLookup?: DnsLookupFn;
   fetchImpl?: typeof fetch;
   upstreamTls?: UpstreamTlsOptions;
   maxBackupUncompressedBytes?: number;
+  apiBodyLimitBytes?: number;
+  v1BodyLimitBytes?: number;
+  trustProxy?: boolean;
+  cookieSecure?: boolean;
+  authRateLimit?: AuthRateLimitOptions;
   now?: () => number;
+}
+
+function parseEnvBoolean(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function firstForwardedValue(headerValue: string | undefined): string | null {
+  if (!headerValue) return null;
+  const first = headerValue.split(',')[0]?.trim() ?? '';
+  return first.length > 0 ? first : null;
+}
+
+function sanitizeAuthorityHost(rawHost: string | undefined, proto: 'http' | 'https'): string | null {
+  const candidate = firstForwardedValue(rawHost);
+  if (!candidate || candidate.length > 255 || !SAFE_HOST_AUTHORITY_RE.test(candidate)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(`${proto}://${candidate}`);
+    if (
+      parsed.username !== '' ||
+      parsed.password !== '' ||
+      parsed.pathname !== '/' ||
+      parsed.search !== '' ||
+      parsed.hash !== ''
+    ) {
+      return null;
+    }
+    return parsed.host;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Determines whether the incoming request arrived over HTTPS, honoring
+ * `X-Forwarded-Proto` only when `trustProxy` is enabled.
+ */
+export function isHttpsRequest(c: Context<AppEnv>, trustProxy: boolean): boolean {
+  try {
+    if (new URL(c.req.url).protocol === 'https:') {
+      return true;
+    }
+  } catch {
+    // Ignore URL parse error and fall through to forwarded header check
+  }
+
+  if (trustProxy) {
+    const forwardedProto = firstForwardedValue(c.req.header('x-forwarded-proto'));
+    if (forwardedProto?.toLowerCase() === 'https') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Resolves the effective public origin (`scheme://host[:port]`) for the request,
+ * honoring sanitized `X-Forwarded-Proto` / `X-Forwarded-Host` when `trustProxy` is enabled.
+ */
+export function resolveEffectiveOrigin(c: Context<AppEnv>, trustProxy: boolean): string | null {
+  const proto: 'http' | 'https' = isHttpsRequest(c, trustProxy) ? 'https' : 'http';
+
+  let host: string | null = null;
+  if (trustProxy) {
+    host = sanitizeAuthorityHost(c.req.header('x-forwarded-host'), proto);
+  }
+  if (!host) {
+    host = sanitizeAuthorityHost(c.req.header('host'), proto);
+  }
+  if (!host) {
+    try {
+      const parsed = new URL(c.req.url);
+      host = sanitizeAuthorityHost(parsed.host, proto);
+    } catch {
+      host = null;
+    }
+  }
+
+  if (!host) {
+    return null;
+  }
+
+  try {
+    return new URL(`${proto}://${host}`).origin;
+  } catch {
+    return null;
+  }
+}
+
+function resolveEffectiveClientIp(c: Context<AppEnv>, trustProxy: boolean): string {
+  if (trustProxy) {
+    const forwardedFor = firstForwardedValue(c.req.header('x-forwarded-for'));
+    if (forwardedFor && forwardedFor.length <= 128) {
+      return forwardedFor;
+    }
+    const realIp = firstForwardedValue(c.req.header('x-real-ip'));
+    if (realIp && realIp.length <= 128) {
+      return realIp;
+    }
+  }
+
+  const incoming = (c.env as { incoming?: { socket?: { remoteAddress?: string } } } | undefined)
+    ?.incoming;
+  const socketIp = incoming?.socket?.remoteAddress?.trim();
+  if (socketIp) {
+    return socketIp;
+  }
+
+  return 'direct';
+}
+
+class SlidingWindowRateLimiter {
+  private readonly buckets = new Map<string, number[]>();
+  private ops = 0;
+
+  constructor(
+    private readonly windowMs: number,
+    private readonly maxEntries: number,
+    private readonly getNowMs: () => number,
+  ) {}
+
+  private pruneBucket(key: string, cutoffMs: number): number[] {
+    const existing = this.buckets.get(key);
+    if (!existing || existing.length === 0) {
+      return [];
+    }
+    let firstValid = 0;
+    while (firstValid < existing.length && existing[firstValid]! <= cutoffMs) {
+      firstValid += 1;
+    }
+    if (firstValid === 0) {
+      return existing;
+    }
+    const remaining = existing.slice(firstValid);
+    if (remaining.length === 0) {
+      this.buckets.delete(key);
+    } else {
+      this.buckets.set(key, remaining);
+    }
+    return remaining;
+  }
+
+  private sweepIfNeeded(nowMs: number): void {
+    this.ops += 1;
+    if (this.ops % 256 !== 0 && this.buckets.size <= this.maxEntries) {
+      return;
+    }
+    const cutoffMs = nowMs - this.windowMs;
+    for (const [key, timestamps] of this.buckets.entries()) {
+      const remaining = timestamps.filter((ts) => ts > cutoffMs);
+      if (remaining.length === 0) {
+        this.buckets.delete(key);
+      } else {
+        this.buckets.set(key, remaining);
+      }
+    }
+    while (this.buckets.size > this.maxEntries) {
+      const oldestKey = this.buckets.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.buckets.delete(oldestKey);
+    }
+  }
+
+  check(key: string, maxAttempts: number): { allowed: boolean; retryAfterSec: number } {
+    const nowMs = this.getNowMs();
+    const cutoffMs = nowMs - this.windowMs;
+    const recent = this.pruneBucket(key, cutoffMs);
+    if (recent.length >= maxAttempts) {
+      const oldestInWindow = recent[0] ?? nowMs;
+      const retryAfterMs = Math.max(1000, oldestInWindow + this.windowMs - nowMs);
+      return { allowed: false, retryAfterSec: Math.ceil(retryAfterMs / 1000) };
+    }
+    return { allowed: true, retryAfterSec: 0 };
+  }
+
+  record(key: string): void {
+    const nowMs = this.getNowMs();
+    const cutoffMs = nowMs - this.windowMs;
+    const recent = this.pruneBucket(key, cutoffMs);
+    recent.push(nowMs);
+    this.buckets.delete(key);
+    this.buckets.set(key, recent);
+    this.sweepIfNeeded(nowMs);
+  }
+
+  clear(key: string): void {
+    this.buckets.delete(key);
+  }
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -328,6 +576,12 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     options.schemasDir ?? path.resolve(import.meta.dirname, '../../schemas'),
   );
   const allowLocalhostUpstreamsForTests = Boolean(options.allowLocalhostUpstreamsForTests);
+  const effectiveAllowLocalhostUpstreams =
+    options.allowLocalhostUpstreamsForTests !== undefined
+      ? Boolean(options.allowLocalhostUpstreamsForTests)
+      : allowLocalOfficialUpstreams();
+  const allowLoopbackNodes = options.allowLoopbackNodes;
+  const dnsLookup = options.dnsLookup;
   const rawExplicitMarketplaceUrl =
     (options.marketplaceUrl ?? process.env.BIFROST_MARKETPLACE_URL)?.trim() || undefined;
   const explicitMarketplaceUrl =
@@ -339,13 +593,210 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
   const nowSeconds = () => Math.floor(now() / 1000);
+  const isTrustProxy = (): boolean =>
+    options.trustProxy !== undefined
+      ? options.trustProxy
+      : parseEnvBoolean(process.env.BIFROST_TRUST_PROXY);
+  const isCookieSecure = (): boolean =>
+    options.cookieSecure !== undefined
+      ? options.cookieSecure
+      : parseEnvBoolean(process.env.BIFROST_COOKIE_SECURE);
+  const shouldUseSecureCookie = (c: Context<AppEnv>): boolean =>
+    isCookieSecure() || isHttpsRequest(c, isTrustProxy());
+
+  const rateLimitEnabled = options.authRateLimit?.enabled !== false;
+  const authRateLimitWindowMs = Math.max(
+    1_000,
+    options.authRateLimit?.windowMs ?? DEFAULT_AUTH_RATE_LIMIT_WINDOW_MS,
+  );
+  const loginMaxAttempts = Math.max(
+    1,
+    options.authRateLimit?.loginMaxAttempts ?? DEFAULT_AUTH_RATE_LIMIT_MAX_ATTEMPTS,
+  );
+  const setupMaxAttempts = Math.max(
+    1,
+    options.authRateLimit?.setupMaxAttempts ?? DEFAULT_AUTH_RATE_LIMIT_MAX_ATTEMPTS,
+  );
+  const inviteAcceptMaxAttempts = Math.max(
+    1,
+    options.authRateLimit?.inviteAcceptMaxAttempts ?? DEFAULT_AUTH_RATE_LIMIT_MAX_ATTEMPTS,
+  );
+  const authRateLimiter = new SlidingWindowRateLimiter(
+    authRateLimitWindowMs,
+    Math.max(100, options.authRateLimit?.maxEntries ?? DEFAULT_AUTH_RATE_LIMIT_MAX_ENTRIES),
+    now,
+  );
+
+  const applySecurityHeaders = (c: Context<AppEnv>, res: Response): Response => {
+    const desiredHeaders: Array<[string, string]> = [
+      ['X-Frame-Options', 'DENY'],
+      ['X-Content-Type-Options', 'nosniff'],
+      ['Referrer-Policy', 'strict-origin-when-cross-origin'],
+      ['Permissions-Policy', 'camera=(), microphone=(), geolocation=()'],
+      ['Content-Security-Policy', DEFAULT_CONTENT_SECURITY_POLICY],
+    ];
+    if (isHttpsRequest(c, isTrustProxy())) {
+      desiredHeaders.push(['Strict-Transport-Security', 'max-age=31536000; includeSubDomains']);
+    }
+
+    try {
+      for (const [name, value] of desiredHeaders) {
+        if (!res.headers.has(name)) {
+          res.headers.set(name, value);
+        }
+      }
+      return res;
+    } catch {
+      // Fallback for Responses with immutable headers (e.g. proxied upstream Responses)
+      const clonedHeaders = new Headers(res.headers);
+      for (const [name, value] of desiredHeaders) {
+        if (!clonedHeaders.has(name)) {
+          clonedHeaders.set(name, value);
+        }
+      }
+      return new Response(res.body, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: clonedHeaders,
+      });
+    }
+  };
+
+  // --- Global Error Handler with Secret Redaction (SEC-16) ---
+
+  app.onError((err, c) => {
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const rawStack = err instanceof Error && err.stack ? err.stack : undefined;
+    const redactedMessage = redactSecretsInText(rawMessage);
+    const redactedStack = rawStack ? redactSecretsInText(rawStack) : undefined;
+
+    try {
+      writeSystemLog(
+        db,
+        'error',
+        'system',
+        `Unhandled request error on ${c.req.method} ${c.req.path}: ${redactedMessage}`,
+        {
+          method: c.req.method,
+          path: c.req.path,
+          errorName: err instanceof Error ? err.name : 'Error',
+          ...(redactedStack ? { stack: redactedStack.slice(0, 2000) } : {}),
+        },
+        nowSeconds(),
+      );
+    } catch {
+      // Never allow SQLite logging failure to crash or leak inside error handling
+    }
+
+    const res = c.json({ error: 'Internal server error.' }, 500);
+    return applySecurityHeaders(c, res);
+  });
+
+  // --- Global HTTP Security Headers Middleware (SEC-05) ---
+
+  app.use('*', async (c, next) => {
+    await next();
+    c.res = applySecurityHeaders(c, c.res);
+  });
+
+  // --- Request Body Size Limits (SEC-04 / DEEP-13) ---
+
+  const apiBodyLimitBytes = Math.max(
+    1024,
+    options.apiBodyLimitBytes ?? DEFAULT_API_BODY_LIMIT_BYTES,
+  );
+  const backupBodyLimitBytes =
+    Math.ceil((options.maxBackupUncompressedBytes ?? 50 * 1024 * 1024) * 1.4) + 256 * 1024;
+  const v1BodyLimitBytes = Math.max(
+    1024,
+    options.v1BodyLimitBytes ?? DEFAULT_V1_BODY_LIMIT_BYTES,
+  );
+
+  const generalApiBodyLimit = bodyLimit({
+    maxSize: apiBodyLimitBytes,
+    onError: (c) => c.json({ error: 'Request payload too large.' }, 413),
+  });
+  const backupImportBodyLimit = bodyLimit({
+    maxSize: backupBodyLimitBytes,
+    onError: (c) => c.json({ error: 'Backup payload exceeds maximum allowed size.' }, 413),
+  });
+  const v1ApiBodyLimit = bodyLimit({
+    maxSize: v1BodyLimitBytes,
+    onError: (c) =>
+      c.json(
+        openAiError(
+          'Request payload too large.',
+          'invalid_request_error',
+          'payload_too_large',
+        ),
+        413,
+      ),
+  });
+
+  app.use('/api/*', async (c, next) => {
+    if (c.req.path === '/api/backup/import') {
+      return backupImportBodyLimit(c, next);
+    }
+    return generalApiBodyLimit(c, next);
+  });
+
+  app.use('/v1/*', v1ApiBodyLimit);
+
+  // --- CSRF Protection for Cookie-Authenticated Mutating /api/* Requests (SEC-05) ---
+
+  app.use('/api/*', async (c, next) => {
+    if (!MUTATING_HTTP_METHODS.has(c.req.method.toUpperCase())) {
+      return next();
+    }
+
+    const hasSessionCookie = Boolean(getCookie(c, SESSION_COOKIE_NAME));
+    const authHeader = (c.req.header('authorization') ?? '').trim();
+    const hasBearerAuth = /^Bearer\s+\S+/i.test(authHeader);
+
+    if (!hasSessionCookie || hasBearerAuth) {
+      return next();
+    }
+
+    const secFetchSite = c.req.header('sec-fetch-site')?.trim().toLowerCase();
+    if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+      return c.json({ error: 'Cross-site request blocked by CSRF protection.' }, 403);
+    }
+
+    const originHeader = c.req.header('origin')?.trim();
+    if (originHeader) {
+      let normalizedOrigin: string | null = null;
+      try {
+        const parsed = new URL(originHeader);
+        normalizedOrigin = parsed.origin === 'null' ? null : parsed.origin;
+      } catch {
+        normalizedOrigin = null;
+      }
+
+      const effectiveOrigin = resolveEffectiveOrigin(c, isTrustProxy());
+      if (!normalizedOrigin || !effectiveOrigin || normalizedOrigin !== effectiveOrigin) {
+        return c.json({ error: 'Cross-origin request blocked by CSRF protection.' }, 403);
+      }
+    }
+
+    return next();
+  });
 
   // Backward compatibility: if marketplaceUrl is explicitly passed (e.g., tests or env override),
-  // configure and enable the official source to point to that URL. Normal startup keeps official opt-in (enabled = 0).
+  // validate it against SSRF rules before configuring and enabling the official source.
   if (explicitMarketplaceUrl) {
+    const mpValidation = validateMarketplaceSourceUrlSync(explicitMarketplaceUrl, {
+      allowLocalhostForTests: effectiveAllowLocalhostUpstreams,
+    });
+    if (!mpValidation.ok) {
+      throw new UpstreamSsrfError(
+        `Invalid BIFROST_MARKETPLACE_URL: ${mpValidation.error}`,
+      );
+    }
+    const validatedMarketplaceUrl = mpValidation.url;
+
     const conflictingSource = db
       .prepare(`SELECT id FROM marketplace_sources WHERE url = ? AND id != ?`)
-      .get(explicitMarketplaceUrl, OFFICIAL_MARKETPLACE_SOURCE_ID) as
+      .get(validatedMarketplaceUrl, OFFICIAL_MARKETPLACE_SOURCE_ID) as
       | { id: string }
       | undefined;
 
@@ -364,7 +815,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       ).run(
         OFFICIAL_MARKETPLACE_SOURCE_ID,
         OFFICIAL_MARKETPLACE_SOURCE_NAME,
-        explicitMarketplaceUrl,
+        validatedMarketplaceUrl,
         nowSeconds(),
       );
     }
@@ -394,6 +845,20 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   // --- Initial Admin Setup (HU-03) ---
 
   app.post('/api/setup', async (c) => {
+    const clientIp = resolveEffectiveClientIp(c, isTrustProxy());
+    const setupIpKey = `setup:ip:${clientIp}`;
+    if (rateLimitEnabled) {
+      const rl = authRateLimiter.check(setupIpKey, setupMaxAttempts);
+      if (!rl.allowed) {
+        return c.json(
+          { error: 'Too many setup attempts. Please try again later.' },
+          429,
+          { 'Retry-After': String(rl.retryAfterSec) },
+        );
+      }
+      authRateLimiter.record(setupIpKey);
+    }
+
     if (isAdminInitialized()) {
       return c.json({ error: 'Initial setup has already been completed.' }, 409);
     }
@@ -408,11 +873,17 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     const username = typeof body.username === 'string' ? body.username.trim() : '';
     const password = typeof body.password === 'string' ? body.password : '';
 
-    if (username.length < 3 || username.length > 64) {
-      return c.json({ error: 'Username must be between 3 and 64 characters.' }, 400);
+    if (username.length < 3 || username.length > MAX_USERNAME_LENGTH) {
+      return c.json(
+        { error: `Username must be between 3 and ${MAX_USERNAME_LENGTH} characters.` },
+        400,
+      );
     }
-    if (password.length < 8) {
-      return c.json({ error: 'Password must be at least 8 characters.' }, 400);
+    if (password.length < 8 || password.length > MAX_PASSWORD_LENGTH) {
+      return c.json(
+        { error: `Password must be between 8 and ${MAX_PASSWORD_LENGTH} characters.` },
+        400,
+      );
     }
 
     const passwordHash = await hashPassword(password);
@@ -457,6 +928,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     setCookie(c, SESSION_COOKIE_NAME, token, {
       httpOnly: true,
       sameSite: 'Lax',
+      secure: shouldUseSecureCookie(c),
       path: '/',
       maxAge: SESSION_TTL_SECONDS,
     });
@@ -476,10 +948,26 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   // --- Panel Session Authentication ---
 
   app.post('/api/auth/login', async (c) => {
+    const clientIp = resolveEffectiveClientIp(c, isTrustProxy());
+    const loginIpKey = `login:ip:${clientIp}`;
+    if (rateLimitEnabled) {
+      const ipCheck = authRateLimiter.check(loginIpKey, loginMaxAttempts);
+      if (!ipCheck.allowed) {
+        return c.json(
+          { error: 'Too many failed login attempts. Please try again later.' },
+          429,
+          { 'Retry-After': String(ipCheck.retryAfterSec) },
+        );
+      }
+    }
+
     let body: Record<string, unknown>;
     try {
       body = (await c.req.json()) as Record<string, unknown>;
     } catch {
+      if (rateLimitEnabled) {
+        authRateLimiter.record(loginIpKey);
+      }
       return c.json({ error: 'Invalid JSON request body.' }, 400);
     }
 
@@ -489,13 +977,45 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     if (!username || !password) {
       return c.json({ error: 'Username and password are required.' }, 400);
     }
+    if (username.length > MAX_USERNAME_LENGTH) {
+      return c.json(
+        { error: `Username must be at most ${MAX_USERNAME_LENGTH} characters.` },
+        400,
+      );
+    }
+    if (password.length > MAX_PASSWORD_LENGTH) {
+      return c.json(
+        { error: `Password must be at most ${MAX_PASSWORD_LENGTH} characters.` },
+        400,
+      );
+    }
+
+    const loginUserKey = `login:user:${username.toLowerCase()}`;
+    if (rateLimitEnabled) {
+      const userCheck = authRateLimiter.check(loginUserKey, loginMaxAttempts);
+      if (!userCheck.allowed) {
+        return c.json(
+          { error: 'Too many failed login attempts. Please try again later.' },
+          429,
+          { 'Retry-After': String(userCheck.retryAfterSec) },
+        );
+      }
+    }
 
     const row = db
       .prepare(`SELECT * FROM users WHERE username = ?`)
       .get(username) as Record<string, unknown> | undefined;
 
+    // Equalize scrypt verification timing for existing and non-existing usernames (SEC-15)
+    const targetHash = row ? String(row.password_hash) : DUMMY_SCRYPT_HASH;
+    const passwordMatches = await verifyPassword(password, targetHash);
+
     const nowSec = nowSeconds();
-    if (!row || !(await verifyPassword(password, String(row.password_hash)))) {
+    if (!row || !passwordMatches) {
+      if (rateLimitEnabled) {
+        authRateLimiter.record(loginIpKey);
+        authRateLimiter.record(loginUserKey);
+      }
       writeSystemLog(
         db,
         'warn',
@@ -505,6 +1025,10 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         nowSec,
       );
       return c.json({ error: 'Invalid username or password.' }, 401);
+    }
+
+    if (rateLimitEnabled) {
+      authRateLimiter.clear(loginUserKey);
     }
 
     const user = mapUserRow(row);
@@ -529,6 +1053,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     setCookie(c, SESSION_COOKIE_NAME, token, {
       httpOnly: true,
       sameSite: 'Lax',
+      secure: shouldUseSecureCookie(c),
       path: '/',
       maxAge: SESSION_TTL_SECONDS,
     });
@@ -571,6 +1096,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       path: '/',
       httpOnly: true,
       sameSite: 'Lax',
+      secure: shouldUseSecureCookie(c),
     });
 
     return c.json({ ok: true });
@@ -781,12 +1307,19 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     readCachedOrBundledMarketplaceCatalog(db, resolvedSchemasDir);
 
   app.get('/api/marketplace', async (c) => {
+    const user = c.get('user');
+    if (user.role !== 'admin') {
+      return c.json({ error: 'Admin privileges required.' }, 403);
+    }
+
     const nowSec = nowSeconds();
     const refreshParam = c.req.query('refresh');
     const forceRefresh = refreshParam === '1' || refreshParam === 'true';
 
     const catalog = await fetchAndMergeMarketplaceCatalog(db, {
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       forceRefresh,
       nowSec,
       bundledDir: resolvedSchemasDir,
@@ -825,7 +1358,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
       },
       nowSec,
-      { allowLocalhostForTests: allowLocalhostUpstreamsForTests },
+      { allowLocalhostForTests: allowLocalhostUpstreamsForTests, dnsLookup },
     );
 
     if (!result.ok) {
@@ -1034,9 +1567,25 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       manifest.adapter?.healthPath
     ) {
       try {
+        if (!isSafeRelativeEndpointPath(manifest.adapter.healthPath)) {
+          throw new UpstreamSsrfError('Invalid adapter healthPath: expected a strict relative path.');
+        }
         const parsedAdapter = new URL(adapterUrl);
-        const healthUrl = new URL(manifest.adapter.healthPath, parsedAdapter.origin).href;
-        const hRes = await fetchImpl(healthUrl, { method: 'GET', redirect: 'error' });
+        const healthUrlObj = new URL(manifest.adapter.healthPath, parsedAdapter.origin);
+        if (healthUrlObj.origin !== parsedAdapter.origin) {
+          throw new UpstreamSsrfError('Adapter healthPath cannot change origin from adapterUrl.');
+        }
+        const hRes = await safeFetch(
+          healthUrlObj.href,
+          { method: 'GET', redirect: 'error' },
+          {
+            mode: 'experimental-adapter',
+            allowLocalhost: effectiveAllowLocalhostUpstreams,
+            fetchImpl,
+            dnsLookup,
+            upstreamTls: options.upstreamTls,
+          },
+        );
         adapterHealth = { reachable: hRes.ok, status: hRes.status };
       } catch {
         adapterHealth = { reachable: false, status: null };
@@ -1132,10 +1681,13 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       typeof body.providerId === 'string' && body.providerId.trim().length > 0
         ? body.providerId.trim()
         : undefined;
+    const confirmSensitiveChange = body.confirmSensitiveChange === true;
 
     const nowSec = nowSeconds();
     const catalog = await fetchAndMergeMarketplaceCatalog(db, {
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       forceRefresh: true,
       nowSec,
       bundledDir: resolvedSchemasDir,
@@ -1145,26 +1697,64 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     const updated: string[] = [];
     const skipped: string[] = [];
 
-    let targetRows: Array<{ id: string; schema_json: string }>;
+    let targetRows: Array<{ id: string; schema_json: string; source_id: string | null }>;
     if (requestedProviderId) {
       const row = db
-        .prepare(`SELECT id, schema_json FROM providers WHERE id = ?`)
-        .get(requestedProviderId) as { id: string; schema_json: string } | undefined;
+        .prepare(`SELECT id, schema_json, source_id FROM providers WHERE id = ?`)
+        .get(requestedProviderId) as
+        | { id: string; schema_json: string; source_id: string | null }
+        | undefined;
       if (!row) {
         return c.json({ error: `Installed provider "${requestedProviderId}" not found.` }, 404);
       }
       targetRows = [row];
     } else {
       targetRows = db
-        .prepare(`SELECT id, schema_json FROM providers ORDER BY created_at ASC`)
-        .all() as Array<{ id: string; schema_json: string }>;
+        .prepare(`SELECT id, schema_json, source_id FROM providers ORDER BY created_at ASC`)
+        .all() as Array<{ id: string; schema_json: string; source_id: string | null }>;
     }
 
-    const updateStmt = db.prepare(
-      `UPDATE providers
-       SET name = ?, package_type = ?, models_source = ?, schema_json = ?, source_id = ?, manifest_hash = ?
-       WHERE id = ?`,
-    );
+    const extractOrigin = (rawUrl: string | undefined): string => {
+      if (typeof rawUrl !== 'string') return '';
+      try {
+        return new URL(rawUrl).origin;
+      } catch {
+        return rawUrl.trim();
+      }
+    };
+
+    const normalizeAuthPrefix = (auth: ProviderManifest['auth'] | undefined): string => {
+      if (!auth) return '';
+      if (auth.prefix !== undefined) return auth.prefix;
+      return auth.type === 'bearer' ? 'Bearer ' : '';
+    };
+
+    const normalizeExtraHeaders = (
+      extra: Record<string, string> | undefined,
+    ): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (!extra || typeof extra !== 'object') return out;
+      const entries = Object.entries(extra)
+        .map(([k, v]) => [k.trim().toLowerCase(), String(v)] as const)
+        .sort(([a], [b]) => a.localeCompare(b));
+      for (const [k, v] of entries) {
+        out[k] = v;
+      }
+      return out;
+    };
+
+    const pendingUpdates: Array<{
+      id: string;
+      nextManifest: ProviderManifest;
+      nextSourceId: string;
+      nextHash: string;
+    }> = [];
+    const sensitiveChanges: Array<{
+      providerId: string;
+      field: string;
+      previous: unknown;
+      next: unknown;
+    }> = [];
 
     for (const row of targetRows) {
       const entry = catalogById.get(row.id);
@@ -1185,17 +1775,119 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       const nextManifest = validation.manifest;
       const nextHash = computeManifestHash(nextManifest);
 
+      const keysCount = Number(
+        (
+          db
+            .prepare(`SELECT COUNT(*) AS count FROM provider_keys WHERE provider_id = ?`)
+            .get(row.id) as { count: number | bigint }
+        ).count,
+      );
+
+      if (keysCount >= 1 && !confirmSensitiveChange) {
+        let prevManifest: ProviderManifest | null = null;
+        try {
+          prevManifest = JSON.parse(row.schema_json) as ProviderManifest;
+        } catch {
+          prevManifest = null;
+        }
+
+        if (prevManifest) {
+          const prevOrigin = extractOrigin(prevManifest.baseUrl);
+          const nextOrigin = extractOrigin(nextManifest.baseUrl);
+          if (prevOrigin !== nextOrigin) {
+            sensitiveChanges.push({
+              providerId: row.id,
+              field: 'baseUrl',
+              previous: prevOrigin,
+              next: nextOrigin,
+            });
+          }
+
+          const prevHeader = (prevManifest.auth?.header ?? '').trim().toLowerCase();
+          const nextHeader = (nextManifest.auth?.header ?? '').trim().toLowerCase();
+          if (prevHeader !== nextHeader) {
+            sensitiveChanges.push({
+              providerId: row.id,
+              field: 'auth.header',
+              previous: prevManifest.auth?.header ?? '',
+              next: nextManifest.auth?.header ?? '',
+            });
+          }
+
+          const prevPrefix = normalizeAuthPrefix(prevManifest.auth);
+          const nextPrefix = normalizeAuthPrefix(nextManifest.auth);
+          if (prevPrefix !== nextPrefix || prevManifest.auth?.type !== nextManifest.auth?.type) {
+            sensitiveChanges.push({
+              providerId: row.id,
+              field: 'auth.prefix',
+              previous: prevPrefix,
+              next: nextPrefix,
+            });
+          }
+
+          const prevExtra = normalizeExtraHeaders(prevManifest.auth?.extraHeaders);
+          const nextExtra = normalizeExtraHeaders(nextManifest.auth?.extraHeaders);
+          if (JSON.stringify(prevExtra) !== JSON.stringify(nextExtra)) {
+            sensitiveChanges.push({
+              providerId: row.id,
+              field: 'auth.extraHeaders',
+              previous: prevExtra,
+              next: nextExtra,
+            });
+          }
+        }
+
+        const prevSourceId = row.source_id ?? null;
+        const nextSourceId = entry.sourceId ?? null;
+        if (prevSourceId !== nextSourceId) {
+          sensitiveChanges.push({
+            providerId: row.id,
+            field: 'sourceId',
+            previous: prevSourceId,
+            next: nextSourceId,
+          });
+        }
+      }
+
+      pendingUpdates.push({
+        id: row.id,
+        nextManifest,
+        nextSourceId: entry.sourceId,
+        nextHash,
+      });
+    }
+
+    if (sensitiveChanges.length > 0 && !confirmSensitiveChange) {
+      return c.json(
+        {
+          code: 'MANIFEST_SENSITIVE_CHANGE',
+          requiresConfirmation: true,
+          changes: sensitiveChanges,
+          message:
+            'Manifest update modifies sensitive destination, authentication, or source fields for a provider with registered API keys. Re-submit with confirmSensitiveChange: true to apply.',
+        },
+        409,
+      );
+    }
+
+    const updateStmt = db.prepare(
+      `UPDATE providers
+       SET name = ?, package_type = ?, models_source = ?, schema_json = ?, source_id = ?, manifest_hash = ?
+       WHERE id = ?`,
+    );
+
+    for (const item of pendingUpdates) {
       // In-place update ONLY on `providers` — NEVER touches `provider_keys`, `models`, or `usage_logs`.
       updateStmt.run(
-        nextManifest.name,
-        nextManifest.packageType,
-        nextManifest.modelsSource,
-        JSON.stringify(nextManifest),
-        entry.sourceId,
-        nextHash,
-        row.id,
+        item.nextManifest.name,
+        item.nextManifest.packageType,
+        item.nextManifest.modelsSource,
+        JSON.stringify(item.nextManifest),
+        item.nextSourceId,
+        item.nextHash,
+        item.id,
       );
-      updated.push(row.id);
+      updated.push(item.id);
     }
 
     writeSystemLog(
@@ -1947,6 +2639,10 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       });
     }
 
+    const upstreamMode =
+      provRow.package_type === 'experimental-adapter'
+        ? ('experimental-adapter' as const)
+        : ('official-json' as const);
     const effectiveBaseUrl =
       provRow.package_type === 'experimental-adapter' &&
       typeof provRow.adapter_url === 'string' &&
@@ -1957,7 +2653,51 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       typeof manifest.modelsEndpoint === 'string' && manifest.modelsEndpoint.trim().length > 0
         ? manifest.modelsEndpoint.trim()
         : '/models';
-    const targetUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}${modelsPath.startsWith('/') ? modelsPath : `/${modelsPath}`}`;
+    if (!isSafeRelativeEndpointPath(modelsPath)) {
+      return c.json(
+        {
+          ok: false,
+          httpStatus: null,
+          latencyMs: 0,
+          status: currentKeyStatus,
+          message: 'Manifest modelsEndpoint must be a strict relative path starting with "/".',
+        },
+        400,
+      );
+    }
+    let targetUrl: string;
+    try {
+      const baseParsed = new URL(effectiveBaseUrl);
+      const targetParsed = new URL(`${effectiveBaseUrl.replace(/\/+$/, '')}${modelsPath}`);
+      if (targetParsed.origin !== baseParsed.origin) {
+        return c.json(
+          {
+            ok: false,
+            httpStatus: null,
+            latencyMs: 0,
+            status: currentKeyStatus,
+            message: 'Manifest modelsEndpoint cannot change origin from baseUrl.',
+          },
+          400,
+        );
+      }
+      targetUrl = assertSafeUpstreamUrlSync(targetParsed.href, {
+        mode: upstreamMode,
+        allowLocalhost: effectiveAllowLocalhostUpstreams,
+      });
+    } catch (err) {
+      return c.json(
+        {
+          ok: false,
+          httpStatus: null,
+          latencyMs: 0,
+          status: currentKeyStatus,
+          message:
+            err instanceof Error ? err.message : 'Upstream test URL blocked by SSRF policy.',
+        },
+        400,
+      );
+    }
 
     let rawSecret: string;
     try {
@@ -2009,12 +2749,22 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
           options.upstreamTls,
         );
       } else {
-        res = await fetchImpl(targetUrl, {
-          method: 'GET',
-          headers,
-          redirect: 'error',
-          signal: AbortSignal.timeout(8000),
-        });
+        res = await safeFetch(
+          targetUrl,
+          {
+            method: 'GET',
+            headers,
+            redirect: 'error',
+            signal: AbortSignal.timeout(8000),
+          },
+          {
+            mode: upstreamMode,
+            allowLocalhost: effectiveAllowLocalhostUpstreams,
+            fetchImpl,
+            dnsLookup,
+            upstreamTls: options.upstreamTls,
+          },
+        );
       }
 
       const latencyMs = Math.max(0, now() - startMs);
@@ -2038,7 +2788,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       }
 
       const rawText = await res.text().catch(() => '');
-      const safeSnippet = scrubSecretsFromText(rawText, [rawSecret]).slice(0, 160);
+      const safeSnippet = redactSecretsInText(rawText, [rawSecret]).slice(0, 160);
       const errorMessage = safeSnippet
         ? `Upstream returned HTTP ${res.status}: ${safeSnippet}`
         : `Upstream returned HTTP ${res.status}.`;
@@ -2079,7 +2829,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     } catch (err) {
       const latencyMs = Math.max(0, now() - startMs);
       const rawErr = err instanceof Error ? err.message : 'Upstream key test failed.';
-      const safeMsg = scrubSecretsFromText(rawErr, [rawSecret]);
+      const safeMsg = redactSecretsInText(rawErr, [rawSecret]);
       const nextStatus = currentKeyStatus === 'active' ? 'rate_limited' : currentKeyStatus;
 
       const failNowSec = nowSeconds();
@@ -2158,6 +2908,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       drainingKeys: registry.getDrainingKeys(),
       drainingProviders: registry.getDrainingProviders(),
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       upstreamTls: options.upstreamTls,
       nowSec: nowSeconds(),
     });
@@ -2199,19 +2951,78 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
 
   // --- Monochrome Sanitized Provider Logos & Catalog Explorer (HU-14, HU-14b, HU-14c, HU-15) ---
 
+  const isKnownLogoSlug = (normalizedSlug: string): boolean => {
+    // 1. Installed providers in SQLite
+    const providerRows = db
+      .prepare(`SELECT id FROM providers`)
+      .all() as Array<{ id: string }>;
+    for (const row of providerRows) {
+      if (normalizeLogoSlug(row.id) === normalizedSlug) {
+        return true;
+      }
+    }
+
+    // 2. Vendor prefixes of installed models (e.g. "deepseek/deepseek-r1" -> "deepseek")
+    const modelRows = db
+      .prepare(`SELECT model_id, canonical_model_id FROM models WHERE active = 1`)
+      .all() as Array<{ model_id: string; canonical_model_id: string | null }>;
+    for (const row of modelRows) {
+      for (const candidate of [row.model_id, row.canonical_model_id]) {
+        if (!candidate) continue;
+        const slashIdx = candidate.indexOf('/');
+        if (slashIdx > 0) {
+          const vendor = normalizeLogoSlug(candidate.slice(0, slashIdx));
+          if (vendor === normalizedSlug) {
+            return true;
+          }
+        }
+      }
+    }
+
+    // 3. Cached or bundled marketplace catalog providers
+    const catalog = loadCachedOrSeedCatalog();
+    for (const entry of catalog) {
+      if (normalizeLogoSlug(entry.id) === normalizedSlug) {
+        return true;
+      }
+    }
+
+    // 4. Cached models.dev snapshot provider keys & canonical vendor prefixes
+    const snapshot = readCachedModelsDevSnapshot(db);
+    for (const key of Object.keys(snapshot.api)) {
+      if (normalizeLogoSlug(key) === normalizedSlug) {
+        return true;
+      }
+    }
+    for (const canonicalId of Object.keys(snapshot.canonical)) {
+      const slashIdx = canonicalId.indexOf('/');
+      if (slashIdx > 0 && normalizeLogoSlug(canonicalId.slice(0, slashIdx)) === normalizedSlug) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
   app.get('/api/logos/:slug', async (c) => {
     const user = c.get('user');
     const rawSlug = c.req.param('slug') ?? '';
     const cleanedSlug = rawSlug.trim().replace(/\.svg$/i, '');
-    const providerRow = db
-      .prepare(`SELECT name FROM providers WHERE id = ?`)
-      .get(cleanedSlug) as { name: string } | undefined;
+    const normalizedSlug = normalizeLogoSlug(cleanedSlug);
+    const providerRow = normalizedSlug
+      ? (db
+          .prepare(`SELECT name FROM providers WHERE id = ? OR id = ?`)
+          .get(cleanedSlug, normalizedSlug) as { name: string } | undefined)
+      : undefined;
+
+    const allowRemoteFetch = normalizedSlug !== null && isKnownLogoSlug(normalizedSlug);
 
     const result = await getProviderLogo(db, cleanedSlug, {
       displayName: providerRow?.name ?? cleanedSlug,
       fetchFn: fetchImpl,
       nowSec: nowSeconds(),
-      forceRefresh: user.role === 'admin' && c.req.query('refresh') === '1',
+      forceRefresh: allowRemoteFetch && user.role === 'admin' && c.req.query('refresh') === '1',
+      allowRemoteFetch,
     });
 
     const accept = (c.req.header('accept') ?? '').toLowerCase();
@@ -2799,16 +3610,16 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json({ error: 'Node mode must be "tailscale" or "public_ip".' }, 400);
     }
 
-    const parsedEndpoint = parseNodeEndpoint(rawEndpoint);
-    if (!parsedEndpoint) {
+    const endpointCheck = validateNodeEndpoint(rawEndpoint, mode, { allowLoopbackNodes });
+    if (!endpointCheck.valid) {
       return c.json(
         {
-          error:
-            'Invalid node endpoint. Expected "<host>:<port>" or "<host>" (default port 9443).',
+          error: endpointCheck.error,
         },
         400,
       );
     }
+    const parsedEndpoint = endpointCheck.parsed;
 
     let tlsFingerprint: string | null = null;
     if (typeof body.tlsFingerprint === 'string' && body.tlsFingerprint.trim().length > 0) {
@@ -2857,19 +3668,23 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       createdAt,
     );
 
-    let serverOrigin: string | undefined;
-    try {
-      serverOrigin = new URL(c.req.url).origin;
-    } catch {
-      serverOrigin = undefined;
-    }
+    const serverOrigin = resolveEffectiveOrigin(c, isTrustProxy()) ?? undefined;
 
-    const installCommand = buildNodeInstallCommand({
-      mode,
-      endpoint: parsedEndpoint.normalized,
-      rawToken,
-      serverOrigin,
-    });
+    let installCommand: string;
+    try {
+      installCommand = buildNodeInstallCommand({
+        mode,
+        endpoint: parsedEndpoint.normalized,
+        rawToken,
+        serverOrigin,
+      });
+    } catch {
+      installCommand = buildNodeInstallCommand({
+        mode,
+        endpoint: parsedEndpoint.normalized,
+        rawToken,
+      });
+    }
     const publicIpWarning = mode === 'public_ip' ? PUBLIC_IP_WARNING_MESSAGE : null;
 
     writeSystemLog(
@@ -3549,14 +4364,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json({ error: 'Invalid JSON request body.' }, 400);
     }
 
-    let requestOrigin: string | null = c.req.header('origin') ?? null;
-    if (!requestOrigin) {
-      try {
-        requestOrigin = new URL(c.req.url).origin;
-      } catch {
-        requestOrigin = null;
-      }
-    }
+    const requestOrigin = resolveEffectiveOrigin(c, isTrustProxy());
 
     try {
       const created = createInvitation(
@@ -3593,18 +4401,52 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   });
 
   app.post('/api/invitations/:token/accept', async (c) => {
-    let body: Record<string, unknown>;
-    try {
-      body = (await c.req.json()) as Record<string, unknown>;
-    } catch {
-      return c.json({ error: 'Invalid JSON request body.' }, 400);
+    const clientIp = resolveEffectiveClientIp(c, isTrustProxy());
+    const inviteIpKey = `invite:ip:${clientIp}`;
+    if (rateLimitEnabled) {
+      const ipCheck = authRateLimiter.check(inviteIpKey, inviteAcceptMaxAttempts);
+      if (!ipCheck.allowed) {
+        return c.json(
+          { error: 'Too many invitation attempts. Please try again later.' },
+          429,
+          { 'Retry-After': String(ipCheck.retryAfterSec) },
+        );
+      }
     }
 
     let rawToken = c.req.param('token') ?? '';
     try {
       rawToken = decodeURIComponent(rawToken);
     } catch {
+      if (rateLimitEnabled) {
+        authRateLimiter.record(inviteIpKey);
+      }
       return c.json({ error: 'Malformed invitation token.' }, 400);
+    }
+
+    const inviteTokenKey = rawToken.trim()
+      ? `invite:token:${sha256Hex(rawToken.trim())}`
+      : null;
+    if (rateLimitEnabled && inviteTokenKey) {
+      const tokenCheck = authRateLimiter.check(inviteTokenKey, inviteAcceptMaxAttempts);
+      if (!tokenCheck.allowed) {
+        return c.json(
+          { error: 'Too many invitation attempts. Please try again later.' },
+          429,
+          { 'Retry-After': String(tokenCheck.retryAfterSec) },
+        );
+      }
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await c.req.json()) as Record<string, unknown>;
+    } catch {
+      if (rateLimitEnabled) {
+        authRateLimiter.record(inviteIpKey);
+        if (inviteTokenKey) authRateLimiter.record(inviteTokenKey);
+      }
+      return c.json({ error: 'Invalid JSON request body.' }, 400);
     }
 
     try {
@@ -3616,9 +4458,14 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         nowSeconds(),
       );
 
+      if (rateLimitEnabled && inviteTokenKey) {
+        authRateLimiter.clear(inviteTokenKey);
+      }
+
       setCookie(c, SESSION_COOKIE_NAME, accepted.sessionToken, {
         httpOnly: true,
         sameSite: 'Lax',
+        secure: shouldUseSecureCookie(c),
         path: '/',
         maxAge: SESSION_TTL_SECONDS,
       });
@@ -3626,6 +4473,10 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json({ user: accepted.user }, 201);
     } catch (err) {
       if (err instanceof UserHttpError) {
+        if (rateLimitEnabled) {
+          authRateLimiter.record(inviteIpKey);
+          if (inviteTokenKey) authRateLimiter.record(inviteTokenKey);
+        }
         return c.json({ error: err.message }, err.status);
       }
       throw err;
@@ -3996,6 +4847,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       masterKey,
       registry,
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       upstreamTls: options.upstreamTls,
       now,
       userId: user.id,
@@ -4109,6 +4962,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       masterKey,
       registry,
       fetchImpl,
+      allowLocalhost: effectiveAllowLocalhostUpstreams,
+      dnsLookup,
       upstreamTls: options.upstreamTls,
       now,
       userId: user.id,

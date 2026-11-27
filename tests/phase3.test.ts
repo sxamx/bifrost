@@ -13,6 +13,7 @@ import {
   createBifrostNodeServer,
   loadOrGenerateTlsMaterial,
 } from '../nodes/dist/index.js';
+import { closeHttpServer, createOfflineFetch } from './helpers/test-app.js';
 
 function createTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `bifrost-p3-${prefix}-`));
@@ -177,15 +178,13 @@ describe('Phase 3 Backend — Exit Nodes, HTTP CONNECT Zero-Knowledge Routing, R
     for (const n of activeNodeServers) {
       await n.stop().catch(() => {});
     }
-    await new Promise<void>((resolve) => {
-      upstreamHttpsServer.close(() => resolve());
-    });
+    await closeHttpServer(upstreamHttpsServer);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
   it('end-to-end Phase 3 lifecycle: HU-11, HU-11b, HTTP CONNECT zero-knowledge TLS routing, HU-08, HU-11d, HU-11c, HU-12 & HU-13', async () => {
     const dataDir = path.join(tmpDir, 'data');
-    const resolved = resolveMasterKey({ dataDir, env: {} });
+    const resolved = resolveMasterKey({ dataDir, envMasterKey: undefined });
     const db = openDatabase(resolved.dbPath);
 
     let fakeNowMs = 1_760_000_000_000;
@@ -193,6 +192,7 @@ describe('Phase 3 Backend — Exit Nodes, HTTP CONNECT Zero-Knowledge Routing, R
       db,
       masterKey: resolved.key,
       now: () => fakeNowMs,
+      fetchImpl: createOfflineFetch(),
       upstreamTls: {
         pinnedFingerprintSha256: upstreamTlsMaterial.fingerprintSha256,
       },
@@ -933,9 +933,9 @@ describe('Phase 3 Backend — Exit Nodes, HTTP CONNECT Zero-Knowledge Routing, R
 
   it('validates node input constraints, duplicate endpoints, and explicit POST key collision confirmation', async () => {
     const dataDir = path.join(tmpDir, 'data-edge');
-    const resolved = resolveMasterKey({ dataDir, env: {} });
+    const resolved = resolveMasterKey({ dataDir, envMasterKey: undefined });
     const db = openDatabase(resolved.dbPath);
-    const app = createApp({ db, masterKey: resolved.key });
+    const app = createApp({ db, masterKey: resolved.key, fetchImpl: createOfflineFetch() });
 
     try {
       const setupRes = await app.request('http://bifrost.local/api/setup', {

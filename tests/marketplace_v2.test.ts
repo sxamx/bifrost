@@ -26,9 +26,10 @@ function extractCookieHeader(res: Response): string {
 describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updates', () => {
   it('starts with official source disabled (opt-in) on fresh DB and returns empty catalog + recommended source', async () => {
     const tmpDir = makeTempDir();
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
       let fetchCalled = false;
 
       const app = createApp({
@@ -86,17 +87,18 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
         'https://raw.githubusercontent.com/mazzapata/providers/main/index.json',
       );
 
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 
   it('enforces admin-only 403 on all /api/marketplace/sources and /api/marketplace/update-installed routes', async () => {
     const tmpDir = makeTempDir();
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
       const app = createApp({ db, masterKey });
 
       const setupRes = await app.request('http://localhost/api/setup', {
@@ -158,17 +160,18 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       );
       assert.equal(updateInstalled.status, 403);
 
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 
   it('enforces strict SSRF protection on POST /api/marketplace/sources and blocks deleting official source', async () => {
     const tmpDir = makeTempDir();
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
       const app = createApp({ db, masterKey });
 
       const setupRes = await app.request('http://localhost/api/setup', {
@@ -205,8 +208,8 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       });
       assert.equal(delOfficial.status, 400);
 
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -215,9 +218,10 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
     const tmpDir = makeTempDir();
     let clockMs = Date.UTC(2026, 10, 22, 12, 0, 0);
 
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
 
       let groqVersion = 1;
       let officialFetches = 0;
@@ -525,8 +529,8 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       );
       assert.equal(delCommunity.status, 200);
 
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -538,90 +542,99 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
     try {
       // 1. Standard migration from legacy official URL -> new official URL + cache cleanup
       const db1 = openDatabase(dbPath);
-      db1
-        .prepare(
-          `UPDATE marketplace_sources
-           SET name = 'Legacy Official', url = ?, enabled = 1,
-               catalog_version = '2026-11-01', last_checked_at = 1700000000, last_error = 'old err'
-           WHERE id = 'official'`,
-        )
-        .run(legacyUrl);
-      db1
-        .prepare(
-          `INSERT OR REPLACE INTO external_cache (cache_key, payload_json, etag, fetched_at)
-           VALUES ('marketplace_source:official', '{}', NULL, 1700000000),
-                  ('marketplace:index', '{}', NULL, 1700000000),
-                  ('marketplace:unapproved', '{}', NULL, 1700000000),
-                  ('unrelated_cache', '{}', NULL, 1700000000)`,
-        )
-        .run();
-      db1.close();
+      try {
+        db1
+          .prepare(
+            `UPDATE marketplace_sources
+             SET name = 'Legacy Official', url = ?, enabled = 1,
+                 catalog_version = '2026-11-01', last_checked_at = 1700000000, last_error = 'old err'
+             WHERE id = 'official'`,
+          )
+          .run(legacyUrl);
+        db1
+          .prepare(
+            `INSERT OR REPLACE INTO external_cache (cache_key, payload_json, etag, fetched_at)
+             VALUES ('marketplace_source:official', '{}', NULL, 1700000000),
+                    ('marketplace:index', '{}', NULL, 1700000000),
+                    ('marketplace:unapproved', '{}', NULL, 1700000000),
+                    ('unrelated_cache', '{}', NULL, 1700000000)`,
+          )
+          .run();
+      } finally {
+        db1.close();
+      }
 
       // Re-opening runs ensureOfficialMarketplaceSource migration
       const db2 = openDatabase(dbPath);
-      const migrated = db2
-        .prepare(
-          `SELECT id, name, url, is_official, enabled, catalog_version, last_checked_at, last_error
-           FROM marketplace_sources WHERE id = 'official'`,
-        )
-        .get() as {
-        id: string;
-        name: string;
-        url: string;
-        is_official: number;
-        enabled: number;
-        catalog_version: string | null;
-        last_checked_at: number | null;
-        last_error: string | null;
-      };
-      assert.equal(migrated.name, OFFICIAL_MARKETPLACE_SOURCE_NAME);
-      assert.equal(migrated.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
-      assert.equal(migrated.is_official, 1);
-      assert.equal(migrated.enabled, 1);
-      assert.equal(migrated.catalog_version, null);
-      assert.equal(migrated.last_checked_at, null);
-      assert.equal(migrated.last_error, null);
+      try {
+        const migrated = db2
+          .prepare(
+            `SELECT id, name, url, is_official, enabled, catalog_version, last_checked_at, last_error
+             FROM marketplace_sources WHERE id = 'official'`,
+          )
+          .get() as {
+          id: string;
+          name: string;
+          url: string;
+          is_official: number;
+          enabled: number;
+          catalog_version: string | null;
+          last_checked_at: number | null;
+          last_error: string | null;
+        };
+        assert.equal(migrated.name, OFFICIAL_MARKETPLACE_SOURCE_NAME);
+        assert.equal(migrated.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
+        assert.equal(migrated.is_official, 1);
+        assert.equal(migrated.enabled, 1);
+        assert.equal(migrated.catalog_version, null);
+        assert.equal(migrated.last_checked_at, null);
+        assert.equal(migrated.last_error, null);
 
-      const cacheKeys = (
+        const cacheKeys = (
+          db2
+            .prepare(`SELECT cache_key FROM external_cache ORDER BY cache_key`)
+            .all() as Array<{ cache_key: string }>
+        ).map((r) => r.cache_key);
+        assert.deepEqual(cacheKeys, ['unrelated_cache']);
+
+        // 2. Edge case: user already added mazzapata/providers as a custom source -> no UNIQUE(url) crash on DB init OR createApp(marketplaceUrl)
         db2
-          .prepare(`SELECT cache_key FROM external_cache ORDER BY cache_key`)
-          .all() as Array<{ cache_key: string }>
-      ).map((r) => r.cache_key);
-      assert.deepEqual(cacheKeys, ['unrelated_cache']);
-
-      // 2. Edge case: user already added mazzapata/providers as a custom source -> no UNIQUE(url) crash on DB init OR createApp(marketplaceUrl)
-      db2
-        .prepare(`UPDATE marketplace_sources SET url = ?, name = 'Legacy Official' WHERE id = 'official'`)
-        .run(legacyUrl);
-      db2
-        .prepare(
-          `INSERT INTO marketplace_sources (id, name, url, is_official, enabled, created_at)
-           VALUES ('custom-mp', 'Mi Mazzapata', ?, 0, 0, 1700000001)`,
-        )
-        .run(OFFICIAL_MARKETPLACE_SOURCE_URL);
-      db2.close();
+          .prepare(`UPDATE marketplace_sources SET url = ?, name = 'Legacy Official' WHERE id = 'official'`)
+          .run(legacyUrl);
+        db2
+          .prepare(
+            `INSERT INTO marketplace_sources (id, name, url, is_official, enabled, created_at)
+             VALUES ('custom-mp', 'Mi Mazzapata', ?, 0, 0, 1700000001)`,
+          )
+          .run(OFFICIAL_MARKETPLACE_SOURCE_URL);
+      } finally {
+        db2.close();
+      }
 
       // Must open cleanly without throwing UNIQUE constraint error
       const db3 = openDatabase(dbPath);
-      const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      // Must also boot createApp cleanly when BIFROST_MARKETPLACE_URL / marketplaceUrl matches the custom source URL
-      const app = createApp({
-        db: db3,
-        masterKey,
-        marketplaceUrl: OFFICIAL_MARKETPLACE_SOURCE_URL,
-      });
-      const healthRes = await app.request('http://localhost/api/health');
-      assert.equal(healthRes.status, 200);
+      try {
+        const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
+        // Must also boot createApp cleanly when BIFROST_MARKETPLACE_URL / marketplaceUrl matches the custom source URL
+        const app = createApp({
+          db: db3,
+          masterKey,
+          marketplaceUrl: OFFICIAL_MARKETPLACE_SOURCE_URL,
+        });
+        const healthRes = await app.request('http://localhost/api/health');
+        assert.equal(healthRes.status, 200);
 
-      const rows = db3
-        .prepare(`SELECT id, url, enabled FROM marketplace_sources ORDER BY id`)
-        .all() as Array<{ id: string; url: string; enabled: number }>;
-      assert.equal(rows.length, 2);
-      const customRow = rows.find((r) => r.id === 'custom-mp');
-      assert.equal(customRow?.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
-      assert.equal(customRow?.enabled, 1);
-      assert.equal(rows.find((r) => r.id === 'official')?.url, legacyUrl);
-      db3.close();
+        const rows = db3
+          .prepare(`SELECT id, url, enabled FROM marketplace_sources ORDER BY id`)
+          .all() as Array<{ id: string; url: string; enabled: number }>;
+        assert.equal(rows.length, 2);
+        const customRow = rows.find((r) => r.id === 'custom-mp');
+        assert.equal(customRow?.url, OFFICIAL_MARKETPLACE_SOURCE_URL);
+        assert.equal(customRow?.enabled, 1);
+        assert.equal(rows.find((r) => r.id === 'official')?.url, legacyUrl);
+      } finally {
+        db3.close();
+      }
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -629,9 +642,10 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
 
   it('normalizes legacy BIFROST_MARKETPLACE_URL passed to createApp to OFFICIAL_MARKETPLACE_SOURCE_URL while preserving custom URLs', async () => {
     const tmpDir = makeTempDir();
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'legacy-env.db'));
+      db = openDatabase(path.join(tmpDir, 'legacy-env.db'));
 
       // Passing the legacy Watchtower-inherited URL must normalize id='official' to mazzapata/providers
       const app1 = createApp({
@@ -664,8 +678,8 @@ describe('HU-42 — Multi-Repo Marketplace, Versioning & In-Place Manifest Updat
       assert.equal(customRow.url, customUrl);
       assert.equal(customRow.enabled, 1);
 
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

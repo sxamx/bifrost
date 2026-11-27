@@ -30,11 +30,67 @@ export function readExternalCache<T>(
     return null;
   }
 
-  return {
-    data: JSON.parse(row.payload_json) as T,
-    etag: row.etag,
-    fetchedAt: Number(row.fetched_at),
-  };
+  try {
+    return {
+      data: JSON.parse(row.payload_json) as T,
+      etag: row.etag,
+      fetchedAt: Number(row.fetched_at),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function readResponseBufferWithLimit(
+  res: Response,
+  maxBytes = 64 * 1024 * 1024,
+): Promise<Buffer> {
+  const contentLengthHeader = res.headers.get('content-length');
+  if (contentLengthHeader !== null) {
+    const declaredBytes = Number(contentLengthHeader);
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+      if (res.body) {
+        await res.body.cancel().catch(() => {});
+      }
+      throw new Error(
+        `Response Content-Length (${declaredBytes} bytes) exceeds maximum allowed (${maxBytes} bytes).`,
+      );
+    }
+  }
+
+  if (!res.body) {
+    const ab = await res.arrayBuffer();
+    if (ab.byteLength > maxBytes) {
+      throw new Error(
+        `Response body (${ab.byteLength} bytes) exceeds maximum allowed (${maxBytes} bytes).`,
+      );
+    }
+    return Buffer.from(ab);
+  }
+
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error(
+          `Streamed response body exceeded maximum allowed size (${maxBytes} bytes).`,
+        );
+      }
+      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks, totalBytes);
 }
 
 export function writeExternalCache(

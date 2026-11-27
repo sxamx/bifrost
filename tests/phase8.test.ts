@@ -132,7 +132,7 @@ describe('Phase 8 Backend Acceptance & Red-Team Security Tests (HU-04, HU-05, HU
         const restrictedModel = 'openrouter/deepseek/deepseek-r1:free';
 
         // 3. Admin creates a single-use guest invitation
-        const invRes = await app.request('http://localhost/api/invitations', {
+        const invRes = await app.request('https://bifrost.example.com/api/invitations', {
           method: 'POST',
           headers: {
             Cookie: adminCookie,

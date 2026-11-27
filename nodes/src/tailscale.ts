@@ -27,7 +27,16 @@ export interface DetectTailscaleOptions {
  * or `tailscale ip -4` CLI fallback.
  */
 export function detectTailscaleIpv4(options: DetectTailscaleOptions = {}): string | null {
-  const interfaces = options.interfaces ?? os.networkInterfaces();
+  let interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]>;
+  if (options.interfaces !== undefined) {
+    interfaces = options.interfaces;
+  } else {
+    try {
+      interfaces = os.networkInterfaces();
+    } catch {
+      interfaces = {};
+    }
+  }
   const preferredMatches: string[] = [];
   const fallbackMatches: string[] = [];
 

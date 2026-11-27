@@ -38,10 +38,10 @@ export function redactExplicitSecrets(
 }
 
 /**
- * Scrubs explicit raw secrets (literal + URL-encoded), raw API keys, bearer/basic tokens,
- * node tokens, internal sk-bf- keys, query params, and provider prefixes from log strings.
+ * Redacts explicit secret values (literal + URL-encoded) and common API key,
+ * bearer/basic token, node token, internal sk-bf- key, and query-param patterns from text.
  */
-export function scrubSecretsFromText(
+export function redactSecretsInText(
   text: string,
   explicitSecrets?: ReadonlyArray<string | null | undefined>,
 ): string {
@@ -56,6 +56,16 @@ export function scrubSecretsFromText(
     .replace(/AIza[A-Za-z0-9_-]{16,}/g, 'AIza[REDACTED]')
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [REDACTED]')
     .replace(/([?&](?:key|api_key|apikey|token|access_token)=)[^&\s"'#]+/gi, '$1[REDACTED]');
+}
+
+/**
+ * Scrubs raw API keys, bearer/basic tokens, node tokens, internal sk-bf- keys, query params, and provider prefixes from log strings.
+ */
+export function scrubSecretsFromText(
+  text: string,
+  explicitSecrets?: ReadonlyArray<string | null | undefined>,
+): string {
+  return redactSecretsInText(text, explicitSecrets);
 }
 
 export function scrubMetaValue(value: unknown, depth = 0): unknown {
