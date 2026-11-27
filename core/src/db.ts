@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   endpoint TEXT NOT NULL,
   token_hash TEXT NOT NULL,
   encrypted_token BLOB,
+  pending_encrypted_token BLOB,
   tls_fingerprint TEXT,
   last_commit TEXT,
   prev_token_hash TEXT,
@@ -237,6 +238,9 @@ function ensureNodesColumns(db: DatabaseSync): void {
 
   if (!colNames.has('encrypted_token')) {
     db.exec(`ALTER TABLE nodes ADD COLUMN encrypted_token BLOB;`);
+  }
+  if (!colNames.has('pending_encrypted_token')) {
+    db.exec(`ALTER TABLE nodes ADD COLUMN pending_encrypted_token BLOB;`);
   }
   if (!colNames.has('tls_fingerprint')) {
     db.exec(`ALTER TABLE nodes ADD COLUMN tls_fingerprint TEXT;`);
@@ -468,7 +472,7 @@ export function openDatabase(dbPath: string): DatabaseSync {
 }
 
 const SENSITIVE_FIELD_RE =
-  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|x-api-key|x-goog-api-key|token|token_hash|tokenHash|prev_token_hash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|inviteUrl|invite_url|encrypted_token|encryptedToken|masterKey|master_key|authorization|proxy-authorization|proxy_authorization|cookie)$/i;
+  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|x-api-key|x-goog-api-key|token|token_hash|tokenHash|prev_token_hash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|inviteUrl|invite_url|encrypted_token|encryptedToken|pending_encrypted_token|pendingEncryptedToken|masterKey|master_key|authorization|proxy-authorization|proxy_authorization|cookie)$/i;
 
 function sanitizeLogValue(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[TRUNCATED]';

@@ -6,6 +6,7 @@ import {
   loadModelsDevSnapshot,
   parseReleaseDateToUtcSeconds,
   resolveCanonicalAndEnrichModel,
+  stripFreeAndDateSuffix,
 } from './catalog/models-dev.js';
 import { decryptSecret } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
@@ -212,6 +213,8 @@ function matchesFreeRule(rawModel: Record<string, unknown>, freeRule?: ProviderF
       if (!matched) {
         return false;
       }
+    } else {
+      return false;
     }
   }
 
@@ -261,11 +264,9 @@ function normalizeUpstreamApiModel(
   let canonicalModelId: string | null = enriched.canonicalModelId;
   if (!canonicalModelId) {
     if (rawCanonicalSlug) {
-      canonicalModelId = rawCanonicalSlug.replace(/:free$/i, '').replace(/-\d{8}$/, '');
-    } else if (modelId.endsWith(':free')) {
-      canonicalModelId = modelId.slice(0, -5);
-    } else if (modelId.endsWith('-free')) {
-      canonicalModelId = modelId.slice(0, -5);
+      canonicalModelId = stripFreeAndDateSuffix(rawCanonicalSlug);
+    } else if (/:free$/i.test(modelId) || /-free$/i.test(modelId)) {
+      canonicalModelId = stripFreeAndDateSuffix(modelId);
     }
   }
 
@@ -495,6 +496,20 @@ export function formatModelRow(
     );
     const enrichedContextLength = base.contextLength ?? md.contextLength;
     const enrichedMaxOutput = base.maxOutput ?? md.maxOutput;
+    const enrichedModalities = md.modalities
+      ? {
+          input: mergeUniqueStrings(base.modalities.input, md.modalities.input),
+          output: mergeUniqueStrings(base.modalities.output, md.modalities.output),
+        }
+      : base.modalities;
+    const enrichedCapabilities = md.capabilities
+      ? {
+          tools: base.capabilities.tools || md.capabilities.tools,
+          reasoning: base.capabilities.reasoning || md.capabilities.reasoning,
+          structuredOutput:
+            base.capabilities.structuredOutput || md.capabilities.structuredOutput,
+        }
+      : base.capabilities;
     const hasCatalogInfo = Boolean(
       md.capabilities !== null ||
         enrichedContextLength !== null ||
@@ -509,6 +524,8 @@ export function formatModelRow(
       canonicalModelId: base.canonicalModelId ?? md.canonicalModelId,
       contextLength: enrichedContextLength,
       maxOutput: enrichedMaxOutput,
+      modalities: enrichedModalities,
+      capabilities: enrichedCapabilities,
       family: md.family,
       releaseDate: md.releaseDate,
       hasCatalogInfo,

@@ -3085,12 +3085,21 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       serverOrigin = undefined;
     }
 
-    const installCommand = buildNodeInstallCommand({
-      mode,
-      endpoint: parsedEndpoint.normalized,
-      rawToken,
-      serverOrigin,
-    });
+    let installCommand: string;
+    try {
+      installCommand = buildNodeInstallCommand({
+        mode,
+        endpoint: parsedEndpoint.normalized,
+        rawToken,
+        serverOrigin,
+      });
+    } catch {
+      installCommand = buildNodeInstallCommand({
+        mode,
+        endpoint: parsedEndpoint.normalized,
+        rawToken,
+      });
+    }
     const publicIpWarning = mode === 'public_ip' ? PUBLIC_IP_WARNING_MESSAGE : null;
 
     writeSystemLog(
