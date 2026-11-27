@@ -293,7 +293,9 @@ describe('Phase 7 Backend — Community Marketplace, Sidecar Adapters, Multi-Acc
       assert.equal(sidecarAuthSeen.length, 2);
 
       // 6) Offline bundled fallback (clear external_cache & set remoteMarketplaceOffline=true)
-      db.prepare(`DELETE FROM external_cache WHERE cache_key = 'marketplace:index'`).run();
+      db.prepare(
+        `DELETE FROM external_cache WHERE cache_key = 'marketplace:index' OR cache_key LIKE 'marketplace_source:%'`,
+      ).run();
       remoteMarketplaceOffline = true;
       const offlineMpRes = await app.request('http://localhost/api/marketplace', {
         headers: { Cookie: adminCookie },
