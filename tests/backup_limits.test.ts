@@ -77,8 +77,16 @@ describe('Ola 5 Regression Suite — Backups V2, Master Key Secrets, Draining, A
       return new Response('Not found', { status: 404 });
     };
 
+    const stubDnsLookup = async () => [{ address: '93.184.216.34', family: 4 as const }];
+
     try {
-      const appA = createApp({ db: dbA, masterKey: masterKeyA, fetchImpl: mockFetch, now: () => nowMs });
+      const appA = createApp({
+        db: dbA,
+        masterKey: masterKeyA,
+        fetchImpl: mockFetch,
+        dnsLookup: stubDnsLookup,
+        now: () => nowMs,
+      });
       const setupA = await appA.request('http://localhost/api/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -112,7 +120,18 @@ describe('Ola 5 Regression Suite — Backups V2, Master Key Secrets, Draining, A
       assert.equal(addKeyRes.status, 201);
       const keyAId = ((await addKeyRes.json()) as { key: { id: string; status: string } }).key.id;
 
-      // Add a second active key temporarily so detect-models works, or insert model directly with disabled_by_admin = 1
+      // Add a second active key so detect-models works without touching the disabled key
+      const addActiveKeyRes = await appA.request('http://localhost/api/providers/openrouter/keys', {
+        method: 'POST',
+        headers: { Cookie: cookieA, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          label: 'Active Sync Key',
+          secret: 'sk-or-active-sync-secret-0002',
+          status: 'active',
+        }),
+      });
+      assert.equal(addActiveKeyRes.status, 201);
+
       const syncRes = await appA.request('http://localhost/api/providers/openrouter/detect-models', {
         method: 'POST',
         headers: { Cookie: cookieA },

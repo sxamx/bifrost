@@ -584,7 +584,9 @@ describe('Real-Time SSE Streaming End-to-End (No Buffering)', () => {
         const [host, portStr] = String(req.url ?? '').split(':');
         const upSock = net.connect(Number(portStr), host!, () => {
           upSock.setNoDelay(true);
-          clientSock.setNoDelay(true);
+          if ('setNoDelay' in clientSock && typeof clientSock.setNoDelay === 'function') {
+            clientSock.setNoDelay(true);
+          }
           clientSock.write('HTTP/1.1 200 Connection Established\r\n\r\n');
           if (head && head.length > 0) upSock.write(head);
           upSock.pipe(clientSock);

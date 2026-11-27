@@ -172,8 +172,9 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
         version: string;
         active_tunnels: number;
       };
+      const pkgVersion = (JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')) as { version: string }).version;
       assert.equal(healthBody.ok, true);
-      assert.equal(healthBody.version, '0.1.0');
+      assert.equal(healthBody.version, pkgVersion);
       assert.equal(healthBody.active_tunnels, 1);
 
       const postBody = JSON.stringify({ prompt: 'Zero-knowledge test message' });
@@ -494,7 +495,11 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
 
     const rawState = fs.readFileSync(stateFilePath, 'utf8');
     assert.ok(!rawState.includes(rotatedToken), 'State file must never contain plaintext token');
-    assert.equal(fs.statSync(stateFilePath).mode & 0o777, 0o600);
+    const stateStat = fs.statSync(stateFilePath);
+    assert.ok(stateStat.isFile() && stateStat.size > 0, 'State file must exist and have non-zero size');
+    if (process.platform !== 'win32') {
+      assert.equal(stateStat.mode & 0o777, 0o600);
+    }
 
     const restartedNode = createBifrostNodeServer({
       mode: 'tailscale',
@@ -622,11 +627,20 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
     assert.equal(parsed.port, 9555);
 
     const scriptPath = path.join(__dirname, 'install-node.sh');
-    execFileSync('bash', ['-n', scriptPath]);
-    const helpOut = execFileSync('bash', [scriptPath, '--help'], { encoding: 'utf8' });
-    assert.match(helpOut, /--token/);
-    assert.match(helpOut, /--mode/);
-    assert.match(helpOut, /--port/);
+    assert.ok(fs.existsSync(scriptPath), 'install-node.sh must exist');
+    try {
+      execFileSync('bash', ['-n', scriptPath]);
+      const helpOut = execFileSync('bash', [scriptPath, '--help'], { encoding: 'utf8' });
+      assert.match(helpOut, /--token/);
+      assert.match(helpOut, /--mode/);
+      assert.match(helpOut, /--port/);
+    } catch (err) {
+      if (process.platform === 'win32' && (err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        // bash is not installed in this Windows environment; skip only the bash -n / --help sub-check.
+      } else {
+        throw err;
+      }
+    }
   });
 
   it('exposes commit in /_bifrost/health and supports authenticated POST /_bifrost/update', async () => {
@@ -682,8 +696,9 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
       assert.deepEqual(
         ranCommands.map((c) => [c.cmd, ...c.args]),
         [
-          ['git', 'pull', '--ff-only'],
-          ['npm', '--prefix', 'nodes', 'ci', '--include=dev'],
+          ['git', 'fetch', '--depth', '1', 'origin', 'main'],
+          ['git', 'reset', '--hard', 'origin/main'],
+          ['npm', '--prefix', 'nodes', 'ci', '--include=dev', '--ignore-scripts'],
           ['npm', '--prefix', 'nodes', 'run', 'build']
         ]
       );

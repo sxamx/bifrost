@@ -9,9 +9,11 @@
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "test": "node --import tsx --test ../tests/phase1.test.ts ../tests/phase2.test.ts ../tests/phase3.test.ts ../tests/phase4.test.ts ../tests/phase5.test.ts ../tests/phase6.test.ts ../tests/phase7.test.ts ../tests/phase8.test.ts ../tests/backup_limits.test.ts ../tests/security-hardening.test.ts ../tests/privacy.test.ts ../tests/v1_1_features.test.ts ../tests/adaptive_quotas.test.ts ../tests/update_checker.test.ts ../tests/marketplace_v2.test.ts ../tests/playground_history.test.ts ../tests/streaming_realtime.test.ts"
+    "pretest": "npm --prefix ../nodes run build",
+    "test": "node ../scripts/run-core-tests.mjs"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",

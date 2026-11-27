@@ -8,6 +8,7 @@ import { createApp } from '../core/src/app.js';
 import { encryptSecret } from '../core/src/crypto.js';
 import { openDatabase } from '../core/src/db.js';
 import { validateProviderManifest } from '../core/src/schema.js';
+import { closeHttpServer, createOfflineFetch } from './helpers/test-app.js';
 
 const openServers: http.Server[] = [];
 
@@ -39,7 +40,7 @@ function extractCookiePair(setCookieHeader: string | null): string {
 afterEach(async () => {
   while (openServers.length > 0) {
     const srv = openServers.pop()!;
-    await new Promise<void>((resolve) => srv.close(() => resolve()));
+    await closeHttpServer(srv);
   }
 });
 
@@ -158,6 +159,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
           db,
           masterKey,
           marketplaceUrl: `${mockCatalog.url}/index.json`,
+          fetchImpl: createOfflineFetch(),
         });
 
         const setupRes = await app.request('http://localhost/api/setup', {
@@ -248,6 +250,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
           db,
           masterKey,
           now: () => clockMs,
+          fetchImpl: createOfflineFetch(),
         });
 
         const setupRes = await app.request('http://localhost/api/setup', {
@@ -440,7 +443,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
           res.end(JSON.stringify({ error: { message: 'RPM burst limit' } }));
         });
 
-        const app = createApp({ db, masterKey, now: () => clockMs });
+        const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
         const setupRes = await app.request('http://localhost/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -553,7 +556,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
       const nowSec = Math.floor(clockMs / 1000);
 
       try {
-        const app = createApp({ db, masterKey, now: () => clockMs });
+        const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
         const setupRes = await app.request('http://localhost/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -665,7 +668,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
         const nowSec = Math.floor(clockMs / 1000);
 
         try {
-          const app = createApp({ db, masterKey, now: () => clockMs });
+          const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
           const setupRes = await app.request('http://localhost/api/setup', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -745,7 +748,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
       const nowSec = Math.floor(clockMs / 1000);
 
       try {
-        const app = createApp({ db, masterKey, now: () => clockMs });
+        const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
         const setupRes = await app.request('http://localhost/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -808,7 +811,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
       const nowSec = Math.floor(clockMs / 1000);
 
       try {
-        const app = createApp({ db, masterKey, now: () => clockMs });
+        const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
         const setupRes = await app.request('http://localhost/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -909,7 +912,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
       const nowSec = Math.floor(clockMs / 1000);
 
       try {
-        const app = createApp({ db, masterKey, now: () => clockMs });
+        const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
         const setupRes = await app.request('http://localhost/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1099,7 +1102,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
           res.end(JSON.stringify({ error: { message: 'Upstream :free provider rate-limited' } }));
         });
 
-        const app = createApp({ db, masterKey, now: () => clockMs });
+        const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
         const setupRes = await app.request('http://localhost/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1312,7 +1315,7 @@ describe('HU-38 & HU-39: Marketplace Rate-Limit Metadata & Adaptive Free-Tier Qu
       const nowSec = Math.floor(clockMs / 1000);
 
       try {
-        const app = createApp({ db, masterKey, now: () => clockMs });
+        const app = createApp({ db, masterKey, now: () => clockMs, fetchImpl: createOfflineFetch() });
         const setupRes = await app.request('http://localhost/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

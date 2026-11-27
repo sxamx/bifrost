@@ -8,6 +8,7 @@ import { createApp } from '../core/src/app.js';
 import { encryptSecret } from '../core/src/crypto.js';
 import { openDatabase } from '../core/src/db.js';
 import { validateProviderManifest } from '../core/src/schema.js';
+import { closeHttpServer, createOfflineFetch } from './helpers/test-app.js';
 
 const openServers: http.Server[] = [];
 
@@ -39,11 +40,11 @@ function extractCookiePair(setCookieHeader: string | null): string {
 afterEach(async () => {
   while (openServers.length > 0) {
     const srv = openServers.pop()!;
-    await new Promise<void>((resolve) => srv.close(() => resolve()));
+    await closeHttpServer(srv);
   }
 });
 
-function baseManifest(overrides: Record<string, unknown> = {}) {
+function baseManifest<T extends Record<string, unknown> = Record<string, never>>(overrides?: T) {
   return {
     schemaVersion: '1.0',
     id: 'test-provider',
@@ -63,7 +64,7 @@ function baseManifest(overrides: Record<string, unknown> = {}) {
         name: 'Test Model',
       },
     ],
-    ...overrides,
+    ...(overrides as T),
   };
 }
 
@@ -212,6 +213,7 @@ describe('Provider Privacy Schema & API Exposure', () => {
           db,
           masterKey,
           marketplaceUrl: `${mockCatalog.url}/index.json`,
+          fetchImpl: createOfflineFetch(),
         });
 
         // 1. Setup admin

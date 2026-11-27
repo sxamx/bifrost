@@ -23,8 +23,24 @@ import { loadOrGenerateTlsMaterial } from './tls.js';
 
 const execFileAsync = promisify(execFile);
 
-export const NODE_AGENT_VERSION = '0.1.0';
+function loadNodeAgentVersion(): string {
+  try {
+    const pkgPath = path.resolve(import.meta.dirname, '../package.json');
+    const parsed = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: unknown };
+    if (typeof parsed.version === 'string' && parsed.version.trim().length > 0) {
+      return parsed.version.trim();
+    }
+  } catch {
+    // Fallback if package.json is unavailable
+  }
+  return '0.0.0';
+}
+
+export const NODE_AGENT_VERSION = loadNodeAgentVersion();
 export const DEFAULT_NODE_PORT = 9443;
+export const DEFAULT_REQUEST_BODY_TIMEOUT_MS = 10_000;
+export const DEFAULT_TUNNEL_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+export const DEFAULT_MAX_ACTIVE_TUNNELS = 256;
 export type NodeMode = 'tailscale' | 'public_ip';
 
 export interface NodeLogger {
@@ -43,6 +59,10 @@ export interface BifrostNodeOptions {
   allowedPorts?: number[];
   allowPrivateTargets?: boolean;
   connectTimeoutMs?: number;
+  requestBodyTimeoutMs?: number;
+  tunnelIdleTimeoutMs?: number;
+  maxActiveTunnels?: number;
+  updateDrainTimeoutMs?: number;
   tlsCertPath?: string;
   tlsKeyPath?: string;
   tlsCertPem?: string;
@@ -86,35 +106,76 @@ function sendJson(res: http.ServerResponse, statusCode: number, body: Record<str
   res.end(payload);
 }
 
-function readRequestBody(req: http.IncomingMessage, maxBytes = 8192): Promise<string> {
+function readRequestBody(
+  req: http.IncomingMessage,
+  maxBytes = 8192,
+  timeoutMs = DEFAULT_REQUEST_BODY_TIMEOUT_MS
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
 
-    req.on('data', (chunk: Buffer) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('aborted', onAborted);
+      req.removeListener('close', onClose);
+    };
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      req.pause();
+      fail(Object.assign(new Error(`Request body timed out after ${timeoutMs}ms`), { statusCode: 408 }));
+    }, timeoutMs);
+    timer.unref();
+
+    const onData = (chunk: Buffer) => {
       if (settled) return;
       total += chunk.length;
       if (total > maxBytes) {
-        settled = true;
-        reject(Object.assign(new Error('Payload too large'), { statusCode: 413 }));
+        fail(Object.assign(new Error('Payload too large'), { statusCode: 413 }));
         req.resume();
         return;
       }
       chunks.push(chunk);
-    });
+    };
 
-    req.on('end', () => {
+    const onEnd = () => {
       if (settled) return;
       settled = true;
+      cleanup();
       resolve(Buffer.concat(chunks).toString('utf8'));
-    });
+    };
 
-    req.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      reject(err);
-    });
+    const onError = (err: Error) => {
+      fail(err);
+    };
+
+    const onAborted = () => {
+      fail(Object.assign(new Error('Request aborted before body completed'), { statusCode: 400 }));
+    };
+
+    const onClose = () => {
+      if (!settled && !req.complete) {
+        fail(Object.assign(new Error('Connection closed before body completed'), { statusCode: 400 }));
+      }
+    };
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('aborted', onAborted);
+    req.on('close', onClose);
   });
 }
 
@@ -179,6 +240,10 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
   const allowedPorts = new Set<number>(options.allowedPorts ?? [443]);
   const allowPrivateTargets = options.allowPrivateTargets ?? false;
   const connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
+  const requestBodyTimeoutMs = options.requestBodyTimeoutMs ?? DEFAULT_REQUEST_BODY_TIMEOUT_MS;
+  const tunnelIdleTimeoutMs = options.tunnelIdleTimeoutMs ?? DEFAULT_TUNNEL_IDLE_TIMEOUT_MS;
+  const maxActiveTunnels = options.maxActiveTunnels ?? DEFAULT_MAX_ACTIVE_TUNNELS;
+  const updateDrainTimeoutMs = options.updateDrainTimeoutMs ?? 5_000;
   const resolvedRepoDir =
     options.repoDir ??
     (process.env.BIFROST_NODE_REPO_DIR?.trim() || path.resolve(import.meta.dirname, '../..'));
@@ -232,6 +297,8 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
   const startedAtMs = nowFn();
   let boundPort = requestedPort;
   let activeTunnels = 0;
+  let pendingTunnels = 0;
+  let updateInFlight = false;
   const trackedSockets = new Set<Duplex>();
 
   server.on('connection', (socket: net.Socket) => {
@@ -244,7 +311,7 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
   });
 
   // Control plane HTTP endpoints (/_bifrost/health, /_bifrost/rotate, /_bifrost/update)
-  server.on('request', async (req: http.IncomingMessage, res: http.ServerResponse) => {
+  const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     const verification = authenticator.verifyHeaders(req.headers);
     if (!verification.authenticated) {
       sendJson(
@@ -288,7 +355,7 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
       }
 
       try {
-        const rawBody = await readRequestBody(req);
+        const rawBody = await readRequestBody(req, 8192, requestBodyTimeoutMs);
         const parsed = JSON.parse(rawBody || '{}') as { newToken?: unknown };
         if (typeof parsed.newToken !== 'string' || parsed.newToken.trim().length < 16) {
           sendJson(res, 400, {
@@ -309,7 +376,19 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
           err && typeof err === 'object' && 'statusCode' in err && typeof err.statusCode === 'number'
             ? err.statusCode
             : 400;
-        sendJson(res, statusCode, { ok: false, error: 'invalid_rotate_payload' });
+        if (!res.headersSent && !res.writableEnded) {
+          sendJson(
+            res,
+            statusCode,
+            { ok: false, error: statusCode === 408 ? 'request_timeout' : 'invalid_rotate_payload' },
+            statusCode === 408 ? { Connection: 'close' } : undefined
+          );
+          if (statusCode === 408) {
+            res.once('finish', () => {
+              req.socket?.destroy();
+            });
+          }
+        }
       }
       return;
     }
@@ -325,6 +404,14 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
         return;
       }
 
+      if (updateInFlight) {
+        sendJson(res, 409, {
+          ok: false,
+          error: 'Node update is already in progress'
+        });
+        return;
+      }
+
       if (!fs.existsSync(path.join(resolvedRepoDir, '.git'))) {
         sendJson(res, 409, {
           ok: false,
@@ -333,6 +420,8 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
         return;
       }
 
+      updateInFlight = true;
+      let restarting = false;
       const runCmd = options.runUpdateCommand ?? defaultRunNodeUpdateCommand;
       try {
         const hasUpdates = options.checkHasUpdates
@@ -351,17 +440,25 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
           return;
         }
 
-        await runCmd('git', ['pull', '--ff-only'], resolvedRepoDir);
-        await runCmd('npm', ['--prefix', 'nodes', 'ci', '--include=dev'], resolvedRepoDir);
+        await runCmd('git', ['fetch', '--depth', '1', 'origin', 'main'], resolvedRepoDir);
+        await runCmd('git', ['reset', '--hard', 'origin/main'], resolvedRepoDir);
+        await runCmd('npm', ['--prefix', 'nodes', 'ci', '--include=dev', '--ignore-scripts'], resolvedRepoDir);
         await runCmd('npm', ['--prefix', 'nodes', 'run', 'build'], resolvedRepoDir);
+        restarting = true;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error(`[bifrost-node] Auto-update failed: ${msg}`);
-        sendJson(res, 500, {
-          ok: false,
-          error: `Node update failed: ${msg}`
-        });
+        if (!res.headersSent && !res.writableEnded) {
+          sendJson(res, 500, {
+            ok: false,
+            error: `Node update failed: ${msg}`
+          });
+        }
         return;
+      } finally {
+        if (!restarting) {
+          updateInFlight = false;
+        }
       }
 
       sendJson(res, 200, {
@@ -374,17 +471,36 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
       if (options.onUpdateRestart) {
         options.onUpdateRestart();
       } else {
-        const timer = setTimeout(() => process.exit(0), 300);
+        const timer = setTimeout(() => {
+          const forceTimer = setTimeout(() => process.exit(0), updateDrainTimeoutMs);
+          forceTimer.unref();
+          server.close(() => {
+            clearTimeout(forceTimer);
+            process.exit(0);
+          });
+        }, 300);
         timer.unref();
       }
       return;
     }
 
     sendJson(res, 404, { ok: false, error: 'not_found' });
+  };
+
+  server.on('request', (req: http.IncomingMessage, res: http.ServerResponse) => {
+    void handleRequest(req, res).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`[bifrost-node] Unhandled request error: ${msg}`);
+      if (!res.headersSent && !res.writableEnded) {
+        sendJson(res, 500, { ok: false, error: 'internal_server_error' });
+      } else if (!res.destroyed) {
+        res.destroy();
+      }
+    });
   });
 
   // Data plane: Zero-knowledge HTTP CONNECT TCP tunnel
-  server.on('connect', async (req: http.IncomingMessage, clientSocket: Duplex, head: Buffer) => {
+  const handleConnect = async (req: http.IncomingMessage, clientSocket: Duplex, head: Buffer): Promise<void> => {
     clientSocket.on('error', () => {
       // Prevent unhandled socket error crashes on abrupt peer resets
     });
@@ -403,16 +519,38 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
       return;
     }
 
-    const resolution = await validateAndResolveTarget(parsedTarget, {
-      allowedPorts,
-      allowPrivateTargets
-    });
+    if (activeTunnels + pendingTunnels >= maxActiveTunnels) {
+      writeRawHttpResponse(clientSocket, '503 Service Unavailable');
+      return;
+    }
+
+    pendingTunnels += 1;
+    let pendingReleased = false;
+    const releasePending = (): void => {
+      if (!pendingReleased) {
+        pendingReleased = true;
+        pendingTunnels = Math.max(0, pendingTunnels - 1);
+      }
+    };
+
+    let resolution: Awaited<ReturnType<typeof validateAndResolveTarget>>;
+    try {
+      resolution = await validateAndResolveTarget(parsedTarget, {
+        allowedPorts,
+        allowPrivateTargets
+      });
+    } catch (err) {
+      releasePending();
+      throw err;
+    }
 
     if (clientSocket.destroyed) {
+      releasePending();
       return;
     }
 
     if (!resolution.allowed || !resolution.resolvedIp) {
+      releasePending();
       writeRawHttpResponse(clientSocket, '403 Forbidden');
       return;
     }
@@ -430,6 +568,7 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
     let tunnelReleased = false;
 
     const releaseTunnel = (): void => {
+      releasePending();
       trackedSockets.delete(clientSocket);
       trackedSockets.delete(upstreamSocket);
       if (tunnelEstablished && !tunnelReleased) {
@@ -450,9 +589,11 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
       clearTimeout(connectTimer);
       if (clientSocket.destroyed) {
         upstreamSocket.destroy();
+        releaseTunnel();
         return;
       }
 
+      releasePending();
       tunnelEstablished = true;
       activeTunnels += 1;
 
@@ -463,6 +604,17 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
       }
       if ('setKeepAlive' in clientSocket && typeof clientSocket.setKeepAlive === 'function') {
         clientSocket.setKeepAlive(true, 30_000);
+      }
+
+      if (tunnelIdleTimeoutMs > 0) {
+        const onTunnelIdleTimeout = () => {
+          if (!upstreamSocket.destroyed) upstreamSocket.destroy();
+          if (!clientSocket.destroyed) clientSocket.destroy();
+        };
+        upstreamSocket.setTimeout(tunnelIdleTimeoutMs, onTunnelIdleTimeout);
+        if ('setTimeout' in clientSocket && typeof clientSocket.setTimeout === 'function') {
+          clientSocket.setTimeout(tunnelIdleTimeoutMs, onTunnelIdleTimeout);
+        }
       }
 
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -499,6 +651,16 @@ export function createBifrostNodeServer(options: BifrostNodeOptions): BifrostNod
         upstreamSocket.destroy();
       }
       releaseTunnel();
+    });
+  };
+
+  server.on('connect', (req: http.IncomingMessage, clientSocket: Duplex, head: Buffer) => {
+    void handleConnect(req, clientSocket, head).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`[bifrost-node] Unhandled connect error: ${msg}`);
+      if (!clientSocket.destroyed) {
+        clientSocket.destroy();
+      }
     });
   });
 

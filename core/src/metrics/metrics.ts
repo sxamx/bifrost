@@ -116,9 +116,14 @@ export function getSummaryMetrics(
          JOIN models m
            ON (uma.model_full_id = m.full_id OR uma.model_full_id = '*' OR uma.model_full_id = m.provider_id || '/*')
          JOIN providers p ON p.id = m.provider_id
-         WHERE uma.user_id = ? AND m.active = 1 AND p.enabled = 1`,
+         WHERE uma.user_id = ? AND m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1`,
       )
       .get(options.userId) as { models_cnt: number; providers_cnt: number };
+
+    const quotaPercentageRemaining =
+      configuredDailyLimit !== null && configuredDailyLimit > 0 && remainingTokensToday !== null
+        ? round2(Math.max(0, Math.min(100, (remainingTokensToday / configuredDailyLimit) * 100)))
+        : null;
 
     return {
       quotaToday: {
@@ -135,6 +140,7 @@ export function getSummaryMetrics(
         windowLabel: '24h',
         confidence: 'configured',
         effectiveLimit: configuredDailyLimit,
+        quotaPercentageRemaining,
         adaptiveAdjusted: false,
       },
       providersCount: Number(counts?.providers_cnt ?? 0),
@@ -143,41 +149,43 @@ export function getSummaryMetrics(
     };
   }
 
-  // Admin view: global provider_keys quota pool + x-ratelimit-* signals + UTC usage
-  const keyPoolRow = db
-    .prepare(
-      `SELECT COUNT(pk.daily_quota_limit) AS keys_with_limit,
-              SUM(pk.daily_quota_limit) AS total_daily_limit,
-              COUNT(CASE WHEN pk.ratelimit_remaining IS NOT NULL AND (pk.ratelimit_reset_at IS NULL OR pk.ratelimit_reset_at > ?) THEN 1 END) AS keys_with_rl,
-              SUM(CASE WHEN pk.ratelimit_remaining IS NOT NULL AND (pk.ratelimit_reset_at IS NULL OR pk.ratelimit_reset_at > ?) THEN pk.ratelimit_remaining ELSE 0 END) AS total_rl_remaining,
-              MIN(CASE WHEN pk.ratelimit_reset_at IS NOT NULL AND pk.ratelimit_reset_at > ? THEN pk.ratelimit_reset_at END) AS earliest_rl_reset
-       FROM provider_keys pk
-       JOIN providers p ON p.id = pk.provider_id
-       WHERE p.enabled = 1 AND pk.status IN ('active', 'rate_limited')`,
-    )
-    .get(nowSec, nowSec, nowSec) as {
-    keys_with_limit: number;
-    total_daily_limit: number | null;
-    keys_with_rl: number;
-    total_rl_remaining: number | null;
-    earliest_rl_reset: number | null;
-  };
+  // Admin view: align global quota pool with computeAdaptiveFreeQuotas (unit-safe, online-node filtered, isRealHeaderSignal)
+  const adaptive = computeAdaptiveFreeQuotas(db, nowSec);
+  const countableProviders = adaptive.providers.filter((p) => p.unit !== 'none');
+  const hasTokenProviders = countableProviders.some((p) => p.unit === 'tokens');
+  const hasRequestProviders = countableProviders.some((p) => p.unit === 'requests');
+  const hasMixedUnits = hasTokenProviders && hasRequestProviders;
+  const isRequestsOnly = hasRequestProviders && !hasTokenProviders;
 
   const userDailyLimit =
     userRow?.daily_token_limit !== null && userRow?.daily_token_limit !== undefined
       ? Number(userRow.daily_token_limit)
       : null;
 
-  const poolDailyLimit =
-    Number(keyPoolRow?.keys_with_limit ?? 0) > 0 ? Number(keyPoolRow.total_daily_limit ?? 0) : null;
+  const configuredDailyLimit = hasMixedUnits
+    ? null
+    : (adaptive.configuredLimit ?? userDailyLimit);
+  const effectiveLimit = hasMixedUnits
+    ? null
+    : (adaptive.effectiveLimit ?? configuredDailyLimit);
 
-  const configuredDailyLimit = poolDailyLimit ?? userDailyLimit;
+  const providersWithRealHeader = countableProviders.filter((p) => p.headerRemaining !== null);
   const providerRateLimitRemaining =
-    Number(keyPoolRow?.keys_with_rl ?? 0) > 0 ? Number(keyPoolRow.total_rl_remaining ?? 0) : null;
-  const earliestProviderResetAt =
-    keyPoolRow?.earliest_rl_reset !== null && keyPoolRow?.earliest_rl_reset !== undefined
-      ? formatIsoUtc(Number(keyPoolRow.earliest_rl_reset))
+    !hasMixedUnits && providersWithRealHeader.length > 0
+      ? providersWithRealHeader.reduce((sum, p) => sum + (p.headerRemaining ?? 0), 0)
       : null;
+
+  let earliestResetMs: number | null = null;
+  let earliestProviderResetAt: string | null = null;
+  for (const p of countableProviders) {
+    if (p.earliestResetAt) {
+      const tsMs = Date.parse(p.earliestResetAt);
+      if (Number.isFinite(tsMs) && (earliestResetMs === null || tsMs < earliestResetMs)) {
+        earliestResetMs = tsMs;
+        earliestProviderResetAt = p.earliestResetAt;
+      }
+    }
+  }
 
   const todayStartSec = utcStartOfDaySec(nowSec);
   const usageRow = db
@@ -189,14 +197,40 @@ export function getSummaryMetrics(
     .get(todayStartSec, nowSec) as { used_tokens: number };
 
   const usedTokensToday = Number(usageRow?.used_tokens ?? 0);
-  const remainingTokensToday =
-    configuredDailyLimit !== null
-      ? Math.max(0, configuredDailyLimit - usedTokensToday)
-      : providerRateLimitRemaining;
-  const usedPct =
-    configuredDailyLimit !== null && configuredDailyLimit > 0
-      ? round2((usedTokensToday / configuredDailyLimit) * 100)
-      : null;
+
+  let remainingTokensToday: number | null = null;
+  let usedPct: number | null = null;
+  let quotaPercentageRemaining: number | null = adaptive.quotaPercentageRemaining;
+
+  if (hasMixedUnits) {
+    // Mixed units (tokens + requests): never sum limits or subtract tokens from requests
+    remainingTokensToday = null;
+    usedPct =
+      quotaPercentageRemaining !== null
+        ? round2(Math.max(0, Math.min(100, 100 - quotaPercentageRemaining)))
+        : null;
+  } else if (isRequestsOnly) {
+    // Requests-only providers: never subtract usedTokensToday (tokens) from a requests limit
+    remainingTokensToday = adaptive.remainingInWindow;
+    usedPct =
+      quotaPercentageRemaining !== null
+        ? round2(Math.max(0, Math.min(100, 100 - quotaPercentageRemaining)))
+        : null;
+  } else {
+    remainingTokensToday =
+      configuredDailyLimit !== null
+        ? Math.max(0, configuredDailyLimit - usedTokensToday)
+        : providerRateLimitRemaining;
+    usedPct =
+      configuredDailyLimit !== null && configuredDailyLimit > 0
+        ? round2((usedTokensToday / configuredDailyLimit) * 100)
+        : null;
+    if (quotaPercentageRemaining === null && configuredDailyLimit !== null && configuredDailyLimit > 0) {
+      quotaPercentageRemaining = round2(
+        Math.max(0, Math.min(100, ((configuredDailyLimit - usedTokensToday) / configuredDailyLimit) * 100)),
+      );
+    }
+  }
 
   const providersCount = Number(
     (
@@ -212,7 +246,7 @@ export function getSummaryMetrics(
           `SELECT COUNT(*) AS c
            FROM models m
            JOIN providers p ON p.id = m.provider_id
-           WHERE m.active = 1 AND p.enabled = 1`,
+           WHERE m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1`,
         )
         .get() as { c: number }
     )?.c ?? 0,
@@ -224,9 +258,6 @@ export function getSummaryMetrics(
       }
     )?.c ?? 0,
   );
-
-  const adaptive = computeAdaptiveFreeQuotas(db, nowSec);
-  const effectiveLimit = adaptive.effectiveLimit ?? configuredDailyLimit;
 
   return {
     quotaToday: {
@@ -243,6 +274,7 @@ export function getSummaryMetrics(
       windowLabel: adaptive.windowLabel,
       confidence: adaptive.confidence,
       effectiveLimit,
+      quotaPercentageRemaining,
       adaptiveAdjusted: adaptive.adaptiveAdjusted,
     },
     providersCount,
