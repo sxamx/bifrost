@@ -380,8 +380,13 @@ export function sanitizeAndMonochromeSvg(rawSvg: string): string | null {
   return /^<svg(?=[\s>])[\s\S]*<\/svg>$/.test(sanitized) ? sanitized : null;
 }
 
+export const MAX_LOGO_SLUG_LENGTH = 64;
+
 export function normalizeLogoSlug(slug: string): string | null {
   const cleaned = slug.trim().toLowerCase().replace(/\.svg$/i, '');
+  if (cleaned.length === 0 || cleaned.length > MAX_LOGO_SLUG_LENGTH) {
+    return null;
+  }
   if (cleaned === 'nvidia-nim') return 'nvidia';
   if (cleaned === 'opencode-zen') return 'opencode';
   if (!/^[a-z0-9-]+$/.test(cleaned)) {
@@ -404,12 +409,13 @@ export async function getProviderLogo(
     nowSec?: number;
     ttlSec?: number;
     forceRefresh?: boolean;
+    allowRemoteFetch?: boolean;
   } = {},
 ): Promise<ProviderLogoResult> {
   const initial = deriveFallbackInitial(options.displayName ?? providerSlug);
   const normalizedSlug = normalizeLogoSlug(providerSlug);
   if (!normalizedSlug) {
-    return { hasLogo: false, slug: providerSlug, initial };
+    return { hasLogo: false, slug: providerSlug.slice(0, MAX_LOGO_SLUG_LENGTH), initial };
   }
 
   const cacheKey = `logo:${normalizedSlug}`;
@@ -423,6 +429,13 @@ export async function getProviderLogo(
       return { hasLogo: false, slug: normalizedSlug, initial };
     }
     return cached.data;
+  }
+
+  if (options.allowRemoteFetch === false) {
+    if (cached && cached.data.hasLogo) {
+      return cached.data;
+    }
+    return { hasLogo: false, slug: normalizedSlug, initial };
   }
 
   try {
