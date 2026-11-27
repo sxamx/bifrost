@@ -44,14 +44,14 @@ jobs:
           npm --prefix core ci
           npm --prefix nodes ci
 
+      - name: Build all workspaces
+        run: npm run build
+
       - name: Type-check tests (if tsconfig.test.json exists)
         run: |
           if [ -f tsconfig.test.json ]; then
             npx --prefix core tsc -p tsconfig.test.json
           fi
-
-      - name: Build all workspaces
-        run: npm run build
 
       - name: Run full test suite
         run: npm test
