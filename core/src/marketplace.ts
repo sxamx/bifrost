@@ -2,14 +2,25 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import { redactSecretsInText } from './db.js';
+import {
+  LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL,
+  OFFICIAL_MARKETPLACE_SOURCE_URL,
+  redactSecretsInText,
+} from './db.js';
 import {
   type ProviderManifest,
   loadSeedManifests,
   validateProviderManifest,
 } from './schema.js';
 import {
+  type DnsLookupFn,
+  safeFetch,
+  validateSafeUpstreamUrl,
+  validateSafeUpstreamUrlSync,
+} from './ssrf.js';
+import {
   type UrlSecurityValidationResult,
+  allowLocalOfficialUpstreams,
   validateProviderTargetUrl,
 } from './url-security.js';
 
@@ -65,6 +76,7 @@ export interface MergedMarketplaceCatalogResult {
   source: string;
   notice?: string;
   error?: string;
+  partialErrors?: Array<{ sourceId: string; sourceName: string; error: string }>;
 }
 
 const MARKETPLACE_WRAPPER_KEYS = new Set<string>([
@@ -125,24 +137,89 @@ export function computeManifestHash(manifest: unknown): string {
 
 export interface MarketplaceSsrfOptions {
   allowLocalhostForTests?: boolean;
+  dnsLookup?: DnsLookupFn;
+  resolveDns?: boolean;
+}
+
+/**
+ * Synchronous Marketplace repository index URL validator with strict SSRF protection
+ * (`official-json` mode: strict HTTPS, blocks RFC1918/loopback/CGNAT/IMDS/single-label/IPv6 transition/userinfo).
+ */
+function finalizeNormalizedMarketplaceUrl(rawInput: string, normalizedUrl: string): string {
+  let finalUrl = normalizeMarketplaceSourceUrl(normalizedUrl);
+  try {
+    const parsedInput = new URL(rawInput);
+    if (
+      parsedInput.pathname.length > 1 &&
+      parsedInput.pathname.endsWith('/') &&
+      !parsedInput.search &&
+      !parsedInput.hash &&
+      !finalUrl.endsWith('/')
+    ) {
+      finalUrl = `${finalUrl}/`;
+    }
+  } catch {
+    // Keep normalizedUrl as-is
+  }
+  return finalUrl;
+}
+
+export function validateMarketplaceSourceUrlSync(
+  rawUrl: string,
+  ssrfOpts?: MarketplaceSsrfOptions,
+): { ok: true; url: string } | { ok: false; error: string } {
+  const allowLoopback = Boolean(ssrfOpts?.allowLocalhostForTests);
+  const normalizedInput = normalizeMarketplaceSourceUrl(rawUrl);
+  const check = validateSafeUpstreamUrlSync(normalizedInput, {
+    mode: 'official-json',
+    allowLocalhostForTests: allowLoopback,
+  });
+  if (!check.allowed || !check.normalizedUrl) {
+    return { ok: false, error: check.reason ?? 'Invalid marketplace source URL.' };
+  }
+  return { ok: true, url: finalizeNormalizedMarketplaceUrl(normalizedInput, check.normalizedUrl) };
+}
+
+export function normalizeMarketplaceSourceUrl(rawUrl: string): string {
+  const trimmed = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+  if (trimmed === LEGACY_OFFICIAL_MARKETPLACE_SOURCE_URL) {
+    return OFFICIAL_MARKETPLACE_SOURCE_URL;
+  }
+  return trimmed;
 }
 
 /**
  * Validates a Marketplace repository index URL with strict SSRF protection
- * (`official-json` mode: strict HTTPS, blocks RFC1918/loopback/CGNAT/IMDS/IPv6 transition/userinfo).
+ * (`official-json` mode: strict HTTPS, blocks RFC1918/loopback/CGNAT/IMDS/single-label/IPv6 transition/userinfo,
+ * plus DNS validation when `dnsLookup` or `resolveDns: true` is provided).
  */
 export async function validateMarketplaceSourceUrl(
   rawUrl: string,
   ssrfOpts?: MarketplaceSsrfOptions,
 ): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
-  const allowLoopback = Boolean(ssrfOpts?.allowLocalhostForTests);
-  const check = validateProviderTargetUrl(rawUrl, 'official-json', 'baseUrl', {
-    allowLoopback,
-  });
-  if (!check.valid || !check.normalizedUrl) {
-    return { ok: false, error: check.error ?? 'Invalid marketplace source URL.' };
+  const normalizedInput = normalizeMarketplaceSourceUrl(rawUrl);
+  const syncCheck = validateMarketplaceSourceUrlSync(normalizedInput, ssrfOpts);
+  if (!syncCheck.ok) {
+    return syncCheck;
   }
-  return { ok: true, url: check.normalizedUrl };
+
+  if (ssrfOpts?.dnsLookup || ssrfOpts?.resolveDns === true) {
+    const dnsCheck = await validateSafeUpstreamUrl(syncCheck.url, {
+      mode: 'official-json',
+      allowLocalhostForTests: Boolean(ssrfOpts.allowLocalhostForTests),
+      dnsLookup: ssrfOpts.dnsLookup,
+      resolveDns: true,
+    });
+    if (!dnsCheck.allowed || !dnsCheck.normalizedUrl) {
+      return { ok: false, error: dnsCheck.reason ?? 'Invalid marketplace source URL.' };
+    }
+    return {
+      ok: true,
+      url: finalizeNormalizedMarketplaceUrl(normalizedInput, dnsCheck.normalizedUrl),
+    };
+  }
+
+  return syncCheck;
 }
 
 function mapSourceRow(row: Record<string, unknown>): MarketplaceSourceRecord {
@@ -191,14 +268,18 @@ export async function addMarketplaceSource(
     return { ok: false, status: 400, error: 'Source name must be between 1 and 120 characters.' };
   }
 
-  const urlCheck = await validateMarketplaceSourceUrl(input.url, ssrfOpts);
+  const urlCheck = await validateMarketplaceSourceUrl(
+    normalizeMarketplaceSourceUrl(input.url),
+    ssrfOpts,
+  );
   if (!urlCheck.ok) {
     return { ok: false, status: 400, error: urlCheck.error };
   }
+  const normalizedUrl = normalizeMarketplaceSourceUrl(urlCheck.url);
 
   const duplicate = db
     .prepare(`SELECT id FROM marketplace_sources WHERE url = ?`)
-    .get(urlCheck.url) as { id: string } | undefined;
+    .get(normalizedUrl) as { id: string } | undefined;
   if (duplicate) {
     return { ok: false, status: 409, error: 'A marketplace source with this URL already exists.' };
   }
@@ -210,7 +291,7 @@ export async function addMarketplaceSource(
     `INSERT INTO marketplace_sources (
        id, name, url, is_official, enabled, catalog_version, last_checked_at, last_error, created_at
      ) VALUES (?, ?, ?, 0, ?, NULL, NULL, NULL, ?)`,
-  ).run(id, name, urlCheck.url, enabledInt, nowSec);
+  ).run(id, name, normalizedUrl, enabledInt, nowSec);
 
   db.prepare(`DELETE FROM external_cache WHERE cache_key = 'marketplace:index'`).run();
 
@@ -321,7 +402,19 @@ export function loadBundledMarketplaceCatalog(schemasDir: string): MarketplaceCa
         if (!fs.existsSync(resolvedFile)) continue;
 
         const rawManifest = JSON.parse(fs.readFileSync(resolvedFile, 'utf8')) as unknown;
-        const check = validateProviderManifest(rawManifest, schemasDir);
+        if (
+          rawManifest &&
+          typeof rawManifest === 'object' &&
+          !Array.isArray(rawManifest) &&
+          (rawManifest as Record<string, unknown>).approved === false
+        ) {
+          continue;
+        }
+        const cleaned =
+          rawManifest && typeof rawManifest === 'object' && !Array.isArray(rawManifest)
+            ? stripMarketplaceWrapperFields(rawManifest as Record<string, unknown>)
+            : rawManifest;
+        const check = validateProviderManifest(cleaned, schemasDir);
         if (check.valid && check.manifest) {
           loaded.push({
             ...check.manifest,
@@ -381,33 +474,65 @@ export function readCachedOrBundledMarketplaceCatalog(
   return loadBundledMarketplaceCatalog(schemasDir);
 }
 
-interface SingleSourceFetchOutput {
-  manifests: MarketplaceCatalogManifest[];
-  unapprovedIds: string[];
-  catalogVersion: string;
-  updatedAt: string | null;
-  etag: string | null;
-}
+type SingleSourceFetchOutput =
+  | {
+      notModified: true;
+      etag: string | null;
+    }
+  | {
+      notModified: false;
+      manifests: MarketplaceCatalogManifest[];
+      unapprovedIds: string[];
+      catalogVersion: string;
+      updatedAt: string | null;
+      etag: string | null;
+    };
 
 async function fetchSingleSourceCatalog(options: {
   marketplaceUrl: string;
   schemasDir: string;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
+  etag?: string | null;
 }): Promise<SingleSourceFetchOutput> {
-  const { marketplaceUrl, schemasDir, fetchImpl } = options;
+  const { schemasDir, fetchImpl, allowLocalhost, dnsLookup, etag } = options;
+  const marketplaceUrl = normalizeMarketplaceSourceUrl(options.marketplaceUrl);
+  const effectiveAllowLocalhost =
+    allowLocalhost !== undefined ? allowLocalhost : allowLocalOfficialUpstreams();
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
   let res: Response;
   try {
-    res = await fetchImpl(marketplaceUrl, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      redirect: 'error',
-      signal: controller.signal,
-    });
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (etag) {
+      headers['If-None-Match'] = etag;
+    }
+    res = await safeFetch(
+      marketplaceUrl,
+      {
+        method: 'GET',
+        headers,
+        redirect: 'error',
+        signal: controller.signal,
+      },
+      {
+        mode: 'official-json',
+        allowLocalhost: effectiveAllowLocalhost,
+        fetchImpl,
+        dnsLookup,
+      },
+    );
   } finally {
     clearTimeout(timer);
+  }
+
+  if (res.status === 304) {
+    return {
+      notModified: true,
+      etag: res.headers.get('etag') ?? etag ?? null,
+    };
   }
 
   if (!res.ok) {
@@ -465,19 +590,30 @@ async function fetchSingleSourceCatalog(options: {
       if (resolvedUrl.origin !== baseCatalogUrl.origin) {
         continue;
       }
-      const baseDirPath = path.posix.dirname(baseCatalogUrl.pathname);
+      const baseDirPath = baseCatalogUrl.pathname.endsWith('/')
+        ? baseCatalogUrl.pathname.replace(/\/+$/, '') || '/'
+        : path.posix.dirname(baseCatalogUrl.pathname);
       const expectedPrefix = baseDirPath === '/' ? '/providers/' : `${baseDirPath}/providers/`;
       if (!resolvedUrl.pathname.startsWith(expectedPrefix)) {
         continue;
       }
 
       try {
-        const mRes = await fetchImpl(resolvedUrl.href, {
-          method: 'GET',
-          headers: { Accept: 'application/json' },
-          redirect: 'error',
-          signal: AbortSignal.timeout(4000),
-        });
+        const mRes = await safeFetch(
+          resolvedUrl.href,
+          {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+            redirect: 'error',
+            signal: AbortSignal.timeout(4000),
+          },
+          {
+            mode: 'official-json',
+            allowLocalhost: effectiveAllowLocalhost,
+            fetchImpl,
+            dnsLookup,
+          },
+        );
         if (!mRes.ok) continue;
         const rawManifest = (await mRes.json()) as unknown;
         if (
@@ -486,6 +622,16 @@ async function fetchSingleSourceCatalog(options: {
           !Array.isArray(rawManifest) &&
           (rawManifest as Record<string, unknown>).approved === false
         ) {
+          const manifestObj = rawManifest as Record<string, unknown>;
+          const unapprovedId =
+            typeof rec.id === 'string' && rec.id.trim()
+              ? rec.id.trim()
+              : typeof manifestObj.id === 'string' && manifestObj.id.trim()
+                ? manifestObj.id.trim()
+                : null;
+          if (unapprovedId) {
+            unapprovedIds.push(unapprovedId);
+          }
           continue;
         }
         const cleaned =
@@ -521,6 +667,7 @@ async function fetchSingleSourceCatalog(options: {
   }
 
   return {
+    notModified: false,
     manifests: validManifests,
     unapprovedIds,
     catalogVersion,
@@ -539,13 +686,24 @@ export async function fetchRemoteMarketplaceCatalog(options: {
   marketplaceUrl: string;
   schemasDir: string;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
   nowSec: number;
 }): Promise<{
   manifests: MarketplaceCatalogManifest[];
   unapprovedIds: string[];
 }> {
-  const { db, marketplaceUrl, schemasDir, fetchImpl, nowSec } = options;
-  const result = await fetchSingleSourceCatalog({ marketplaceUrl, schemasDir, fetchImpl });
+  const { db, marketplaceUrl, schemasDir, fetchImpl, allowLocalhost, dnsLookup, nowSec } = options;
+  const result = await fetchSingleSourceCatalog({
+    marketplaceUrl,
+    schemasDir,
+    fetchImpl,
+    allowLocalhost,
+    dnsLookup,
+  });
+  if (result.notModified) {
+    return { manifests: [], unapprovedIds: [] };
+  }
 
   db.prepare(
     `INSERT INTO external_cache (cache_key, payload_json, etag, fetched_at)
@@ -632,12 +790,21 @@ export async function fetchAndMergeMarketplaceCatalog(
   db: DatabaseSync,
   options: {
     fetchImpl: typeof fetch;
+    allowLocalhost?: boolean;
+    dnsLookup?: DnsLookupFn;
     forceRefresh?: boolean;
     nowSec: number;
     bundledDir: string;
   },
 ): Promise<MergedMarketplaceCatalogResult> {
-  const { fetchImpl, forceRefresh = false, nowSec, bundledDir } = options;
+  const {
+    fetchImpl,
+    allowLocalhost,
+    dnsLookup,
+    forceRefresh = false,
+    nowSec,
+    bundledDir,
+  } = options;
 
   const allSources = listMarketplaceSources(db);
   const enabledSources = allSources.filter((s) => s.enabled);
@@ -658,9 +825,12 @@ export async function fetchAndMergeMarketplaceCatalog(
     };
   }
 
-  const indexCacheExists = Boolean(
-    db.prepare(`SELECT 1 FROM external_cache WHERE cache_key = 'marketplace:index'`).get(),
-  );
+  interface CachedSourcePayload {
+    manifests: MarketplaceCatalogManifest[];
+    unapprovedIds: string[];
+    catalogVersion: string;
+    updatedAt: string | null;
+  }
 
   type SourceFetchOutcome =
     | {
@@ -675,39 +845,55 @@ export async function fetchAndMergeMarketplaceCatalog(
         ok: false;
         source: MarketplaceSourceRecord;
         error: string;
+        staleCache: CachedSourcePayload | null;
       };
 
   const outcomes: SourceFetchOutcome[] = await Promise.all(
     enabledSources.map(async (src): Promise<SourceFetchOutcome> => {
       const cacheKey = `marketplace_source:${src.id}`;
 
-      if (!forceRefresh && indexCacheExists) {
-        const cached = db
-          .prepare(`SELECT payload_json, fetched_at FROM external_cache WHERE cache_key = ?`)
-          .get(cacheKey) as { payload_json: string; fetched_at: number } | undefined;
+      const cachedRow = db
+        .prepare(`SELECT payload_json, etag, fetched_at FROM external_cache WHERE cache_key = ?`)
+        .get(cacheKey) as
+        | { payload_json: string; etag: string | null; fetched_at: number }
+        | undefined;
 
-        if (cached && nowSec - Number(cached.fetched_at) < MARKETPLACE_SOURCE_CACHE_TTL_SEC) {
-          try {
-            const parsed = JSON.parse(cached.payload_json) as {
-              manifests?: MarketplaceCatalogManifest[];
-              unapprovedIds?: string[];
-              catalogVersion?: string;
-              updatedAt?: string | null;
+      let cachedPayload: CachedSourcePayload | null = null;
+      if (cachedRow) {
+        try {
+          const parsed = JSON.parse(cachedRow.payload_json) as {
+            manifests?: MarketplaceCatalogManifest[];
+            unapprovedIds?: string[];
+            catalogVersion?: string;
+            updatedAt?: string | null;
+          };
+          if (Array.isArray(parsed.manifests)) {
+            cachedPayload = {
+              manifests: parsed.manifests,
+              unapprovedIds: Array.isArray(parsed.unapprovedIds) ? parsed.unapprovedIds : [],
+              catalogVersion: parsed.catalogVersion ?? src.catalogVersion ?? '',
+              updatedAt: parsed.updatedAt ?? null,
             };
-            if (Array.isArray(parsed.manifests)) {
-              return {
-                ok: true,
-                source: src,
-                manifests: parsed.manifests,
-                unapprovedIds: Array.isArray(parsed.unapprovedIds) ? parsed.unapprovedIds : [],
-                catalogVersion: parsed.catalogVersion ?? src.catalogVersion ?? '',
-                updatedAt: parsed.updatedAt ?? null,
-              };
-            }
-          } catch {
-            // Cache corrupted; fall through to live fetch
           }
+        } catch {
+          // Cache corrupted; ignore and fetch live
         }
+      }
+
+      if (
+        !forceRefresh &&
+        cachedPayload &&
+        cachedRow &&
+        nowSec - Number(cachedRow.fetched_at) < MARKETPLACE_SOURCE_CACHE_TTL_SEC
+      ) {
+        return {
+          ok: true,
+          source: src,
+          manifests: cachedPayload.manifests,
+          unapprovedIds: cachedPayload.unapprovedIds,
+          catalogVersion: cachedPayload.catalogVersion,
+          updatedAt: cachedPayload.updatedAt,
+        };
       }
 
       try {
@@ -715,7 +901,35 @@ export async function fetchAndMergeMarketplaceCatalog(
           marketplaceUrl: src.url,
           schemasDir: bundledDir,
           fetchImpl,
+          allowLocalhost,
+          dnsLookup,
+          etag: cachedPayload ? cachedRow?.etag ?? null : null,
         });
+
+        if (fetched.notModified && cachedPayload) {
+          db.prepare(`UPDATE external_cache SET fetched_at = ? WHERE cache_key = ?`).run(
+            nowSec,
+            cacheKey,
+          );
+          db.prepare(
+            `UPDATE marketplace_sources
+             SET last_checked_at = ?, last_error = NULL
+             WHERE id = ?`,
+          ).run(nowSec, src.id);
+
+          return {
+            ok: true,
+            source: src,
+            manifests: cachedPayload.manifests,
+            unapprovedIds: cachedPayload.unapprovedIds,
+            catalogVersion: cachedPayload.catalogVersion,
+            updatedAt: cachedPayload.updatedAt,
+          };
+        }
+
+        if (fetched.notModified) {
+          throw new Error('Marketplace returned HTTP 304 without cached payload.');
+        }
 
         db.prepare(
           `INSERT INTO external_cache (cache_key, payload_json, etag, fetched_at)
@@ -764,6 +978,7 @@ export async function fetchAndMergeMarketplaceCatalog(
           ok: false,
           source: src,
           error: errMsg,
+          staleCache: cachedPayload,
         };
       }
     }),
@@ -773,6 +988,14 @@ export async function fetchAndMergeMarketplaceCatalog(
   const installedHashes = loadInstalledProviderHashes(db);
   const succeeded = outcomes.filter((o): o is Extract<SourceFetchOutcome, { ok: true }> => o.ok);
   const failed = outcomes.filter((o): o is Extract<SourceFetchOutcome, { ok: false }> => !o.ok);
+  const partialErrors =
+    failed.length > 0
+      ? failed.map((f) => ({
+          sourceId: f.source.id,
+          sourceName: f.source.name,
+          error: f.error,
+        }))
+      : undefined;
 
   if (succeeded.length === 0) {
     const fallbackRaw = readCachedOrBundledMarketplaceCatalog(db, bundledDir);
@@ -805,27 +1028,44 @@ export async function fetchAndMergeMarketplaceCatalog(
       notice:
         'Catálogo remoto fuera de línea. Mostrando fichas locales verificadas; también puedes importar un archivo JSON local.',
       error: failed[0]?.error ?? 'Unable to reach remote marketplace catalog.',
+      ...(partialErrors ? { partialErrors } : {}),
     };
   }
 
-  // Merge in priority order (official first, then earliest created_at — already sorted)
+  // Merge in priority order (official first, then earliest created_at — already sorted),
+  // falling back to per-source stale cache when a source fails partially.
   const seenIds = new Set<string>();
   const merged: EnrichedMarketplaceManifest[] = [];
   const unapprovedSet = new Set<string>();
   const updatedAts: string[] = [];
   const versionParts: string[] = [];
 
-  for (const outcome of succeeded) {
-    if (outcome.updatedAt) {
-      updatedAts.push(outcome.updatedAt);
+  for (const outcome of outcomes) {
+    const payload = outcome.ok
+      ? {
+          manifests: outcome.manifests,
+          unapprovedIds: outcome.unapprovedIds,
+          catalogVersion: outcome.catalogVersion,
+          updatedAt: outcome.updatedAt,
+        }
+      : outcome.staleCache;
+
+    if (!payload) {
+      continue;
     }
-    if (outcome.catalogVersion) {
-      versionParts.push(`${outcome.source.id}:${outcome.catalogVersion}`);
+
+    if (payload.updatedAt) {
+      updatedAts.push(payload.updatedAt);
     }
-    for (const uid of outcome.unapprovedIds) {
-      unapprovedSet.add(uid);
+    if (payload.catalogVersion) {
+      versionParts.push(`${outcome.source.id}:${payload.catalogVersion}`);
     }
-    for (const manifest of outcome.manifests) {
+    for (const uid of payload.unapprovedIds) {
+      if (!seenIds.has(uid)) {
+        unapprovedSet.add(uid);
+      }
+    }
+    for (const manifest of payload.manifests) {
       if (seenIds.has(manifest.id)) {
         continue;
       }
@@ -837,7 +1077,7 @@ export async function fetchAndMergeMarketplaceCatalog(
             sourceId: outcome.source.id,
             sourceName: outcome.source.name,
             isOfficial: outcome.source.isOfficial,
-            indexUpdatedAt: outcome.updatedAt,
+            indexUpdatedAt: payload.updatedAt,
           },
           installedHashes,
         ),
@@ -845,7 +1085,7 @@ export async function fetchAndMergeMarketplaceCatalog(
     }
   }
 
-  const unapprovedIds = [...unapprovedSet];
+  const unapprovedIds = [...unapprovedSet].filter((id) => !seenIds.has(id));
 
   // Persist merged index + unapproved IDs for backward compatibility & install-by-id lookup
   db.prepare(
@@ -867,7 +1107,7 @@ export async function fetchAndMergeMarketplaceCatalog(
   updatedAts.sort();
   const latestUpdatedAt = updatedAts.length > 0 ? updatedAts[updatedAts.length - 1]! : null;
   let catalogVersion: string | null = null;
-  if (succeeded.length === 1) {
+  if (succeeded.length === 1 && failed.length === 0) {
     catalogVersion = succeeded[0]!.catalogVersion || latestUpdatedAt;
   } else if (latestUpdatedAt) {
     catalogVersion = latestUpdatedAt;
@@ -893,6 +1133,7 @@ export async function fetchAndMergeMarketplaceCatalog(
     updatesAvailableCount,
     enabledSourcesCount: enabledSources.length,
     source: enabledSources.length === 1 ? enabledSources[0]!.id : 'merged',
+    ...(partialErrors ? { partialErrors } : {}),
   };
 }
 

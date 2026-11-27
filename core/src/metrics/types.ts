@@ -36,6 +36,7 @@ export interface SummaryMetricsResult {
     windowLabel?: string;
     confidence?: 'header_exact' | 'configured' | 'inferred';
     effectiveLimit?: number | null;
+    quotaPercentageRemaining?: number | null;
     adaptiveAdjusted?: boolean;
   };
   providersCount: number;

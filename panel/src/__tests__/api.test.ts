@@ -406,7 +406,7 @@ describe('panel/src/api.ts', () => {
       expect(freeQuota.providers).toEqual([]);
 
       const latency = await api.getMetricsLatency();
-      expect(latency).toEqual({ buckets: [], overall: null });
+      expect(latency).toEqual({ buckets: [], overall: null, overallRaw: null });
 
       const speed = await api.getMetricsSpeed();
       expect(speed).toEqual({ models: [], cacheByProvider: [] });

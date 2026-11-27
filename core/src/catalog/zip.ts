@@ -58,8 +58,11 @@ export function readZipArchive(
   let eocdOffset = -1;
   for (let pos = zipBuffer.length - 22; pos >= minEocdOffset; pos -= 1) {
     if (zipBuffer.readUInt32LE(pos) === EOCD_SIGNATURE) {
-      eocdOffset = pos;
-      break;
+      const eocdCommentLen = zipBuffer.readUInt16LE(pos + 20);
+      if (eocdCommentLen === zipBuffer.length - (pos + 22)) {
+        eocdOffset = pos;
+        break;
+      }
     }
   }
   if (eocdOffset === -1) {
@@ -84,6 +87,7 @@ export function readZipArchive(
   const MAX_TOTAL_UNCOMPRESSED_BYTES = maxEntryUncompressedBytes * 2;
   let totalUncompressedRead = 0;
   const seenLocalOffsets = new Set<number>();
+  const entryRanges: Array<{ start: number; end: number; filename: string }> = [];
 
   const entries: ZipEntry[] = [];
   let cursor = centralDirOffset;
@@ -130,6 +134,25 @@ export function readZipArchive(
     }
     seenLocalOffsets.add(localHeaderOffset);
 
+    if (
+      localHeaderOffset + 30 > centralDirOffset ||
+      localHeaderOffset + 30 > zipBuffer.length ||
+      zipBuffer.readUInt32LE(localHeaderOffset) !== LOC_SIGNATURE
+    ) {
+      throw new Error(`Invalid local file header for ZIP entry "${filename}".`);
+    }
+
+    const localNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
+    const localExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
+    const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > centralDirOffset || dataEnd > zipBuffer.length) {
+      throw new Error(`Truncated compressed payload for ZIP entry "${filename}".`);
+    }
+
+    entryRanges.push({ start: localHeaderOffset, end: dataEnd, filename });
+
+    let countedInBudget = false;
     const readBuffer = (): Buffer => {
       if (
         uncompressedSize > maxEntryUncompressedBytes ||
@@ -144,23 +167,8 @@ export function readZipArchive(
           `ZIP stored entry "${filename}" has mismatched compressedSize (${compressedSize}) and uncompressedSize (${uncompressedSize}).`,
         );
       }
-      if (
-        localHeaderOffset + 30 > centralDirOffset ||
-        localHeaderOffset + 30 > zipBuffer.length ||
-        zipBuffer.readUInt32LE(localHeaderOffset) !== LOC_SIGNATURE
-      ) {
-        throw new Error(`Invalid local file header for ZIP entry "${filename}".`);
-      }
 
-      const localNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
-      const localExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
-      const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
-      const dataEnd = dataStart + compressedSize;
-      if (dataEnd > centralDirOffset || dataEnd > zipBuffer.length) {
-        throw new Error(`Truncated compressed payload for ZIP entry "${filename}".`);
-      }
-
-      if (totalUncompressedRead + uncompressedSize > MAX_TOTAL_UNCOMPRESSED_BYTES) {
+      if (!countedInBudget && totalUncompressedRead + uncompressedSize > MAX_TOTAL_UNCOMPRESSED_BYTES) {
         throw new Error(
           `ZIP archive exceeds maximum total uncompressed byte budget (${MAX_TOTAL_UNCOMPRESSED_BYTES} bytes).`,
         );
@@ -184,18 +192,21 @@ export function readZipArchive(
         );
       }
 
-      totalUncompressedRead += out.length;
-      if (totalUncompressedRead > MAX_TOTAL_UNCOMPRESSED_BYTES) {
-        throw new Error(
-          `ZIP archive exceeds maximum total uncompressed byte budget (${MAX_TOTAL_UNCOMPRESSED_BYTES} bytes).`,
-        );
-      }
-
       const actualCrc = crc32(out);
       if (actualCrc !== expectedCrc) {
         throw new Error(
           `CRC32 integrity check failed for ZIP entry "${filename}" (expected 0x${expectedCrc.toString(16)}, got 0x${actualCrc.toString(16)}).`,
         );
+      }
+
+      if (!countedInBudget) {
+        totalUncompressedRead += out.length;
+        countedInBudget = true;
+        if (totalUncompressedRead > MAX_TOTAL_UNCOMPRESSED_BYTES) {
+          throw new Error(
+            `ZIP archive exceeds maximum total uncompressed byte budget (${MAX_TOTAL_UNCOMPRESSED_BYTES} bytes).`,
+          );
+        }
       }
 
       return out;
@@ -207,6 +218,20 @@ export function readZipArchive(
       readBuffer,
       readText: () => readBuffer().toString('utf8'),
     });
+  }
+
+  // Detect any overlapping [localHeaderOffset, dataEnd) intervals across entries
+  if (entryRanges.length > 1) {
+    entryRanges.sort((a, b) => a.start - b.start || a.end - b.end);
+    for (let i = 1; i < entryRanges.length; i += 1) {
+      const prev = entryRanges[i - 1]!;
+      const curr = entryRanges[i]!;
+      if (curr.start < prev.end) {
+        throw new Error(
+          `Invalid ZIP buffer: overlapping entry byte range detected ("${prev.filename}" [${prev.start}, ${prev.end}) overlaps "${curr.filename}" [${curr.start}, ${curr.end})).`,
+        );
+      }
+    }
   }
 
   return entries;

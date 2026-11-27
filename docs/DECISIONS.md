@@ -44,17 +44,16 @@
   - Velocidad (`HU-18b`): TTFT y tokens/s en percentiles (`P50, P75, P90, P95, P99`), más tasa de aciertos de caché, calculados desde telemetría propia.
   - Actividad (`HU-20b`): volumen de tokens separado en `prompt`, `completion` y `reasoning`, con selector por **rango de tiempo** y agrupación/filtro por **modelo, proveedor o usuario**.
 - **Catálogo, precios y benchmarks:**
-  - Catálogo y precios: `models.dev` (`api.json` para precios/proveedores y `models.json` para ficha canónica, licencia MIT) + contraste con `LiteLLM` (MIT).
+  - Catálogo y precios: `models.dev` (`api.json` para precios/proveedores y `models.json` para ficha canónica, licencia MIT). `LiteLLM` no se consume en tiempo de ejecución (solo sirvió como referencia inicial de convenciones).
   - Benchmarks públicos sin clave (regla de falla cerrada de `docs/investigacion/matriz-derechos-por-campo-2026-11-14.md`): **LMArena** (`agent/latest`, CC BY 4.0), **Epoch AI** (solo runs propios, CC BY), **ArtificialWatch** (solo `index` y `percentile` propios, CC BY 4.0) y **OpenCharts** (solo índices propios con enlace).
   - Fuentes excluidas del repo público: Artificial Analysis (cada usuario puede usar su propia clave de forma opcional en uso interno si así se implementa, nunca en repo público), OpenRouter scraping/copia no autorizada, ModelGrep, LLM Stats, PublicAI, Design Arena.
   - Logos de proveedor: automáticos desde `models.dev`, pintados con los colores de la app (`--sub` en modo claro) y cacheados localmente.
 - **UI e interacción:**
-  - Modo oscuro: después de la primera versión.
+  - Modo oscuro: implementado con soporte claro/oscuro/sistema y sincronización en vivo.
   - Playground: pantalla propia usando la cuota real y mostrando tok/s y TTFT.
   - Regla general de interacción: todo elemento con información al pasar el mouse lo indica de forma visible (cambio de color/tono o ícono `ⓘ`) y muestra un mini popup. El popup al clic se reserva para detalle extenso. Prohibido el cursor de ayuda (`?`).
 
 ## Pendiente
 
-- Verificar en vivo el cruce `canonical_model_id` de `models.dev/api.json` contra OpenRouter y definir catálogos de NVIDIA NIM y OpenCode Zen (`PENDIENTES #6`, `#14`).
-- Resolver los puntos puntuales de licencias en `PENDIENTES #20` (identificador programático de runs propios en Epoch AI y verificación de `coding-index.json` / `llm-prices.json` en ArtificialWatch).
-- Integrar el logotipo SVG definitivo de Bifrost cuando esté listo y diseñar los mockups de pantallas de administración (usuarios, nodos, logs, configuración, respaldos).
+- Verificar periódicamente en vivo el cruce `canonical_model_id` de `models.dev/api.json` contra OpenRouter, NVIDIA NIM y OpenCode Zen ante nuevos alias o familias de modelos (los catálogos base de NVIDIA NIM y OpenCode Zen, el detector programático de runs propios de Epoch AI y la integración CC BY 4.0 de `bench-index.json` + `coding-index.json` en ArtificialWatch ya están implementados; `llm-prices.json` no se consume).
+- Integrar el logotipo SVG definitivo de Bifrost cuando esté listo.

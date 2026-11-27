@@ -2,6 +2,8 @@ import type { DatabaseSync } from 'node:sqlite';
 import { redactSecretsInText, writeSystemLog } from './db.js';
 import type { UpstreamTlsOptions } from './nodes.js';
 import {
+  MAX_PLAYGROUND_MESSAGE_CONTENT_LENGTH,
+  MAX_PLAYGROUND_MESSAGE_REASONING_LENGTH,
   PlaygroundHistoryError,
   appendPlaygroundMessages,
   assertPlaygroundChatOwned,
@@ -11,9 +13,21 @@ import {
   type PlaygroundMessageMetrics,
 } from './playground-history.js';
 import {
+  computeTokensPerSec,
   executeChatCompletions,
+  toSafeNonNegInt,
   type DrainingRegistry,
 } from './router.js';
+
+const MAX_PLAYGROUND_SSE_BUFFER_CHARS = 1_048_576;
+const PLAYGROUND_TRUNCATION_NOTICE =
+  '\n\n[Respuesta truncada por exceder el límite de 200.000 caracteres]';
+
+function truncatePlaygroundText(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  const keepLen = Math.max(0, maxLength - PLAYGROUND_TRUNCATION_NOTICE.length);
+  return `${text.slice(0, keepLen)}${PLAYGROUND_TRUNCATION_NOTICE}`.slice(0, maxLength);
+}
 
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high';
 
@@ -53,11 +67,6 @@ function asRecord(val: unknown): Record<string, unknown> {
     return val as Record<string, unknown>;
   }
   return {};
-}
-
-function toSafeNonNegInt(val: unknown): number {
-  const n = Number(val);
-  return Number.isFinite(n) && n >= 0 ? Math.trunc(n) : 0;
 }
 
 function round2(n: number): number {
@@ -300,6 +309,11 @@ export async function handlePlaygroundChat(
     metrics: PlaygroundMessageMetrics | null,
   ) => {
     if (!boundChatId) return;
+    const safeContent = truncatePlaygroundText(content, MAX_PLAYGROUND_MESSAGE_CONTENT_LENGTH);
+    const safeReasoning =
+      reasoningContent !== null
+        ? truncatePlaygroundText(reasoningContent, MAX_PLAYGROUND_MESSAGE_REASONING_LENGTH)
+        : null;
     try {
       appendPlaygroundMessages(
         db,
@@ -308,8 +322,8 @@ export async function handlePlaygroundChat(
         boundChatId,
         {
           role: 'assistant',
-          content,
-          reasoningContent,
+          content: safeContent,
+          reasoningContent: safeReasoning,
           modelFullId: modelRow.full_id,
           metrics,
         },
@@ -428,6 +442,7 @@ export async function handlePlaygroundChat(
       modelId: modelRow.model_id,
       providerRow,
       requestBody: upstreamPayload,
+      signal: boundChatId ? undefined : opts.signal,
     });
   } catch (err) {
     const errMsg = redactSecretsInText(
@@ -560,11 +575,11 @@ export async function handlePlaygroundChat(
               : generatedChars > 0
                 ? Math.max(1, Math.ceil(generatedChars / 4))
                 : 0;
-          const totalOutTokens = effectiveCompletion + reasoningTokens;
-          const tokensPerSec =
-            totalOutTokens > 0 && durationMs > 0
-              ? round2((totalOutTokens / durationMs) * 1000)
-              : null;
+          const tokensPerSec = computeTokensPerSec(
+            effectiveCompletion,
+            reasoningTokens,
+            durationMs,
+          );
           const totalTokens = effectivePrompt + effectiveCompletion + reasoningTokens;
           return {
             durationMs,
@@ -626,62 +641,125 @@ export async function handlePlaygroundChat(
           safeEnqueue(encoder.encode('data: [DONE]\n\n'));
         };
 
-        const processLine = (rawLine: string) => {
-          const trimmed = rawLine.trim();
-          if (!trimmed) return;
-          if (!trimmed.startsWith('data:')) {
-            safeEnqueue(encoder.encode(`${rawLine}\n`));
-            return;
+        let eventDataLines: string[] = [];
+        let eventDataChars = 0;
+
+        const isValidJsonFrame = (raw: string): boolean => {
+          const t = raw.trim();
+          if (!t) return false;
+          try {
+            JSON.parse(t);
+            return true;
+          } catch {
+            return false;
           }
-          const payload = trimmed.slice(5).trim();
-          if (payload === '[DONE]') {
+        };
+
+        const processEventPayload = (payload: string) => {
+          const trimmed = payload.trim();
+          if (!trimmed) return;
+          if (trimmed === '[DONE]') {
             emitMetricsAndDone();
             return;
           }
 
+          let parsed: Record<string, unknown>;
           try {
-            const parsed = asRecord(JSON.parse(payload));
-            const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
-            if (choices.length > 0) {
-              const delta = asRecord(asRecord(choices[0]).delta);
-              const contentDelta = typeof delta.content === 'string' ? delta.content : '';
-              const reasoningDelta =
-                typeof delta.reasoning_content === 'string'
-                  ? delta.reasoning_content
-                  : typeof delta.reasoning === 'string'
-                    ? delta.reasoning
-                    : '';
-              const hasToolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
-              if (contentDelta || reasoningDelta || hasToolCalls) {
-                if (firstTokenMs === null) {
-                  firstTokenMs = Math.max(1, nowFn() - startedAtMs);
-                }
-                assistantContentAcc += contentDelta;
-                assistantReasoningAcc += reasoningDelta;
-                generatedChars += contentDelta.length + reasoningDelta.length;
-              }
+            const candidate = JSON.parse(trimmed) as unknown;
+            if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+              return;
             }
-            if (parsed.usage && typeof parsed.usage === 'object') {
-              const u = asRecord(parsed.usage);
-              const compDetails = asRecord(u.completion_tokens_details);
-              const promptDetails = asRecord(u.prompt_tokens_details);
-              promptTokens = toSafeNonNegInt(u.prompt_tokens ?? u.promptTokens) || promptTokens;
-              completionTokens =
-                toSafeNonNegInt(u.completion_tokens ?? u.completionTokens) || completionTokens;
-              reasoningTokens =
-                toSafeNonNegInt(
-                  u.reasoning_tokens ?? u.reasoningTokens ?? compDetails.reasoning_tokens,
-                ) || reasoningTokens;
-              cachedTokens =
-                toSafeNonNegInt(
-                  u.cached_tokens ?? u.cachedTokens ?? promptDetails.cached_tokens,
-                ) || cachedTokens;
-            }
+            parsed = candidate as Record<string, unknown>;
           } catch {
-            // Forward non-JSON data frame unchanged
+            // Discard truncated / malformed JSON frames instead of forwarding broken JSON
+            return;
           }
 
-          safeEnqueue(encoder.encode(`data: ${payload}\n\n`));
+          const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+          if (choices.length > 0) {
+            const delta = asRecord(asRecord(choices[0]).delta);
+            const contentDelta = typeof delta.content === 'string' ? delta.content : '';
+            const reasoningDelta =
+              typeof delta.reasoning_content === 'string'
+                ? delta.reasoning_content
+                : typeof delta.reasoning === 'string'
+                  ? delta.reasoning
+                  : '';
+            const hasToolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0;
+            if (contentDelta || reasoningDelta || hasToolCalls) {
+              if (firstTokenMs === null) {
+                firstTokenMs = Math.max(1, nowFn() - startedAtMs);
+              }
+              assistantContentAcc += contentDelta;
+              assistantReasoningAcc += reasoningDelta;
+              generatedChars += contentDelta.length + reasoningDelta.length;
+            }
+          }
+          if (parsed.usage && typeof parsed.usage === 'object') {
+            const u = asRecord(parsed.usage);
+            const compDetails = asRecord(u.completion_tokens_details);
+            const promptDetails = asRecord(u.prompt_tokens_details);
+            promptTokens = Math.max(
+              promptTokens,
+              toSafeNonNegInt(u.prompt_tokens ?? u.promptTokens),
+            );
+            completionTokens = Math.max(
+              completionTokens,
+              toSafeNonNegInt(u.completion_tokens ?? u.completionTokens),
+            );
+            reasoningTokens = Math.max(
+              reasoningTokens,
+              toSafeNonNegInt(
+                u.reasoning_tokens ?? u.reasoningTokens ?? compDetails.reasoning_tokens,
+              ),
+            );
+            cachedTokens = Math.max(
+              cachedTokens,
+              toSafeNonNegInt(u.cached_tokens ?? u.cachedTokens ?? promptDetails.cached_tokens),
+            );
+          }
+
+          safeEnqueue(encoder.encode(`data: ${trimmed}\n\n`));
+        };
+
+        const flushEventData = () => {
+          if (eventDataLines.length === 0) return;
+          const payload = eventDataLines.join('\n');
+          eventDataLines = [];
+          eventDataChars = 0;
+          processEventPayload(payload);
+        };
+
+        const processLine = (rawLine: string) => {
+          const line = rawLine.replace(/\r$/, '');
+          if (line === '') {
+            flushEventData();
+            return;
+          }
+          if (line.startsWith(':')) {
+            return;
+          }
+          if (!line.startsWith('data:')) {
+            return;
+          }
+
+          const dataPart = line.slice(5).replace(/^ /, '');
+          if (eventDataLines.length > 0) {
+            const buffered = eventDataLines.join('\n').trim();
+            if (buffered === '[DONE]' || isValidJsonFrame(buffered)) {
+              flushEventData();
+            }
+          }
+          if (eventDataChars + dataPart.length > MAX_PLAYGROUND_SSE_BUFFER_CHARS) {
+            eventDataLines = [];
+            eventDataChars = 0;
+            throw new Error('Upstream SSE event exceeded maximum buffer size.');
+          }
+          eventDataLines.push(dataPart);
+          eventDataChars += dataPart.length;
+          if (eventDataLines.length === 1 && dataPart.trim() === '[DONE]') {
+            flushEventData();
+          }
         };
 
         try {
@@ -689,6 +767,9 @@ export async function handlePlaygroundChat(
             const { done, value } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
+            if (buffer.length > MAX_PLAYGROUND_SSE_BUFFER_CHARS) {
+              throw new Error('Upstream SSE line exceeded maximum buffer size.');
+            }
             const lines = buffer.split('\n');
             buffer = lines.pop() ?? '';
             for (const line of lines) {
@@ -701,6 +782,7 @@ export async function handlePlaygroundChat(
               processLine(line);
             }
           }
+          flushEventData();
           emitMetricsAndDone();
           safeClose();
 
@@ -761,9 +843,15 @@ export async function handlePlaygroundChat(
         startUpstreamPump();
       },
       cancel() {
-        // Client disconnected / navigated away: stop enqueueing to client,
-        // but NEVER abort the upstream reader so HU-43b finishes persisting in background.
+        // Client disconnected / navigated away: stop enqueueing to client.
+        // For persisted chats (HU-43b, boundChatId !== null), keep reading upstream to finish persistence.
+        // For ephemeral chats (boundChatId === null), cancel upstream reader immediately to stop waste.
         clientOpen = false;
+        if (boundChatId === null) {
+          void reader.cancel().catch(() => {
+            // Ignore upstream reader cancel errors
+          });
+        }
       },
     });
 
@@ -834,13 +922,10 @@ export async function handlePlaygroundChat(
 
     const ttftMs =
       Number.isFinite(headerTtft) && headerTtft > 0 ? Math.round(headerTtft) : durationMs;
-    const totalOutTokens = completionTokens + reasoningTokens;
     const tokensPerSec =
       Number.isFinite(headerTps) && headerTps > 0
         ? round2(headerTps)
-        : totalOutTokens > 0 && durationMs > 0
-          ? round2((totalOutTokens / durationMs) * 1000)
-          : null;
+        : computeTokensPerSec(completionTokens, reasoningTokens, durationMs);
 
     if (boundChatId) {
       const hasContent = content.length > 0 || (reasoningContent !== undefined && reasoningContent.length > 0);

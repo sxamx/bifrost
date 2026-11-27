@@ -132,7 +132,7 @@ describe('Phase 8 Backend Acceptance & Red-Team Security Tests (HU-04, HU-05, HU
         const restrictedModel = 'openrouter/deepseek/deepseek-r1:free';
 
         // 3. Admin creates a single-use guest invitation
-        const invRes = await app.request('http://localhost/api/invitations', {
+        const invRes = await app.request('https://bifrost.example.com/api/invitations', {
           method: 'POST',
           headers: {
             Cookie: adminCookie,
@@ -744,9 +744,23 @@ describe('Phase 8 Backend Acceptance & Red-Team Security Tests (HU-04, HU-05, HU
         assert.equal(importJson.restored.nodes, 1);
         assert.equal(importJson.restored.models, 1);
 
-        // Verify adminB's active browser cookie STILL works seamlessly after user ID swap!
-        const meAfterImport = await appB.request('http://localhost/api/auth/me', {
+        // Verify displaced adminB's old session cookie was revoked (NEVER reassigned on username collision!)
+        const displacedMeAfterImport = await appB.request('http://localhost/api/auth/me', {
           headers: { Cookie: cookieB },
+        });
+        assert.equal(displacedMeAfterImport.status, 401);
+
+        // Log in on Instance B with the restored Instance A admin credentials
+        const restoredLoginRes = await appB.request('http://localhost/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'admin', password: 'sourceAdminPassword123!' }),
+        });
+        assert.equal(restoredLoginRes.status, 200);
+        const restoredCookieB = extractCookiePair(restoredLoginRes.headers.get('set-cookie'));
+
+        const meAfterImport = await appB.request('http://localhost/api/auth/me', {
+          headers: { Cookie: restoredCookieB },
         });
         assert.equal(meAfterImport.status, 200);
 
@@ -813,13 +827,19 @@ describe('Phase 8 Backend Acceptance & Red-Team Security Tests (HU-04, HU-05, HU
         );
         const missingTokenImportRes = await appB.request('http://localhost/api/backup/import', {
           method: 'POST',
-          headers: { Cookie: cookieB, 'Content-Type': 'application/json' },
+          headers: { Cookie: restoredCookieB, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             password: backupPassword,
             fileBase64: missingNodeTokenEnvelope.toString('base64'),
           }),
         });
         assert.equal(missingTokenImportRes.status, 200);
+
+        // Re-importing with unchanged admin id/role/password keeps the active admin session valid
+        const meAfterIdempotentImport = await appB.request('http://localhost/api/auth/me', {
+          headers: { Cookie: restoredCookieB },
+        });
+        assert.equal(meAfterIdempotentImport.status, 200);
 
         const safeOfflineNode = dbB
           .prepare(`SELECT status, encrypted_token FROM nodes WHERE id = ?`)

@@ -1,0 +1,39 @@
+# Bifrost Reverse Proxy Configuration for Caddy v2
+#
+# Required Bifrost environment variable when running behind Caddy TLS:
+#   BIFROST_TRUST_PROXY=true
+#
+# Optional: force Secure session cookies unconditionally (even on internal hops):
+#   BIFROST_COOKIE_SECURE=true
+#
+# Replace "bifrost.example.com" with your public domain (Caddy provisions
+# Let's Encrypt TLS certificates automatically).
+# If running via Docker Compose on the same network, replace "127.0.0.1:8080"
+# with "bifrost:8080".
+
+bifrost.example.com {
+	# Never compress SSE streaming routes (/v1/*, /api/playground/chat) so
+	# tokens flush immediately without proxy compression buffering.
+	@non_sse {
+		not path /v1/* /api/playground/chat
+	}
+	encode @non_sse zstd gzip
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Disable response buffering so SSE chunks reach clients in real time.
+		flush_interval -1
+
+		# Forward clean proxy headers consumed by Bifrost when BIFROST_TRUST_PROXY=true.
+		header_up Host {host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+		header_up X-Real-IP {remote_host}
+
+		# Prevent premature timeouts on long-running reasoning/streaming LLM responses.
+		transport http {
+			dial_timeout 10s
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}

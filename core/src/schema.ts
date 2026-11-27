@@ -236,6 +236,108 @@ export function validateAgainstSchema(
   return errors;
 }
 
+const SAFE_RELATIVE_ENDPOINT_PATH_RE = /^\/(?!\/)[^\s\\?#\u0000-\u001f\u007f]*$/;
+const RFC9110_HEADER_NAME_RE = /^[A-Za-z0-9-]+$/;
+const HEADER_CONTROL_CHARS_RE = /[\r\n\0\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+const FORBIDDEN_EXTRA_HEADERS = new Set<string>([
+  'host',
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'content-length',
+  'transfer-encoding',
+  'connection',
+  'upgrade',
+  'te',
+  'forwarded',
+]);
+
+export function isSafeRelativeEndpointPath(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  if (value.length === 0 || value.length > 512) return false;
+  if (!SAFE_RELATIVE_ENDPOINT_PATH_RE.test(value)) return false;
+  if (/(^|\/)\.\.(\/|$)/.test(value)) return false;
+  return true;
+}
+
+export function isValidHeaderName(name: string): boolean {
+  return name.length > 0 && name.length <= 128 && RFC9110_HEADER_NAME_RE.test(name);
+}
+
+export function hasHeaderControlChars(value: string): boolean {
+  return HEADER_CONTROL_CHARS_RE.test(value);
+}
+
+export function isForbiddenExtraHeaderName(name: string): boolean {
+  const lower = name.trim().toLowerCase();
+  return FORBIDDEN_EXTRA_HEADERS.has(lower) || lower.startsWith('x-forwarded-');
+}
+
+export function isForbiddenAuthHeaderName(name: string): boolean {
+  const lower = name.trim().toLowerCase();
+  if (lower === 'authorization') return false;
+  return FORBIDDEN_EXTRA_HEADERS.has(lower) || lower.startsWith('x-forwarded-');
+}
+
+export function validateAuthConfig(auth: unknown): string[] {
+  const errors: string[] = [];
+  if (!auth || typeof auth !== 'object' || Array.isArray(auth)) {
+    return errors;
+  }
+
+  const cfg = auth as Record<string, unknown>;
+  if (typeof cfg.header === 'string') {
+    if (!isValidHeaderName(cfg.header) || hasHeaderControlChars(cfg.header)) {
+      errors.push(
+        `$.auth.header: invalid header name ${JSON.stringify(cfg.header)} (expected RFC 9110 token ^[A-Za-z0-9-]+$)`,
+      );
+    } else if (isForbiddenAuthHeaderName(cfg.header)) {
+      errors.push(
+        `$.auth.header: header "${cfg.header}" is forbidden as an auth header`,
+      );
+    }
+  }
+
+  if (cfg.prefix !== undefined) {
+    if (typeof cfg.prefix !== 'string' || hasHeaderControlChars(cfg.prefix)) {
+      errors.push('$.auth.prefix: contains forbidden control or CRLF characters');
+    }
+  }
+
+  if (cfg.extraHeaders !== undefined) {
+    if (
+      !cfg.extraHeaders ||
+      typeof cfg.extraHeaders !== 'object' ||
+      Array.isArray(cfg.extraHeaders)
+    ) {
+      errors.push('$.auth.extraHeaders: must be an object');
+    } else {
+      for (const [key, val] of Object.entries(cfg.extraHeaders as Record<string, unknown>)) {
+        if (!isValidHeaderName(key) || hasHeaderControlChars(key)) {
+          errors.push(
+            `$.auth.extraHeaders.${key}: invalid header name (expected RFC 9110 token ^[A-Za-z0-9-]+$)`,
+          );
+          continue;
+        }
+        if (isForbiddenExtraHeaderName(key)) {
+          errors.push(
+            `$.auth.extraHeaders.${key}: header "${key}" is forbidden in extraHeaders`,
+          );
+          continue;
+        }
+        if (typeof val !== 'string' || hasHeaderControlChars(val)) {
+          errors.push(
+            `$.auth.extraHeaders.${key}: header value must be a string without CRLF or control characters`,
+          );
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
 function validateProviderSemantics(manifest: Record<string, unknown>): string[] {
   const errors: string[] = [];
   if (typeof manifest.baseUrl === 'string') {
@@ -248,6 +350,14 @@ function validateProviderSemantics(manifest: Record<string, unknown>): string[] 
       if (!urlCheck.valid) {
         errors.push(`$.baseUrl: ${urlCheck.error ?? 'forbidden target URL'}`);
       }
+    }
+  }
+  errors.push(...validateAuthConfig(manifest.auth));
+  if (manifest.modelsEndpoint !== undefined) {
+    if (!isSafeRelativeEndpointPath(manifest.modelsEndpoint)) {
+      errors.push(
+        '$.modelsEndpoint: must be a strict relative path starting with "/" (e.g. "/models") without protocol, host, query, fragment, or path traversal',
+      );
     }
   }
   if (manifest.modelsSource === 'static') {
@@ -265,6 +375,14 @@ function validateProviderSemantics(manifest: Record<string, unknown>): string[] 
   }
   if (manifest.packageType === 'experimental-adapter' && !manifest.adapter) {
     errors.push('$.adapter: required when packageType is "experimental-adapter"');
+  }
+  if (manifest.adapter && typeof manifest.adapter === 'object' && !Array.isArray(manifest.adapter)) {
+    const adapter = manifest.adapter as Record<string, unknown>;
+    if (!isSafeRelativeEndpointPath(adapter.healthPath)) {
+      errors.push(
+        '$.adapter.healthPath: must be a strict relative path starting with "/" (e.g. "/health") without protocol, host, query, fragment, or path traversal',
+      );
+    }
   }
   if (manifest.privacy !== undefined) {
     if (!manifest.privacy || typeof manifest.privacy !== 'object' || Array.isArray(manifest.privacy)) {
@@ -397,24 +515,77 @@ export function loadSeedManifests(
   return manifests;
 }
 
+export function mergeHeadersCaseInsensitive(
+  base: Record<string, string>,
+  overrides?: Record<string, string>,
+): Record<string, string> {
+  const map = new Map<string, { name: string; value: string }>();
+
+  const setEntry = (name: string, value: string) => {
+    if (!isValidHeaderName(name) || hasHeaderControlChars(value)) return;
+    map.set(name.toLowerCase(), { name, value });
+  };
+
+  for (const [k, v] of Object.entries(base)) {
+    setEntry(k, v);
+  }
+  if (overrides) {
+    for (const [k, v] of Object.entries(overrides)) {
+      setEntry(k, v);
+    }
+  }
+
+  const out: Record<string, string> = {};
+  for (const { name, value } of map.values()) {
+    out[name] = value;
+  }
+  return out;
+}
+
 export function buildProviderAuthHeaders(
   auth: ProviderAuthConfig,
   rawSecret: string,
 ): Record<string, string> {
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-    ...(auth.extraHeaders ?? {}),
-  };
+  const map = new Map<string, { name: string; value: string }>();
+  map.set('accept', { name: 'Accept', value: 'application/json' });
+
+  for (const [key, val] of Object.entries(auth.extraHeaders ?? {})) {
+    if (!isValidHeaderName(key) || isForbiddenExtraHeaderName(key)) {
+      continue;
+    }
+    if (typeof val !== 'string' || hasHeaderControlChars(val)) {
+      continue;
+    }
+    map.set(key.toLowerCase(), { name: key, value: val });
+  }
 
   if (auth.type === 'bearer') {
     const headerName = auth.header || 'Authorization';
     const prefix = auth.prefix !== undefined ? auth.prefix : 'Bearer ';
-    headers[headerName] = `${prefix}${rawSecret}`;
+    const value = `${prefix}${rawSecret}`;
+    if (
+      isValidHeaderName(headerName) &&
+      !isForbiddenAuthHeaderName(headerName) &&
+      !hasHeaderControlChars(value)
+    ) {
+      map.set(headerName.toLowerCase(), { name: headerName, value });
+    }
   } else if (auth.type === 'header') {
     const headerName = auth.header || 'X-API-Key';
     const prefix = auth.prefix ?? '';
-    headers[headerName] = `${prefix}${rawSecret}`;
+    const value = `${prefix}${rawSecret}`;
+    if (
+      isValidHeaderName(headerName) &&
+      !isForbiddenAuthHeaderName(headerName) &&
+      !hasHeaderControlChars(value)
+    ) {
+      map.set(headerName.toLowerCase(), { name: headerName, value });
+    }
   }
 
+  const headers: Record<string, string> = {};
+  for (const { name, value } of map.values()) {
+    headers[name] = value;
+  }
   return headers;
 }

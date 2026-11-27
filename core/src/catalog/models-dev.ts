@@ -83,6 +83,19 @@ export interface EnrichedModelMetadata {
   openWeights: boolean | null;
 }
 
+export const MODELS_DEV_FETCH_TIMEOUT_MS = 10_000;
+
+const inFlightModelsDevByDb = new WeakMap<DatabaseSync, Map<string, Promise<unknown>>>();
+
+function getInFlightMap(db: DatabaseSync): Map<string, Promise<unknown>> {
+  let map = inFlightModelsDevByDb.get(db);
+  if (!map) {
+    map = new Map();
+    inFlightModelsDevByDb.set(db, map);
+  }
+  return map;
+}
+
 async function fetchJsonCached<T>(
   db: DatabaseSync,
   cacheKey: string,
@@ -103,39 +116,57 @@ async function fetchJsonCached<T>(
     return existing.data;
   }
 
-  try {
-    const headers: Record<string, string> = {
-      'User-Agent': BIFROST_USER_AGENT,
-      Accept: 'application/json',
-    };
-    if (existing?.etag) {
-      headers['If-None-Match'] = existing.etag;
-    }
+  const inFlightMap = getInFlightMap(db);
+  const existingInFlight = inFlightMap.get(cacheKey);
+  if (existingInFlight) {
+    return existingInFlight as Promise<T | null>;
+  }
 
-    const res = await fetchFn(url, {
-      headers,
-      signal: AbortSignal.timeout(3000),
-    });
-    if (res.status === 304 && existing) {
-      touchExternalCacheTimestamp(db, cacheKey, nowSec);
-      return existing.data;
-    }
-    if (!res.ok) {
+  const work = (async (): Promise<T | null> => {
+    try {
+      const headers: Record<string, string> = {
+        'User-Agent': BIFROST_USER_AGENT,
+        Accept: 'application/json',
+      };
+      if (existing?.etag) {
+        headers['If-None-Match'] = existing.etag;
+      }
+
+      const res = await fetchFn(url, {
+        headers,
+        signal: AbortSignal.timeout(MODELS_DEV_FETCH_TIMEOUT_MS),
+      });
+      if (res.status === 304 && existing) {
+        touchExternalCacheTimestamp(db, cacheKey, nowSec);
+        return existing.data;
+      }
+      if (!res.ok) {
+        return existing ? existing.data : null;
+      }
+
+      const parsed = (await res.json()) as T;
+      const etag = res.headers.get('etag');
+      writeExternalCache(db, cacheKey, parsed, etag, nowSec);
+      return parsed;
+    } catch {
+      // Graceful fallback to cached snapshot when offline or upstream unavailable
       return existing ? existing.data : null;
     }
+  })();
 
-    const parsed = (await res.json()) as T;
-    const etag = res.headers.get('etag');
-    writeExternalCache(db, cacheKey, parsed, etag, nowSec);
-    return parsed;
-  } catch {
-    // Graceful fallback to cached snapshot when offline or upstream unavailable
-    return existing ? existing.data : null;
+  inFlightMap.set(cacheKey, work);
+  try {
+    return await work;
+  } finally {
+    if (inFlightMap.get(cacheKey) === work) {
+      inFlightMap.delete(cacheKey);
+    }
   }
 }
 
 /**
- * Fetches and caches models.dev/api.json and models.dev/models.json in SQLite external_cache.
+ * Fetches and caches models.dev/api.json and models.dev/models.json in SQLite external_cache,
+ * with singleflight deduplication per database instance.
  */
 export async function loadModelsDevSnapshot(
   db: DatabaseSync,
@@ -146,20 +177,38 @@ export async function loadModelsDevSnapshot(
     forceRefresh?: boolean;
   } = {},
 ): Promise<ModelsDevSnapshot> {
-  const [api, canonical] = await Promise.all([
-    fetchJsonCached<ModelsDevApiCatalog>(db, CACHE_KEY_MODELS_DEV_API, MODELS_DEV_API_URL, options),
-    fetchJsonCached<ModelsDevCanonicalCatalog>(
-      db,
-      CACHE_KEY_MODELS_DEV_MODELS,
-      MODELS_DEV_MODELS_URL,
-      options,
-    ),
-  ]);
+  const inFlightMap = getInFlightMap(db);
+  const snapshotKey = 'models_dev:snapshot';
+  const existingInFlight = inFlightMap.get(snapshotKey);
+  if (existingInFlight) {
+    return existingInFlight as Promise<ModelsDevSnapshot>;
+  }
 
-  return {
-    api: api ?? {},
-    canonical: canonical ?? {},
-  };
+  const work = (async (): Promise<ModelsDevSnapshot> => {
+    const [api, canonical] = await Promise.all([
+      fetchJsonCached<ModelsDevApiCatalog>(db, CACHE_KEY_MODELS_DEV_API, MODELS_DEV_API_URL, options),
+      fetchJsonCached<ModelsDevCanonicalCatalog>(
+        db,
+        CACHE_KEY_MODELS_DEV_MODELS,
+        MODELS_DEV_MODELS_URL,
+        options,
+      ),
+    ]);
+
+    return {
+      api: api ?? {},
+      canonical: canonical ?? {},
+    };
+  })();
+
+  inFlightMap.set(snapshotKey, work);
+  try {
+    return await work;
+  } finally {
+    if (inFlightMap.get(snapshotKey) === work) {
+      inFlightMap.delete(snapshotKey);
+    }
+  }
 }
 
 export function readCachedModelsDevSnapshot(db: DatabaseSync): ModelsDevSnapshot {
@@ -173,7 +222,29 @@ function normalizeProviderAliases(providerId: string): string[] {
   const slug = providerId.toLowerCase();
   if (slug === 'nvidia-nim') return ['nvidia', 'nvidia-nim'];
   if (slug === 'opencode-zen') return ['opencode', 'opencode-go', 'opencode-zen'];
+  if (slug === 'google-ai-studio') return ['google', 'google-ai-studio'];
   return [slug];
+}
+
+const TIER_QUALIFIER_RE = /\b(?:ultra|super|lightning)\b/i;
+const MOE_SUFFIX_RE = /-\d+(?:\.\d+)?b-a\d+(?:\.\d+)?b(?:-reasoning)?$/i;
+
+function stripMoeSuffixIfTiered(id: string): string | null {
+  const slashIdx = id.indexOf('/');
+  const prefix = slashIdx > 0 ? id.slice(0, slashIdx + 1) : '';
+  const slug = slashIdx > 0 ? id.slice(slashIdx + 1) : id;
+  if (!TIER_QUALIFIER_RE.test(slug) || !MOE_SUFFIX_RE.test(slug)) {
+    return null;
+  }
+  const strippedSlug = slug.replace(MOE_SUFFIX_RE, '');
+  if (!strippedSlug || strippedSlug === slug) {
+    return null;
+  }
+  return `${prefix}${strippedSlug}`;
+}
+
+function finiteNumberOrNull(val: unknown): number | null {
+  return typeof val === 'number' && Number.isFinite(val) ? val : null;
 }
 
 export function stripFreeAndDateSuffix(rawId: string): string {
@@ -204,9 +275,9 @@ export function parseReleaseDateToUtcSeconds(releaseDate: string | null | undefi
 /**
  * Resolves `canonical_model_id` and enriches model metadata strictly following
  * the verified Phase 4 lookup hierarchy:
- *  1. Direct provider match in `api.json[providerKey].models[modelId]`
+ *  1. Direct provider match in `api.json[providerKey].models[modelId]` (with optional `models/` strip)
  *  2. Stripped ID (`:free` / `-free` removed) in `models.json[strippedId]` and `api.json[vendor]`
- *  3. Upstream `canonical_slug` fallback with `-YYYYMMDD` stripped
+ *  3. Upstream `canonical_slug` fallback with `-YYYYMMDD` stripped and tiered MoE alias linking
  *  4. Preserves `null` when unmatched (never converts `null` into `0`).
  */
 export function resolveCanonicalAndEnrichModel(
@@ -219,9 +290,16 @@ export function resolveCanonicalAndEnrichModel(
   let canonicalHit: ModelsDevModelEntry | undefined;
   let canonicalModelId: string | null = null;
 
+  const providerAliases = normalizeProviderAliases(providerId);
+  const modelIdWithoutModelsPrefix = /^models\//i.test(modelId) ? modelId.slice(7) : null;
+
   // Step 1: Direct lookup under provider key(s) in models.dev/api.json
-  for (const provKey of normalizeProviderAliases(providerId)) {
-    const candidate = snapshot.api[provKey]?.models?.[modelId];
+  for (const provKey of providerAliases) {
+    const modelsMap = snapshot.api[provKey]?.models;
+    if (!modelsMap) continue;
+    const candidate =
+      modelsMap[modelId] ??
+      (modelIdWithoutModelsPrefix ? modelsMap[modelIdWithoutModelsPrefix] : undefined);
     if (candidate) {
       providerHit = candidate;
       break;
@@ -230,41 +308,168 @@ export function resolveCanonicalAndEnrichModel(
 
   // Step 2: Stripped ID lookup in models.json & vendor entry of api.json
   const strippedPrimary = modelId.replace(/:free$/i, '').replace(/-free$/i, '');
-  const candidateCanonicalIds: string[] = [strippedPrimary];
+  const candidateCanonicalIds: string[] = [];
+  const pushCandidate = (id: string | null | undefined) => {
+    const cleaned = id?.trim();
+    if (cleaned && !candidateCanonicalIds.includes(cleaned)) {
+      candidateCanonicalIds.push(cleaned);
+    }
+  };
+
+  pushCandidate(strippedPrimary);
+  if (/^models\//i.test(strippedPrimary)) {
+    const unprefixed = strippedPrimary.slice(7);
+    pushCandidate(unprefixed);
+    pushCandidate(stripFreeAndDateSuffix(unprefixed));
+    if (!unprefixed.includes('/')) {
+      for (const provKey of providerAliases) {
+        pushCandidate(`${provKey}/${unprefixed}`);
+        pushCandidate(`${provKey}/${stripFreeAndDateSuffix(unprefixed)}`);
+      }
+    }
+  }
 
   if (upstreamHints?.canonicalSlug) {
     const cleanedSlug = stripFreeAndDateSuffix(upstreamHints.canonicalSlug);
-    if (cleanedSlug && !candidateCanonicalIds.includes(cleanedSlug)) {
-      candidateCanonicalIds.push(cleanedSlug);
+    pushCandidate(cleanedSlug);
+    if (/^models\//i.test(cleanedSlug)) {
+      pushCandidate(cleanedSlug.slice(7));
     }
   }
+
   const strippedNoDate = stripFreeAndDateSuffix(strippedPrimary);
-  if (strippedNoDate && !candidateCanonicalIds.includes(strippedNoDate)) {
-    candidateCanonicalIds.push(strippedNoDate);
+  pushCandidate(strippedNoDate);
+
+  if (!strippedNoDate.includes('/')) {
+    for (const provKey of providerAliases) {
+      pushCandidate(`${provKey}/${strippedNoDate}`);
+    }
+  }
+
+  // Add tiered MoE-stripped aliases AFTER exact candidates so exact matches always take priority
+  const baseCandidatesSnapshot = [...candidateCanonicalIds];
+  for (const cand of baseCandidatesSnapshot) {
+    const moeStripped = stripMoeSuffixIfTiered(cand);
+    if (moeStripped) {
+      pushCandidate(moeStripped);
+    }
   }
 
   for (const cand of candidateCanonicalIds) {
-    if (snapshot.canonical[cand]) {
+    if (!canonicalHit && snapshot.canonical[cand]) {
       canonicalHit = snapshot.canonical[cand];
-      canonicalModelId = cand;
-      break;
+      if (canonicalModelId === null) {
+        canonicalModelId = cand;
+      }
     }
 
-    const slashIdx = cand.indexOf('/');
-    if (slashIdx > 0) {
-      const vendor = cand.slice(0, slashIdx);
-      const modelSlug = cand.slice(slashIdx + 1);
-      const vendorDirect =
-        snapshot.api[vendor]?.models?.[cand] ?? snapshot.api[vendor]?.models?.[modelSlug];
-      if (vendorDirect) {
-        if (!providerHit) {
+    if (!providerHit) {
+      const slashIdx = cand.indexOf('/');
+      if (slashIdx > 0) {
+        const vendor = cand.slice(0, slashIdx);
+        const modelSlug = cand.slice(slashIdx + 1);
+        const vendorDirect =
+          snapshot.api[vendor]?.models?.[cand] ?? snapshot.api[vendor]?.models?.[modelSlug];
+        if (vendorDirect) {
           providerHit = vendorDirect;
+          if (canonicalModelId === null) {
+            canonicalModelId = cand;
+          }
+          if (!canonicalHit && snapshot.canonical[`${vendor}/${modelSlug}`]) {
+            canonicalHit = snapshot.canonical[`${vendor}/${modelSlug}`];
+          }
         }
-        canonicalModelId = cand;
-        if (snapshot.canonical[`${vendor}/${modelSlug}`]) {
-          canonicalHit = snapshot.canonical[`${vendor}/${modelSlug}`];
+      } else {
+        for (const provKey of providerAliases) {
+          const direct =
+            snapshot.api[provKey]?.models?.[cand] ??
+            snapshot.api[provKey]?.models?.[`${provKey}/${cand}`];
+          if (direct) {
+            providerHit = direct;
+            if (canonicalModelId === null) {
+              canonicalModelId = cand;
+            }
+            break;
+          }
         }
-        break;
+      }
+    }
+
+    if (providerHit && canonicalHit) {
+      break;
+    }
+  }
+
+  // Bidirectional tiered MoE alias link (short unstripped <-> long explicit MoE, e.g.,
+  // `nvidia/nemotron-3.5-super-vl` <-> `nvidia/nemotron-3.5-super-vl-120b-a12b`).
+  // Never links sizeA <-> sizeB and never ignores conflicting vendor/ prefixes.
+  if (!canonicalHit || !providerHit) {
+    const parseVendorAndSlug = (raw: string): { vendor: string | null; slug: string } => {
+      const lower = raw.toLowerCase();
+      const idx = lower.indexOf('/');
+      if (idx > 0) {
+        return { vendor: lower.slice(0, idx), slug: lower.slice(idx + 1) };
+      }
+      return { vendor: null, slug: lower };
+    };
+
+    const shortTieredCandidates = baseCandidatesSnapshot
+      .filter((cand) => {
+        const { slug } = parseVendorAndSlug(cand);
+        return TIER_QUALIFIER_RE.test(slug) && !MOE_SUFFIX_RE.test(slug);
+      })
+      .map(parseVendorAndSlug);
+
+    const matchesShortTieredCandidate = (strippedKey: string): boolean => {
+      const keyParts = parseVendorAndSlug(strippedKey);
+      for (const cand of shortTieredCandidates) {
+        if (keyParts.slug !== cand.slug) continue;
+        if (keyParts.vendor !== null && cand.vendor !== null && keyParts.vendor !== cand.vendor) {
+          continue;
+        }
+        return true;
+      }
+      return false;
+    };
+
+    if (shortTieredCandidates.length > 0) {
+      if (!canonicalHit) {
+        for (const [canonKey, canonEntry] of Object.entries(snapshot.canonical)) {
+          const strippedKey = stripMoeSuffixIfTiered(canonKey);
+          if (!strippedKey) continue;
+          if (matchesShortTieredCandidate(strippedKey)) {
+            canonicalHit = canonEntry;
+            if (canonicalModelId === null) {
+              canonicalModelId = canonKey;
+            }
+            break;
+          }
+        }
+      }
+
+      if (!providerHit) {
+        const searchVendors = new Set<string>(providerAliases);
+        for (const cand of baseCandidatesSnapshot) {
+          const slashIdx = cand.indexOf('/');
+          if (slashIdx > 0) {
+            searchVendors.add(cand.slice(0, slashIdx).toLowerCase());
+          }
+        }
+        outer: for (const vendor of searchVendors) {
+          const modelsMap = snapshot.api[vendor]?.models;
+          if (!modelsMap) continue;
+          for (const [mKey, mEntry] of Object.entries(modelsMap)) {
+            const strippedKey = stripMoeSuffixIfTiered(mKey);
+            if (!strippedKey) continue;
+            if (matchesShortTieredCandidate(strippedKey)) {
+              providerHit = mEntry;
+              if (canonicalModelId === null) {
+                canonicalModelId = mKey;
+              }
+              break outer;
+            }
+          }
+        }
       }
     }
   }
@@ -280,22 +485,18 @@ export function resolveCanonicalAndEnrichModel(
 
   const hasCapabilitiesSource = Boolean(providerHit || canonicalHit);
 
-  const costInput = typeof providerHit?.cost?.input === 'number' ? providerHit.cost.input : null;
-  const costOutput = typeof providerHit?.cost?.output === 'number' ? providerHit.cost.output : null;
+  const costInput =
+    finiteNumberOrNull(providerHit?.cost?.input) ?? finiteNumberOrNull(canonicalHit?.cost?.input);
+  const costOutput =
+    finiteNumberOrNull(providerHit?.cost?.output) ?? finiteNumberOrNull(canonicalHit?.cost?.output);
 
   const contextLength =
-    typeof providerHit?.limit?.context === 'number'
-      ? providerHit.limit.context
-      : typeof canonicalHit?.limit?.context === 'number'
-        ? canonicalHit.limit.context
-        : null;
+    finiteNumberOrNull(providerHit?.limit?.context) ??
+    finiteNumberOrNull(canonicalHit?.limit?.context);
 
   const maxOutput =
-    typeof providerHit?.limit?.output === 'number'
-      ? providerHit.limit.output
-      : typeof canonicalHit?.limit?.output === 'number'
-        ? canonicalHit.limit.output
-        : null;
+    finiteNumberOrNull(providerHit?.limit?.output) ??
+    finiteNumberOrNull(canonicalHit?.limit?.output);
 
   const openWeights =
     typeof providerHit?.open_weights === 'boolean'

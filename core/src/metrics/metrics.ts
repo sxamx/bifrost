@@ -10,7 +10,6 @@ import {
   round2,
   utcNextMidnightSec,
   utcStartOfDaySec,
-  utcStartOfHourSec,
 } from './stats.js';
 import type {
   LatencyBucket,
@@ -117,9 +116,14 @@ export function getSummaryMetrics(
          JOIN models m
            ON (uma.model_full_id = m.full_id OR uma.model_full_id = '*' OR uma.model_full_id = m.provider_id || '/*')
          JOIN providers p ON p.id = m.provider_id
-         WHERE uma.user_id = ? AND m.active = 1 AND p.enabled = 1`,
+         WHERE uma.user_id = ? AND m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1`,
       )
       .get(options.userId) as { models_cnt: number; providers_cnt: number };
+
+    const quotaPercentageRemaining =
+      configuredDailyLimit !== null && configuredDailyLimit > 0 && remainingTokensToday !== null
+        ? round2(Math.max(0, Math.min(100, (remainingTokensToday / configuredDailyLimit) * 100)))
+        : null;
 
     return {
       quotaToday: {
@@ -136,6 +140,7 @@ export function getSummaryMetrics(
         windowLabel: '24h',
         confidence: 'configured',
         effectiveLimit: configuredDailyLimit,
+        quotaPercentageRemaining,
         adaptiveAdjusted: false,
       },
       providersCount: Number(counts?.providers_cnt ?? 0),
@@ -144,41 +149,43 @@ export function getSummaryMetrics(
     };
   }
 
-  // Admin view: global provider_keys quota pool + x-ratelimit-* signals + UTC usage
-  const keyPoolRow = db
-    .prepare(
-      `SELECT COUNT(pk.daily_quota_limit) AS keys_with_limit,
-              SUM(pk.daily_quota_limit) AS total_daily_limit,
-              COUNT(CASE WHEN pk.ratelimit_remaining IS NOT NULL AND (pk.ratelimit_reset_at IS NULL OR pk.ratelimit_reset_at > ?) THEN 1 END) AS keys_with_rl,
-              SUM(CASE WHEN pk.ratelimit_remaining IS NOT NULL AND (pk.ratelimit_reset_at IS NULL OR pk.ratelimit_reset_at > ?) THEN pk.ratelimit_remaining ELSE 0 END) AS total_rl_remaining,
-              MIN(CASE WHEN pk.ratelimit_reset_at IS NOT NULL AND pk.ratelimit_reset_at > ? THEN pk.ratelimit_reset_at END) AS earliest_rl_reset
-       FROM provider_keys pk
-       JOIN providers p ON p.id = pk.provider_id
-       WHERE p.enabled = 1 AND pk.status IN ('active', 'rate_limited')`,
-    )
-    .get(nowSec, nowSec, nowSec) as {
-    keys_with_limit: number;
-    total_daily_limit: number | null;
-    keys_with_rl: number;
-    total_rl_remaining: number | null;
-    earliest_rl_reset: number | null;
-  };
+  // Admin view: align global quota pool with computeAdaptiveFreeQuotas (unit-safe, online-node filtered, isRealHeaderSignal)
+  const adaptive = computeAdaptiveFreeQuotas(db, nowSec);
+  const countableProviders = adaptive.providers.filter((p) => p.unit !== 'none');
+  const hasTokenProviders = countableProviders.some((p) => p.unit === 'tokens');
+  const hasRequestProviders = countableProviders.some((p) => p.unit === 'requests');
+  const hasMixedUnits = hasTokenProviders && hasRequestProviders;
+  const isRequestsOnly = hasRequestProviders && !hasTokenProviders;
 
   const userDailyLimit =
     userRow?.daily_token_limit !== null && userRow?.daily_token_limit !== undefined
       ? Number(userRow.daily_token_limit)
       : null;
 
-  const poolDailyLimit =
-    Number(keyPoolRow?.keys_with_limit ?? 0) > 0 ? Number(keyPoolRow.total_daily_limit ?? 0) : null;
+  const configuredDailyLimit = hasMixedUnits
+    ? null
+    : (adaptive.configuredLimit ?? userDailyLimit);
+  const effectiveLimit = hasMixedUnits
+    ? null
+    : (adaptive.effectiveLimit ?? configuredDailyLimit);
 
-  const configuredDailyLimit = poolDailyLimit ?? userDailyLimit;
+  const providersWithRealHeader = countableProviders.filter((p) => p.headerRemaining !== null);
   const providerRateLimitRemaining =
-    Number(keyPoolRow?.keys_with_rl ?? 0) > 0 ? Number(keyPoolRow.total_rl_remaining ?? 0) : null;
-  const earliestProviderResetAt =
-    keyPoolRow?.earliest_rl_reset !== null && keyPoolRow?.earliest_rl_reset !== undefined
-      ? formatIsoUtc(Number(keyPoolRow.earliest_rl_reset))
+    !hasMixedUnits && providersWithRealHeader.length > 0
+      ? providersWithRealHeader.reduce((sum, p) => sum + (p.headerRemaining ?? 0), 0)
       : null;
+
+  let earliestResetMs: number | null = null;
+  let earliestProviderResetAt: string | null = null;
+  for (const p of countableProviders) {
+    if (p.earliestResetAt) {
+      const tsMs = Date.parse(p.earliestResetAt);
+      if (Number.isFinite(tsMs) && (earliestResetMs === null || tsMs < earliestResetMs)) {
+        earliestResetMs = tsMs;
+        earliestProviderResetAt = p.earliestResetAt;
+      }
+    }
+  }
 
   const todayStartSec = utcStartOfDaySec(nowSec);
   const usageRow = db
@@ -190,14 +197,40 @@ export function getSummaryMetrics(
     .get(todayStartSec, nowSec) as { used_tokens: number };
 
   const usedTokensToday = Number(usageRow?.used_tokens ?? 0);
-  const remainingTokensToday =
-    configuredDailyLimit !== null
-      ? Math.max(0, configuredDailyLimit - usedTokensToday)
-      : providerRateLimitRemaining;
-  const usedPct =
-    configuredDailyLimit !== null && configuredDailyLimit > 0
-      ? round2((usedTokensToday / configuredDailyLimit) * 100)
-      : null;
+
+  let remainingTokensToday: number | null = null;
+  let usedPct: number | null = null;
+  let quotaPercentageRemaining: number | null = adaptive.quotaPercentageRemaining;
+
+  if (hasMixedUnits) {
+    // Mixed units (tokens + requests): never sum limits or subtract tokens from requests
+    remainingTokensToday = null;
+    usedPct =
+      quotaPercentageRemaining !== null
+        ? round2(Math.max(0, Math.min(100, 100 - quotaPercentageRemaining)))
+        : null;
+  } else if (isRequestsOnly) {
+    // Requests-only providers: never subtract usedTokensToday (tokens) from a requests limit
+    remainingTokensToday = adaptive.remainingInWindow;
+    usedPct =
+      quotaPercentageRemaining !== null
+        ? round2(Math.max(0, Math.min(100, 100 - quotaPercentageRemaining)))
+        : null;
+  } else {
+    remainingTokensToday =
+      configuredDailyLimit !== null
+        ? Math.max(0, configuredDailyLimit - usedTokensToday)
+        : providerRateLimitRemaining;
+    usedPct =
+      configuredDailyLimit !== null && configuredDailyLimit > 0
+        ? round2((usedTokensToday / configuredDailyLimit) * 100)
+        : null;
+    if (quotaPercentageRemaining === null && configuredDailyLimit !== null && configuredDailyLimit > 0) {
+      quotaPercentageRemaining = round2(
+        Math.max(0, Math.min(100, ((configuredDailyLimit - usedTokensToday) / configuredDailyLimit) * 100)),
+      );
+    }
+  }
 
   const providersCount = Number(
     (
@@ -213,7 +246,7 @@ export function getSummaryMetrics(
           `SELECT COUNT(*) AS c
            FROM models m
            JOIN providers p ON p.id = m.provider_id
-           WHERE m.active = 1 AND p.enabled = 1`,
+           WHERE m.active = 1 AND m.disabled_by_admin = 0 AND p.enabled = 1`,
         )
         .get() as { c: number }
     )?.c ?? 0,
@@ -225,9 +258,6 @@ export function getSummaryMetrics(
       }
     )?.c ?? 0,
   );
-
-  const adaptive = computeAdaptiveFreeQuotas(db, nowSec);
-  const effectiveLimit = adaptive.effectiveLimit ?? configuredDailyLimit;
 
   return {
     quotaToday: {
@@ -244,6 +274,7 @@ export function getSummaryMetrics(
       windowLabel: adaptive.windowLabel,
       confidence: adaptive.confidence,
       effectiveLimit,
+      quotaPercentageRemaining,
       adaptiveAdjusted: adaptive.adaptiveAdjusted,
     },
     providersCount,
@@ -253,10 +284,37 @@ export function getSummaryMetrics(
   };
 }
 
+const MAX_PERCENTILE_SAMPLES_PER_BUCKET = 10_000;
+const MAX_OVERALL_LATENCY_SAMPLES = 50_000;
+const MAX_SPEED_SAMPLES_PER_MODEL = 10_000;
+
+interface BoundedSampleReservoir {
+  total: number;
+  samples: number[];
+}
+
+function pushReservoirSample(
+  reservoir: BoundedSampleReservoir,
+  value: number,
+  cap: number,
+): void {
+  reservoir.total += 1;
+  if (reservoir.samples.length < cap) {
+    reservoir.samples.push(value);
+    return;
+  }
+  const replaceIdx = Math.floor(Math.random() * reservoir.total);
+  if (replaceIdx < cap) {
+    reservoir.samples[replaceIdx] = value;
+  }
+}
+
 /**
  * HU-18: Computes grouped duration_ms percentiles (P50, P75, P90, P95, P99)
  * bucketed by UTC hour (`today` / `24h`) or UTC day (`7d` / `30d`).
  * Preserves `null` for buckets with 0 samples.
+ * Streams rows via SQLite cursor (`iterate`) with bounded reservoir sampling
+ * so 30-day windows remain memory-safe on 1 GB RAM VMs.
  */
 export function getLatencyMetrics(
   db: DatabaseSync,
@@ -265,7 +323,7 @@ export function getLatencyMetrics(
   const nowSec = options.nowSec ?? Math.floor(Date.now() / 1000);
   const spec = buildTimeBuckets(nowSec, options.range);
 
-  const clauses: string[] = ['created_at >= ?', 'created_at <= ?'];
+  const clauses: string[] = ['created_at >= ?', 'created_at <= ?', 'duration_ms IS NOT NULL'];
   const params: SQLInputValue[] = [spec.rangeStartSec, spec.rangeEndSec];
 
   if (options.providerId) {
@@ -281,55 +339,57 @@ export function getLatencyMetrics(
     params.push(options.userId);
   }
 
-  const rows = db
-    .prepare(
-      `SELECT created_at, duration_ms
-       FROM usage_logs
-       WHERE ${clauses.join(' AND ')}`,
-    )
-    .all(...params) as Array<{ created_at: number; duration_ms: number }>;
+  const bucketExpr =
+    spec.granularity === 'hour'
+      ? '(created_at / 3600) * 3600'
+      : '(created_at / 86400) * 86400';
 
-  const bucketSamples = new Map<number, number[]>();
+  const bucketReservoirs = new Map<number, BoundedSampleReservoir>();
   for (const b of spec.buckets) {
-    bucketSamples.set(b.bucketStartSec, []);
+    bucketReservoirs.set(b.bucketStartSec, { total: 0, samples: [] });
   }
 
-  const allSamples: number[] = [];
-  for (const r of rows) {
-    if (typeof r.duration_ms !== 'number' || !Number.isFinite(r.duration_ms)) {
+  const overallReservoir: BoundedSampleReservoir = { total: 0, samples: [] };
+  const stmt = db.prepare(
+    `SELECT ${bucketExpr} AS bucket_sec, duration_ms
+     FROM usage_logs
+     WHERE ${clauses.join(' AND ')}`,
+  );
+
+  for (const rawRow of stmt.iterate(...params)) {
+    const r = rawRow as { bucket_sec: number; duration_ms: number };
+    const duration = Number(r.duration_ms);
+    if (!Number.isFinite(duration)) {
       continue;
     }
-    allSamples.push(r.duration_ms);
-    const key =
-      spec.granularity === 'hour'
-        ? utcStartOfHourSec(r.created_at)
-        : utcStartOfDaySec(r.created_at);
-    const arr = bucketSamples.get(key);
-    if (arr) {
-      arr.push(r.duration_ms);
+    pushReservoirSample(overallReservoir, duration, MAX_OVERALL_LATENCY_SAMPLES);
+    const bucketKey = Number(r.bucket_sec);
+    const bucket = bucketReservoirs.get(bucketKey);
+    if (bucket) {
+      pushReservoirSample(bucket, duration, MAX_PERCENTILE_SAMPLES_PER_BUCKET);
     }
   }
 
   const buckets: LatencyBucket[] = spec.buckets.map((b) => {
-    const samples = bucketSamples.get(b.bucketStartSec) ?? [];
-    const pcts = computePercentiles(samples);
+    const reservoir = bucketReservoirs.get(b.bucketStartSec) ?? { total: 0, samples: [] };
+    const pcts = computePercentiles(reservoir.samples);
     return {
       bucketStartSec: b.bucketStartSec,
       timestamp: b.bucketStartSec,
       label: b.label,
-      sampleCount: samples.length,
-      count: samples.length,
+      sampleCount: reservoir.total,
+      count: reservoir.total,
       ...pcts,
     };
   });
 
-  const overallPcts = computePercentiles(allSamples);
+  const overallPcts = computePercentiles(overallReservoir.samples);
 
   return {
     range: options.range,
     granularity: spec.granularity,
     overall: {
-      sampleCount: allSamples.length,
+      sampleCount: overallReservoir.total,
       percentiles: overallPcts,
       ...overallPcts,
     },
@@ -340,6 +400,7 @@ export function getLatencyMetrics(
 /**
  * HU-18b: Computes TTFT and tokens/sec percentiles (P50..P99) per active model
  * and prompt cache hit rate (%) per provider.
+ * Filters active models directly in SQL and streams rows via `iterate` with bounded reservoirs.
  */
 export function getSpeedAndCacheMetrics(
   db: DatabaseSync,
@@ -358,48 +419,57 @@ export function getSpeedAndCacheMetrics(
     )
     .all() as Array<{ full_id: string; name: string; provider_id: string }>;
 
-  const modelLogs = db
-    .prepare(
-      `SELECT model_full_id, ttft_ms, tokens_per_sec
-       FROM usage_logs
-       WHERE created_at >= ? AND created_at <= ?`,
-    )
-    .all(spec.rangeStartSec, spec.rangeEndSec) as Array<{
-    model_full_id: string;
-    ttft_ms: number | null;
-    tokens_per_sec: number | null;
-  }>;
-
   const perModelSamples = new Map<
     string,
-    { count: number; ttft: number[]; tps: number[] }
+    { count: number; ttft: BoundedSampleReservoir; tps: BoundedSampleReservoir }
   >();
   for (const m of activeModels) {
-    perModelSamples.set(m.full_id, { count: 0, ttft: [], tps: [] });
+    perModelSamples.set(m.full_id, {
+      count: 0,
+      ttft: { total: 0, samples: [] },
+      tps: { total: 0, samples: [] },
+    });
   }
 
-  for (const row of modelLogs) {
-    const bucket = perModelSamples.get(row.model_full_id);
-    if (!bucket) continue;
-    bucket.count += 1;
-    if (typeof row.ttft_ms === 'number' && Number.isFinite(row.ttft_ms)) {
-      bucket.ttft.push(row.ttft_ms);
-    }
-    if (typeof row.tokens_per_sec === 'number' && Number.isFinite(row.tokens_per_sec)) {
-      bucket.tps.push(row.tokens_per_sec);
+  if (activeModels.length > 0) {
+    const modelLogsStmt = db.prepare(
+      `SELECT u.model_full_id, u.ttft_ms, u.tokens_per_sec
+       FROM usage_logs u
+       INNER JOIN models m ON m.full_id = u.model_full_id
+       INNER JOIN providers p ON p.id = m.provider_id
+       WHERE u.created_at >= ? AND u.created_at <= ?
+         AND m.active = 1 AND p.enabled = 1`,
+    );
+
+    for (const rawRow of modelLogsStmt.iterate(spec.rangeStartSec, spec.rangeEndSec)) {
+      const row = rawRow as {
+        model_full_id: string;
+        ttft_ms: number | null;
+        tokens_per_sec: number | null;
+      };
+      const bucket = perModelSamples.get(row.model_full_id);
+      if (!bucket) continue;
+      bucket.count += 1;
+      if (typeof row.ttft_ms === 'number' && Number.isFinite(row.ttft_ms)) {
+        pushReservoirSample(bucket.ttft, row.ttft_ms, MAX_SPEED_SAMPLES_PER_MODEL);
+      }
+      if (typeof row.tokens_per_sec === 'number' && Number.isFinite(row.tokens_per_sec)) {
+        pushReservoirSample(bucket.tps, row.tokens_per_sec, MAX_SPEED_SAMPLES_PER_MODEL);
+      }
     }
   }
 
   const models: ModelSpeedMetrics[] = activeModels
     .map((m) => {
-      const entry = perModelSamples.get(m.full_id) ?? { count: 0, ttft: [], tps: [] };
+      const entry = perModelSamples.get(m.full_id);
+      const count = entry?.count ?? 0;
       return {
         modelFullId: m.full_id,
         modelName: m.name,
         providerId: m.provider_id,
-        sampleCount: entry.count,
-        ttftMs: computePercentiles(entry.ttft),
-        tokensPerSec: computePercentiles(entry.tps),
+        sampleCount: count,
+        ttftMs: computePercentiles(entry?.ttft.samples ?? []),
+        tokensPerSec: computePercentiles(entry?.tps.samples ?? []),
       };
     })
     .filter((m) => m.sampleCount > 0);

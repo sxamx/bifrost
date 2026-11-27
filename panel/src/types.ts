@@ -64,6 +64,8 @@ export interface LmArenaBenchmarkBlock {
   rankingPeers: LmArenaPeerEntry[];
   sourceUrl: string;
   license: string;
+  licenseUrl?: string | null;
+  attribution?: string | null;
   capturedAt: string | null;
 }
 
@@ -91,6 +93,8 @@ export interface ArtificialWatchBenchmarkBlock {
   }>;
   sourceUrl: string;
   license: string;
+  licenseUrl?: string | null;
+  attribution?: string | null;
   capturedAt: string | null;
 }
 
@@ -106,11 +110,24 @@ export interface EpochBenchmarkRun {
   tokensUsed?: number | null;
 }
 
+export interface EpochEciSummary {
+  model: string;
+  displayName: string | null;
+  eci: number;
+  eciCiLow: number | null;
+  eciCiHigh: number | null;
+  date: string | null;
+  organization: string | null;
+}
+
 export interface EpochBenchmarkBlock {
   available: boolean;
   runs: EpochBenchmarkRun[];
+  eci?: EpochEciSummary | null;
   sourceUrl: string;
   license: string;
+  licenseUrl?: string | null;
+  attribution?: string | null;
   capturedAt: string | null;
 }
 
@@ -130,6 +147,9 @@ export interface OpenChartsBenchmarkBlock {
   }>;
   methodologyUrl: string;
   sourceUrl: string;
+  license?: string | null;
+  licenseUrl?: string | null;
+  attribution?: string | null;
   capturedAt: string | null;
 }
 
@@ -297,6 +317,7 @@ export interface CreateInvitationResult {
 
 export interface BackupExportOptions {
   password: string;
+  adminPassword?: string;
   includeProvidersAndConfig: boolean;
   includeProviderKeys: boolean;
   includeUsersAndQuotas: boolean;
@@ -383,15 +404,26 @@ export interface PercentileTuple {
   p99: number;
 }
 
+export interface NullablePercentileTuple {
+  p50: number | null;
+  p75: number | null;
+  p90: number | null;
+  p95: number | null;
+  p99: number | null;
+}
+
 export interface LatencyBucketPoint extends PercentileTuple {
   timestamp: string | number;
   label?: string;
   count?: number;
+  hasData?: boolean;
+  rawPercentiles?: NullablePercentileTuple;
 }
 
 export interface LatencyMetricsData {
   buckets: LatencyBucketPoint[];
   overall?: PercentileTuple | null;
+  overallRaw?: NullablePercentileTuple | null;
 }
 
 export interface ModelSpeedEntry {
@@ -401,12 +433,15 @@ export interface ModelSpeedEntry {
   sampleCount: number;
   ttftMs: PercentileTuple;
   tokensPerSec: PercentileTuple;
+  rawTtftMs?: NullablePercentileTuple;
+  rawTokensPerSec?: NullablePercentileTuple;
 }
 
 export interface ProviderCacheEntry {
   providerId: string;
   providerName: string;
   cacheHitRate: number;
+  cacheHitRateNullable?: number | null;
   cachedTokens: number;
   promptTokens: number;
 }
@@ -430,6 +465,8 @@ export interface ProviderReliabilityEntry {
   days: UptimeDayCell[];
   toolErrorRate7d: number;
   structuredErrorRate7d: number;
+  toolErrorRate7dNullable?: number | null;
+  structuredErrorRate7dNullable?: number | null;
   totalRequests7d?: number;
 }
 
@@ -514,12 +551,14 @@ export interface CreateNodeInput {
   name: string;
   mode: NodeMode;
   endpoint: string;
+  tlsFingerprint?: string;
 }
 
 export interface CreateNodeResult {
   node: ExitNodeItem;
   rawToken: string;
   installCommand: string;
+  publicIpWarning?: string | null;
 }
 
 export interface RotateNodeTokenResult {

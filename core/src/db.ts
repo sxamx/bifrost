@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { redactSecretsInText } from './metrics/redact.js';
+
+export { redactSecretsInText };
 
 export type SystemLogLevel = 'info' | 'warn' | 'error';
 export type SystemLogCategory =
@@ -78,6 +81,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   endpoint TEXT NOT NULL,
   token_hash TEXT NOT NULL,
   encrypted_token BLOB,
+  pending_encrypted_token BLOB,
   tls_fingerprint TEXT,
   last_commit TEXT,
   prev_token_hash TEXT,
@@ -234,6 +238,9 @@ function ensureNodesColumns(db: DatabaseSync): void {
 
   if (!colNames.has('encrypted_token')) {
     db.exec(`ALTER TABLE nodes ADD COLUMN encrypted_token BLOB;`);
+  }
+  if (!colNames.has('pending_encrypted_token')) {
+    db.exec(`ALTER TABLE nodes ADD COLUMN pending_encrypted_token BLOB;`);
   }
   if (!colNames.has('tls_fingerprint')) {
     db.exec(`ALTER TABLE nodes ADD COLUMN tls_fingerprint TEXT;`);
@@ -465,21 +472,7 @@ export function openDatabase(dbPath: string): DatabaseSync {
 }
 
 const SENSITIVE_FIELD_RE =
-  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|x-api-key|x-goog-api-key|token|token_hash|tokenHash|prev_token_hash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|inviteUrl|invite_url|encrypted_token|encryptedToken|masterKey|master_key|authorization|proxy-authorization|proxy_authorization|cookie)$/i;
-
-export function redactSecretsInText(text: string): string {
-  return text
-    .replace(/sk-bf-[A-Za-z0-9_-]{6,}/g, 'sk-bf-[REDACTED]')
-    .replace(/bfnode_[A-Za-z0-9_-]{6,}/g, 'bfnode_[REDACTED]')
-    .replace(/bfn_[A-Za-z0-9_-]{6,}/g, 'bfn_[REDACTED]')
-    .replace(/bfi_[A-Za-z0-9_-]{6,}/g, 'bfi_[REDACTED]')
-    .replace(/sk-[A-Za-z0-9_-]{10,}/g, 'sk-[REDACTED]')
-    .replace(/nvapi-[A-Za-z0-9_-]{10,}/g, 'nvapi-[REDACTED]')
-    .replace(/gsk_[A-Za-z0-9_-]{10,}/g, 'gsk_[REDACTED]')
-    .replace(/AIza[A-Za-z0-9_-]{16,}/g, 'AIza[REDACTED]')
-    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [REDACTED]')
-    .replace(/([?&](?:key|api_key|apikey|token|access_token)=)[^&\s"'#]+/gi, '$1[REDACTED]');
-}
+  /^(password|password_hash|passwordHash|secret|encrypted_secret|encryptedSecret|rawKey|raw_key|apiKey|api_key|x-api-key|x-goog-api-key|token|token_hash|tokenHash|prev_token_hash|rawToken|raw_token|nodeToken|node_token|newToken|new_token|inviteUrl|invite_url|encrypted_token|encryptedToken|pending_encrypted_token|pendingEncryptedToken|masterKey|master_key|authorization|proxy-authorization|proxy_authorization|cookie)$/i;
 
 function sanitizeLogValue(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[TRUNCATED]';
