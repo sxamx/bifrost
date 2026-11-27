@@ -13,6 +13,7 @@ Environment=NODE_ENV=production
 Environment=PORT=8080
 Environment=DATA_DIR=/var/lib/bifrost
 Environment=PANEL_DIST_DIR=/opt/bifrost/panel/dist
+Environment=NPM_CONFIG_CACHE=/var/lib/bifrost/.npm
 EnvironmentFile=-/etc/default/bifrost
 ExecStart=/usr/bin/env node /opt/bifrost/core/dist/index.js
 Restart=always
@@ -28,8 +29,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/bifrost
-ReadOnlyPaths=/opt/bifrost
+ReadWritePaths=/var/lib/bifrost /opt/bifrost
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

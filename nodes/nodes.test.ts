@@ -172,8 +172,9 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
         version: string;
         active_tunnels: number;
       };
+      const pkgVersion = (JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')) as { version: string }).version;
       assert.equal(healthBody.ok, true);
-      assert.equal(healthBody.version, '0.1.0');
+      assert.equal(healthBody.version, pkgVersion);
       assert.equal(healthBody.active_tunnels, 1);
 
       const postBody = JSON.stringify({ prompt: 'Zero-knowledge test message' });
@@ -695,8 +696,9 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
       assert.deepEqual(
         ranCommands.map((c) => [c.cmd, ...c.args]),
         [
-          ['git', 'pull', '--ff-only'],
-          ['npm', '--prefix', 'nodes', 'ci', '--include=dev'],
+          ['git', 'fetch', '--depth', '1', 'origin', 'main'],
+          ['git', 'reset', '--hard', 'origin/main'],
+          ['npm', '--prefix', 'nodes', 'ci', '--include=dev', '--ignore-scripts'],
           ['npm', '--prefix', 'nodes', 'run', 'build']
         ]
       );
