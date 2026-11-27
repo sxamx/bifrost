@@ -137,7 +137,7 @@ interface ParsedRlEvent {
   createdAt: number;
 }
 
-function isRealHeaderSignal(key: UsableKeyRow, nowSec: number): boolean {
+export function isRealHeaderSignal(key: UsableKeyRow, nowSec: number): boolean {
   if (key.ratelimit_remaining === null || key.ratelimit_remaining === undefined) {
     return false;
   }
@@ -187,13 +187,16 @@ export function computeAdaptiveFreeQuotas(
           ? 'requests'
           : 'tokens';
 
-    // Fix #3: Query ONLY usable keys ('active', 'rate_limited') — NEVER disabled, no_node, or error
+    // Fix #3: Query ONLY usable keys ('active', 'rate_limited') with online or unassigned exit node
     const usableKeys = db
       .prepare(
-        `SELECT id, daily_quota_limit, ratelimit_remaining, ratelimit_reset_at, status
-         FROM provider_keys
-         WHERE provider_id = ? AND status IN ('active', 'rate_limited')
-         ORDER BY created_at ASC`,
+        `SELECT pk.id, pk.daily_quota_limit, pk.ratelimit_remaining, pk.ratelimit_reset_at, pk.status
+         FROM provider_keys pk
+         LEFT JOIN nodes n ON n.id = pk.node_id
+         WHERE pk.provider_id = ?
+           AND pk.status IN ('active', 'rate_limited')
+           AND (pk.node_id IS NULL OR n.status = 'online')
+         ORDER BY pk.created_at ASC`,
       )
       .all(prov.id) as unknown as UsableKeyRow[];
 

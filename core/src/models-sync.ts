@@ -592,12 +592,13 @@ export async function syncProviderModels(options: {
   const keyRows = allKeyRows.filter(
     (k) =>
       k.status !== 'no_node' &&
+      k.status !== 'disabled' &&
       (k.node_id === null || k.node_id === undefined || k.node_status === 'online'),
   );
 
   if (keyRows.length === 0) {
     throw new ModelSyncHttpError(
-      `All configured keys for provider "${manifest.name}" are assigned to offline or unresponsive exit nodes.`,
+      `All configured keys for provider "${manifest.name}" are disabled or assigned to offline/unresponsive exit nodes.`,
       502,
     );
   }
@@ -662,7 +663,7 @@ export async function syncProviderModels(options: {
           const nodeToken = decryptSecret(kRow.node_encrypted_token as Uint8Array, masterKey);
           res = await fetchViaExitNode(
             modelsUrl,
-            { method: 'GET', headers },
+            { method: 'GET', headers, signal: AbortSignal.timeout(15_000) },
             {
               id: kRow.node_id,
               name: String(kRow.node_name ?? kRow.node_id),
@@ -681,6 +682,7 @@ export async function syncProviderModels(options: {
             method: 'GET',
             headers,
             redirect: 'error',
+            signal: AbortSignal.timeout(15_000),
           });
         }
 

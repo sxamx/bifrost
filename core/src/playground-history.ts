@@ -110,19 +110,24 @@ interface RawMessageRow {
   created_at: number | bigint;
 }
 
-const activeGeneratingChats = new Set<string>();
+const activeGeneratingChats = new Map<string, number>();
 
 export function markChatGenerating(chatId: string, active: boolean): void {
   if (!chatId) return;
   if (active) {
-    activeGeneratingChats.add(chatId);
+    activeGeneratingChats.set(chatId, (activeGeneratingChats.get(chatId) ?? 0) + 1);
   } else {
-    activeGeneratingChats.delete(chatId);
+    const current = activeGeneratingChats.get(chatId) ?? 0;
+    if (current <= 1) {
+      activeGeneratingChats.delete(chatId);
+    } else {
+      activeGeneratingChats.set(chatId, current - 1);
+    }
   }
 }
 
 export function isChatGenerating(chatId: string): boolean {
-  return activeGeneratingChats.has(chatId);
+  return (activeGeneratingChats.get(chatId) ?? 0) > 0;
 }
 
 export function resetGeneratingChatsForTests(): void {
