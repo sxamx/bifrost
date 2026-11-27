@@ -18,6 +18,7 @@ import type {
   CreateNodeResult,
   EpochBenchmarkBlock,
   EpochBenchmarkRun,
+  EpochEciSummary,
   ExitNodeItem,
   ExitNodeTestResult,
   FreeQuotaStatus,
@@ -38,6 +39,7 @@ import type {
   ModelSpeedEntry,
   ModelSyncDiff,
   NodeAssignedKeyRef,
+  NullablePercentileTuple,
   OpenChartsBenchmarkBlock,
   PercentileTuple,
   PlaygroundChatDetail,
@@ -172,8 +174,34 @@ function normalizePercentiles(raw: unknown): PercentileTuple {
   };
 }
 
+function normalizeNullablePercentiles(raw: unknown): NullablePercentileTuple {
+  const r = asRecord(raw);
+  return {
+    p50: asNullableNum(r.p50 ?? r.P50),
+    p75: asNullableNum(r.p75 ?? r.P75),
+    p90: asNullableNum(r.p90 ?? r.P90),
+    p95: asNullableNum(r.p95 ?? r.P95),
+    p99: asNullableNum(r.p99 ?? r.P99),
+  };
+}
+
+function hasAnyPercentileValue(pct: NullablePercentileTuple): boolean {
+  return (
+    pct.p50 !== null ||
+    pct.p75 !== null ||
+    pct.p90 !== null ||
+    pct.p95 !== null ||
+    pct.p99 !== null
+  );
+}
+
 function normalizeRatePct(val: unknown): number {
   if (typeof val !== 'number' || !Number.isFinite(val)) return 0;
+  return Math.max(0, Math.min(100, val));
+}
+
+function normalizeNullableRatePct(val: unknown): number | null {
+  if (typeof val !== 'number' || !Number.isFinite(val)) return null;
   return Math.max(0, Math.min(100, val));
 }
 
@@ -277,6 +305,13 @@ function normalizeModelBenchmarks(fullId: string, raw: unknown): ModelBenchmarks
     rankingPeers: lmaPeers,
     sourceUrl: String(lmaRaw.sourceUrl ?? 'https://lmarena.ai'),
     license: String(lmaRaw.license ?? 'CC BY 4.0'),
+    licenseUrl:
+      typeof lmaRaw.licenseUrl === 'string'
+        ? lmaRaw.licenseUrl
+        : typeof lmaRaw.license_url === 'string'
+          ? lmaRaw.license_url
+          : null,
+    attribution: typeof lmaRaw.attribution === 'string' ? lmaRaw.attribution : null,
     capturedAt: typeof lmaRaw.capturedAt === 'string' ? lmaRaw.capturedAt : null,
   };
 
@@ -326,6 +361,13 @@ function normalizeModelBenchmarks(fullId: string, raw: unknown): ModelBenchmarks
       : undefined,
     sourceUrl: String(awRaw.sourceUrl ?? 'https://artificialwatch.com'),
     license: String(awRaw.license ?? 'CC BY 4.0'),
+    licenseUrl:
+      typeof awRaw.licenseUrl === 'string'
+        ? awRaw.licenseUrl
+        : typeof awRaw.license_url === 'string'
+          ? awRaw.license_url
+          : null,
+    attribution: typeof awRaw.attribution === 'string' ? awRaw.attribution : null,
     capturedAt: typeof awRaw.capturedAt === 'string' ? awRaw.capturedAt : null,
   };
 
@@ -355,11 +397,39 @@ function normalizeModelBenchmarks(fullId: string, raw: unknown): ModelBenchmarks
       tokensUsed: asNullableNum(rr.tokensUsed ?? rr.tokens),
     };
   });
+  const epEciRaw = epRaw.eci && typeof epRaw.eci === 'object' ? asRecord(epRaw.eci) : null;
+  const epEciScore = epEciRaw ? asNullableNum(epEciRaw.eci ?? epEciRaw.score) : null;
+  const epEci: EpochEciSummary | null =
+    epEciRaw && epEciScore !== null
+      ? {
+          model: String(epEciRaw.model ?? ''),
+          displayName:
+            typeof epEciRaw.displayName === 'string'
+              ? epEciRaw.displayName
+              : typeof epEciRaw.display_name === 'string'
+                ? epEciRaw.display_name
+                : null,
+          eci: epEciScore,
+          eciCiLow: asNullableNum(epEciRaw.eciCiLow ?? epEciRaw.eci_ci_low),
+          eciCiHigh: asNullableNum(epEciRaw.eciCiHigh ?? epEciRaw.eci_ci_high),
+          date: typeof epEciRaw.date === 'string' ? epEciRaw.date : null,
+          organization:
+            typeof epEciRaw.organization === 'string' ? epEciRaw.organization : null,
+        }
+      : null;
   const epoch: EpochBenchmarkBlock = {
-    available: Boolean(epRaw.available ?? epRuns.length > 0),
+    available: Boolean(epRaw.available ?? (epRuns.length > 0 || epEci !== null)),
     runs: epRuns,
-    sourceUrl: String(epRaw.sourceUrl ?? 'https://epoch.ai/data/ai-benchmarking-dashboard'),
+    eci: epEci,
+    sourceUrl: String(epRaw.sourceUrl ?? 'https://epoch.ai/benchmarks'),
     license: String(epRaw.license ?? 'CC BY 4.0'),
+    licenseUrl:
+      typeof epRaw.licenseUrl === 'string'
+        ? epRaw.licenseUrl
+        : typeof epRaw.license_url === 'string'
+          ? epRaw.license_url
+          : null,
+    attribution: typeof epRaw.attribution === 'string' ? epRaw.attribution : null,
     capturedAt: typeof epRaw.capturedAt === 'string' ? epRaw.capturedAt : null,
   };
 
@@ -398,6 +468,14 @@ function normalizeModelBenchmarks(fullId: string, raw: unknown): ModelBenchmarks
       ocRaw.methodologyUrl ?? 'https://www.opencharts.com/benchmarks/methodology'
     ),
     sourceUrl: String(ocRaw.sourceUrl ?? 'https://www.opencharts.com'),
+    license: typeof ocRaw.license === 'string' ? ocRaw.license : null,
+    licenseUrl:
+      typeof ocRaw.licenseUrl === 'string'
+        ? ocRaw.licenseUrl
+        : typeof ocRaw.license_url === 'string'
+          ? ocRaw.license_url
+          : null,
+    attribution: typeof ocRaw.attribution === 'string' ? ocRaw.attribution : null,
     capturedAt: typeof ocRaw.capturedAt === 'string' ? ocRaw.capturedAt : null,
   };
 
@@ -929,6 +1007,14 @@ function normalizeProviderSummary(raw: unknown): ProviderSummary {
         ? r.published_at
         : manifest?.publishedAt ?? null;
 
+  const privacy = normalizeProviderPrivacy(r.privacy ?? manifest?.privacy);
+  const rateLimitKind = normalizeRateLimitKind(
+    r.rateLimitKind ?? r.rate_limit_kind ?? manifest?.rateLimitKind
+  );
+  const rateLimitWindows = normalizeRateLimitWindows(
+    r.rateLimitWindows ?? r.rate_limit_windows ?? manifest?.rateLimitWindows
+  );
+
   return {
     id: String(r.id ?? manifest?.id ?? ''),
     name: String(r.name ?? manifest?.name ?? ''),
@@ -958,6 +1044,9 @@ function normalizeProviderSummary(raw: unknown): ProviderSummary {
           : null,
     enabled: r.enabled !== undefined ? Boolean(r.enabled) : true,
     reviewedAt,
+    privacy,
+    rateLimitKind,
+    rateLimitWindows,
     lastModelsSyncAt:
       typeof r.lastModelsSyncAt === 'number'
         ? r.lastModelsSyncAt
@@ -1196,13 +1285,37 @@ export const api = {
 
     if (!response.ok) {
       let errMsg = `Error HTTP ${response.status}`;
+      let errPayload: Record<string, unknown> = {};
       try {
         const errJson = (await response.json()) as Record<string, unknown>;
-        errMsg = String(errJson.error ?? errJson.message ?? errMsg);
+        if (errJson && typeof errJson === 'object') {
+          errPayload = { ...errJson };
+          const nestedErr =
+            errJson.error && typeof errJson.error === 'object'
+              ? (errJson.error as Record<string, unknown>)
+              : null;
+          errMsg = String(
+            (typeof errJson.error === 'string' ? errJson.error : null) ??
+              (typeof nestedErr?.message === 'string' ? nestedErr.message : null) ??
+              errJson.message ??
+              errMsg
+          );
+        }
       } catch {
         // Keep HTTP status fallback
       }
-      throw new ApiError(errMsg, response.status);
+      const retryAfterHeader = response.headers.get('retry-after');
+      if (
+        retryAfterHeader !== null &&
+        retryAfterHeader.trim().length > 0 &&
+        errPayload.retryAfter === undefined
+      ) {
+        const parsedRetry = Number(retryAfterHeader.trim());
+        errPayload.retryAfter = Number.isFinite(parsedRetry)
+          ? parsedRetry
+          : retryAfterHeader.trim();
+      }
+      throw new ApiError(errMsg, response.status, errPayload);
     }
 
     const contentType = response.headers.get('content-type') ?? '';
@@ -1655,22 +1768,33 @@ export const api = {
 
     const buckets: LatencyBucketPoint[] = rawList.map((item) => {
       const b = asRecord(item);
-      const pct = normalizePercentiles(b.percentiles ?? b);
+      const rawPctSource = b.percentiles ?? b;
+      const pct = normalizePercentiles(rawPctSource);
+      const rawPercentiles = normalizeNullablePercentiles(rawPctSource);
+      const count =
+        typeof b.count === 'number'
+          ? b.count
+          : typeof b.sampleCount === 'number'
+            ? b.sampleCount
+            : typeof b.samples === 'number'
+              ? b.samples
+              : undefined;
       return {
         timestamp: (b.timestamp ?? b.bucket ?? b.time ?? b.date ?? '') as string | number,
         label: typeof b.label === 'string' ? b.label : undefined,
-        count:
-          typeof b.count === 'number'
-            ? b.count
-            : typeof b.samples === 'number'
-              ? b.samples
-              : undefined,
+        count,
+        hasData: hasAnyPercentileValue(rawPercentiles) && (count === undefined || count > 0),
+        rawPercentiles,
         ...pct,
       };
     });
 
-    const overall = r.overall ? normalizePercentiles(r.overall) : null;
-    return { buckets, overall };
+    const overallRaw = r.overall ? normalizeNullablePercentiles(asRecord(r.overall).percentiles ?? r.overall) : null;
+    const overall =
+      r.overall && overallRaw && hasAnyPercentileValue(overallRaw)
+        ? normalizePercentiles(asRecord(r.overall).percentiles ?? r.overall)
+        : null;
+    return { buckets, overall, overallRaw };
   },
 
   async getMetricsSpeed(): Promise<SpeedMetricsData> {
@@ -1699,15 +1823,17 @@ export const api = {
           m.provider_id ??
           (modelFullId.includes('/') ? modelFullId.split('/')[0] : '')
       );
+      const ttftSource = m.ttftMs ?? m.ttft_ms ?? m.ttft;
+      const tpsSource = m.tokensPerSec ?? m.tokens_per_sec ?? m.tps ?? m.speed;
       return {
         id: `${modelFullId}-${idx}`,
         modelFullId,
         providerId,
         sampleCount: asNum(m.sampleCount ?? m.samples ?? m.count),
-        ttftMs: normalizePercentiles(m.ttftMs ?? m.ttft_ms ?? m.ttft),
-        tokensPerSec: normalizePercentiles(
-          m.tokensPerSec ?? m.tokens_per_sec ?? m.tps ?? m.speed
-        ),
+        ttftMs: normalizePercentiles(ttftSource),
+        tokensPerSec: normalizePercentiles(tpsSource),
+        rawTtftMs: normalizeNullablePercentiles(ttftSource),
+        rawTokensPerSec: normalizeNullablePercentiles(tpsSource),
       };
     });
 
@@ -1716,17 +1842,21 @@ export const api = {
       const cachedTokens = asNum(c.cachedTokens ?? c.cached_tokens);
       const promptTokens = asNum(c.promptTokens ?? c.prompt_tokens);
       const rawHitRate = c.cacheHitRate ?? c.cache_hit_rate ?? c.hitRate;
-      const hitRate =
-        typeof rawHitRate === 'number'
-          ? normalizeRatePct(rawHitRate)
-          : promptTokens > 0
-            ? Math.min(100, (cachedTokens / promptTokens) * 100)
-            : 0;
+      const cacheHitRateNullable =
+        rawHitRate === null
+          ? null
+          : typeof rawHitRate === 'number' && Number.isFinite(rawHitRate)
+            ? normalizeRatePct(rawHitRate)
+            : promptTokens > 0
+              ? Math.min(100, (cachedTokens / promptTokens) * 100)
+              : null;
+      const hitRate = cacheHitRateNullable ?? 0;
       const pid = String(c.providerId ?? c.provider_id ?? c.id ?? '');
       return {
         providerId: pid,
         providerName: String(c.providerName ?? c.provider_name ?? c.name ?? pid),
         cacheHitRate: hitRate,
+        cacheHitRateNullable,
         cachedTokens,
         promptTokens,
       };
@@ -1790,20 +1920,21 @@ export const api = {
               daysWithTraffic.length
             : null;
 
+      const rawToolErr = p.toolErrorRate ?? p.toolErrorRate7d ?? p.tool_error_rate;
+      const rawStructuredErr =
+        p.structuredErrorRate ?? p.structuredErrorRate7d ?? p.structured_error_rate;
+      const toolErrorRate7dNullable = normalizeNullableRatePct(rawToolErr);
+      const structuredErrorRate7dNullable = normalizeNullableRatePct(rawStructuredErr);
+
       return {
         providerId: pid,
         providerName: String(p.providerName ?? p.provider_name ?? p.name ?? pid),
         overallUptimePct,
         days: days60,
-        toolErrorRate7d: normalizeRatePct(
-          p.toolErrorRate ?? p.toolErrorRate7d ?? p.tool_error_rate ?? 0
-        ),
-        structuredErrorRate7d: normalizeRatePct(
-          p.structuredErrorRate ??
-            p.structuredErrorRate7d ??
-            p.structured_error_rate ??
-            0
-        ),
+        toolErrorRate7d: toolErrorRate7dNullable ?? 0,
+        structuredErrorRate7d: structuredErrorRate7dNullable ?? 0,
+        toolErrorRate7dNullable,
+        structuredErrorRate7dNullable,
         totalRequests7d:
           typeof p.totalRequests7d === 'number' ? p.totalRequests7d : undefined,
       };
@@ -1964,29 +2095,54 @@ export const api = {
   },
 
   async createNode(input: CreateNodeInput): Promise<CreateNodeResult> {
+    const payload: Record<string, unknown> = {
+      name: input.name.trim(),
+      mode: input.mode,
+      endpoint: input.endpoint.trim(),
+    };
+    if (typeof input.tlsFingerprint === 'string' && input.tlsFingerprint.trim().length > 0) {
+      payload.tlsFingerprint = input.tlsFingerprint.trim();
+    }
     const raw = await request<unknown>('/api/nodes', {
       method: 'POST',
-      body: JSON.stringify({
-        name: input.name.trim(),
-        mode: input.mode,
-        endpoint: input.endpoint.trim(),
-      }),
+      body: JSON.stringify(payload),
     });
     const r = asRecord(raw);
     const node = normalizeExitNode(r.node ?? raw);
     const rawToken = String(r.rawToken ?? r.nodeToken ?? r.token ?? r.node_token ?? '');
     const defaultScriptUrl = `${window.location.origin}/install-node.sh`;
+    const cleanedEndpoint = node.endpoint
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/+$/, '');
+    let fallbackPort = 9443;
+    const bracketPortMatch = /^\[[^\]]+\]:(\d+)$/.exec(cleanedEndpoint);
+    if (bracketPortMatch) {
+      const p = Number(bracketPortMatch[1]);
+      if (Number.isInteger(p) && p >= 1 && p <= 65535) fallbackPort = p;
+    } else if ((cleanedEndpoint.match(/:/g) ?? []).length === 1) {
+      const p = Number(cleanedEndpoint.slice(cleanedEndpoint.indexOf(':') + 1));
+      if (Number.isInteger(p) && p >= 1 && p <= 65535) fallbackPort = p;
+    }
     const installCommand =
       typeof r.installCommand === 'string' && r.installCommand.length > 0
         ? r.installCommand
         : typeof r.install_command === 'string' && r.install_command.length > 0
           ? r.install_command
-          : `curl -fsSL ${defaultScriptUrl} | sudo bash -s -- --mode ${node.mode} --endpoint "${node.endpoint}" --token "${rawToken}"`;
+          : `curl -fsSL ${defaultScriptUrl} | sudo bash -s -- --mode ${node.mode} --port ${fallbackPort} --token "${rawToken}"`;
+
+    const publicIpWarning =
+      typeof r.publicIpWarning === 'string' && r.publicIpWarning.length > 0
+        ? r.publicIpWarning
+        : typeof r.public_ip_warning === 'string' && r.public_ip_warning.length > 0
+          ? r.public_ip_warning
+          : null;
 
     return {
       node,
       rawToken,
       installCommand,
+      publicIpWarning,
     };
   },
 

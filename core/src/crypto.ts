@@ -56,6 +56,7 @@ export class MasterKeyError extends Error {
 export interface ResolveMasterKeyOptions {
   dataDir?: string;
   envMasterKey?: string;
+  envMasterKeyFile?: string;
   dbFilename?: string;
   keyFilename?: string;
 }
@@ -68,7 +69,7 @@ export interface ResolvedMasterKey {
   dbPath: string;
 }
 
-function parseEnvMasterKey(raw: string): Buffer {
+function parseEnvMasterKey(raw: string, sourceName = 'BIFROST_MASTER_KEY'): Buffer {
   const trimmed = raw.trim();
   if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
     return Buffer.from(trimmed, 'hex');
@@ -86,45 +87,92 @@ function parseEnvMasterKey(raw: string): Buffer {
     }
   }
   throw new MasterKeyError(
-    'Invalid BIFROST_MASTER_KEY: expected 64 hex characters or base64-encoded 32 bytes.',
+    `Invalid ${sourceName}: expected 64 hex characters or base64-encoded 32 bytes.`,
   );
 }
 
 /**
- * Resolves the 32-byte server master key (HU-01, HU-26).
+ * Resolves the 32-byte server master key (HU-01, HU-26, BF-06).
  *
- * - Fresh install (neither bifrost.db nor master.key exists, BIFROST_MASTER_KEY unset):
- *   auto-generates a 32-byte random master.key with 0o600 permissions.
- * - Existing DB (bifrost.db already exists):
+ * - BIFROST_MASTER_KEY_FILE (Docker Secrets): reads trimmed hex/base64 32-byte key from file.
+ *   Never falls back to generating a new key if the file is unreadable or malformed.
+ * - BIFROST_MASTER_KEY: parses hex/base64 32-byte key from env.
+ * - Fresh install (neither bifrost.db/-wal/-shm nor master.key exists):
+ *   auto-generates a 32-byte random master.key atomically with `{ flag: 'wx', mode: 0o600 }`.
+ * - Existing DB (bifrost.db, -wal, or -shm already exists):
  *   NEVER regenerates master.key. Throws MasterKeyError if missing, unreadable, or not 32 bytes.
  */
 export function resolveMasterKey(options: ResolveMasterKeyOptions = {}): ResolvedMasterKey {
   const dataDir = path.resolve(options.dataDir ?? process.env.DATA_DIR ?? './data');
   const dbPath = path.join(dataDir, options.dbFilename ?? 'bifrost.db');
   const keyPath = path.join(dataDir, options.keyFilename ?? 'master.key');
+  const hasExplicitEnvMasterKey =
+    'envMasterKey' in options &&
+    options.envMasterKey !== undefined &&
+    options.envMasterKey !== '';
+  const envKeyFile =
+    'envMasterKeyFile' in options
+      ? options.envMasterKeyFile
+      : hasExplicitEnvMasterKey
+        ? undefined
+        : process.env.BIFROST_MASTER_KEY_FILE;
   const envKey =
     'envMasterKey' in options ? options.envMasterKey : process.env.BIFROST_MASTER_KEY;
 
+  if (envKeyFile !== undefined && envKeyFile.trim() !== '') {
+    const secretFilePath = path.resolve(envKeyFile.trim());
+    let rawSecretText: string;
+    try {
+      rawSecretText = fs.readFileSync(secretFilePath, 'utf8');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new MasterKeyError(
+        `Failed to read BIFROST_MASTER_KEY_FILE at "${secretFilePath}": ${msg}`,
+      );
+    }
+    const key = parseEnvMasterKey(rawSecretText, 'BIFROST_MASTER_KEY_FILE');
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    return { key, source: 'file', dataDir, keyPath: secretFilePath, dbPath };
+  }
+
   if (envKey !== undefined && envKey !== '') {
-    const key = parseEnvMasterKey(envKey);
-    fs.mkdirSync(dataDir, { recursive: true });
+    const key = parseEnvMasterKey(envKey, 'BIFROST_MASTER_KEY');
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     return { key, source: 'env', dataDir, keyPath, dbPath };
   }
 
-  const dbExists = fs.existsSync(dbPath);
+  const dbExists =
+    fs.existsSync(dbPath) ||
+    fs.existsSync(`${dbPath}-wal`) ||
+    fs.existsSync(`${dbPath}-shm`);
   const keyExists = fs.existsSync(keyPath);
 
   if (!dbExists && !keyExists) {
-    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     const key = randomBytes(MASTER_KEY_BYTES);
-    fs.writeFileSync(keyPath, key, { mode: 0o600 });
-    fs.chmodSync(keyPath, 0o600);
+    try {
+      fs.writeFileSync(keyPath, key, { flag: 'wx', mode: 0o600 });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'EEXIST') {
+        throw new MasterKeyError(
+          `Master key already exists at "${keyPath}" (concurrent creation detected). Aborting startup instead of overwriting.`,
+        );
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new MasterKeyError(`Failed to write master key at "${keyPath}": ${msg}`);
+    }
+    try {
+      fs.chmodSync(keyPath, 0o600);
+    } catch {
+      // Best-effort on platforms without POSIX chmod bits
+    }
     return { key, source: 'generated', dataDir, keyPath, dbPath };
   }
 
   if (dbExists && !keyExists) {
     throw new MasterKeyError(
-      `Database already exists at "${dbPath}", but master key is missing at "${keyPath}" (and BIFROST_MASTER_KEY is not set). Aborting startup instead of generating a new master key.`,
+      `Database already exists at "${dbPath}" (or WAL/SHM artifacts are present), but master key is missing at "${keyPath}" (and BIFROST_MASTER_KEY / BIFROST_MASTER_KEY_FILE is not set). Aborting startup instead of generating a new master key.`,
     );
   }
 

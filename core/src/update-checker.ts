@@ -5,6 +5,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 
 import { readExternalCache, writeExternalCache, type FetchLike } from './catalog/cache.js';
+import { redactSecretsInText } from './db.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -269,10 +270,21 @@ export async function checkSystemUpdate(
     const rawMsg =
       typeof payload.commit?.message === 'string' ? payload.commit.message.trim() : '';
     const latestCommitMessage = rawMsg.length > 0 ? rawMsg.split('\n')[0]!.trim() : null;
-    const latestCommitUrl =
+    const rawCommitUrl =
       typeof payload.html_url === 'string' && payload.html_url.trim().length > 0
         ? payload.html_url.trim()
         : null;
+    let latestCommitUrl: string | null = null;
+    if (rawCommitUrl) {
+      try {
+        const parsedCommitUrl = new URL(rawCommitUrl);
+        if (parsedCommitUrl.protocol === 'https:') {
+          latestCommitUrl = parsedCommitUrl.href;
+        }
+      } catch {
+        latestCommitUrl = null;
+      }
+    }
     const rawDate = payload.commit?.committer?.date ?? payload.commit?.author?.date;
     const latestPublishedAt =
       typeof rawDate === 'string' && rawDate.trim().length > 0 ? rawDate.trim() : null;
@@ -444,7 +456,7 @@ export async function triggerSystemUpdate(
         const response = await fetchImpl(endpoint, {
           method: 'POST',
           headers,
-          signal: AbortSignal.timeout(45_000),
+          signal: AbortSignal.timeout(90_000),
         });
         if (!response.ok) {
           const errMsg = `Watchtower returned HTTP ${response.status}`;
@@ -461,12 +473,23 @@ export async function triggerSystemUpdate(
       } catch (err) {
         const name = err instanceof Error ? err.name : '';
         const msg = err instanceof Error ? err.message : String(err);
-        const isExpectedRestartInterrupt =
+        const isTimeoutError =
           name === 'TimeoutError' ||
           name === 'AbortError' ||
-          /timeout|aborted|ECONNRESET|socket|closed/i.test(msg);
-        if (!isExpectedRestartInterrupt) {
-          const errMsg = `Failed to reach Watchtower at ${endpoint}: ${msg}`;
+          /\b(?:timeout|timed out|aborted)\b/i.test(msg);
+        const isConnectionResetInterrupt =
+          !isTimeoutError &&
+          /ECONNRESET|socket|closed|hang up|UND_ERR_SOCKET|EPIPE/i.test(msg);
+
+        if (isTimeoutError) {
+          setUpdatePhase(
+            'error',
+            'Watchtower update timed out without restarting the container. Check Watchtower logs or try again.',
+          );
+        } else if (!isConnectionResetInterrupt) {
+          const safeMsg = redactSecretsInText(msg)
+            .replace(/https?:\/\/[^\s"'<>]+/gi, '[REDACTED_URL]');
+          const errMsg = `Failed to reach Watchtower: ${safeMsg}`;
           setUpdatePhase('error', errMsg);
         }
       } finally {
@@ -498,18 +521,43 @@ export async function triggerSystemUpdate(
     try {
       await runCmd('git', ['pull', '--ff-only'], repoDir);
       setUpdatePhase('building', 'Building Core and Panel…');
+      const lockTargets: Array<{ dir: string; prefix: string | null }> = [
+        { dir: repoDir, prefix: null },
+        { dir: path.join(repoDir, 'panel'), prefix: 'panel' },
+        { dir: path.join(repoDir, 'core'), prefix: 'core' },
+        { dir: path.join(repoDir, 'nodes'), prefix: 'nodes' },
+      ];
+      for (const target of lockTargets) {
+        if (fs.existsSync(path.join(target.dir, 'package-lock.json'))) {
+          await runCmd('npm', target.prefix ? ['--prefix', target.prefix, 'ci'] : ['ci'], repoDir);
+        }
+      }
       await runCmd('npm', ['run', 'build'], repoDir);
       setUpdatePhase('restarting', 'Updated repository and rebuilt Core. Restarting service…');
 
       if (options.onRestart) {
         options.onRestart();
       } else {
-        const timer = setTimeout(() => process.exit(0), 500);
+        const timer = setTimeout(() => {
+          if (options.db) {
+            try {
+              options.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+            } catch {
+              // Ignore checkpoint errors during restart exit
+            }
+            try {
+              options.db.close();
+            } catch {
+              // Ignore DB close errors during restart exit
+            }
+          }
+          process.exit(0);
+        }, 500);
         timer.unref();
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const errMsg = `Native update failed: ${msg}`;
+      const errMsg = `Native update failed: ${redactSecretsInText(msg)}`;
       setUpdatePhase('error', errMsg);
     } finally {
       updateInFlight = false;
