@@ -495,7 +495,11 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
 
     const rawState = fs.readFileSync(stateFilePath, 'utf8');
     assert.ok(!rawState.includes(rotatedToken), 'State file must never contain plaintext token');
-    assert.equal(fs.statSync(stateFilePath).mode & 0o777, 0o600);
+    const stateStat = fs.statSync(stateFilePath);
+    assert.ok(stateStat.isFile() && stateStat.size > 0, 'State file must exist and have non-zero size');
+    if (process.platform !== 'win32') {
+      assert.equal(stateStat.mode & 0o777, 0o600);
+    }
 
     const restartedNode = createBifrostNodeServer({
       mode: 'tailscale',
@@ -623,11 +627,20 @@ describe('Bifrost Phase 3 Egress Node Agent (nodes/)', () => {
     assert.equal(parsed.port, 9555);
 
     const scriptPath = path.join(__dirname, 'install-node.sh');
-    execFileSync('bash', ['-n', scriptPath]);
-    const helpOut = execFileSync('bash', [scriptPath, '--help'], { encoding: 'utf8' });
-    assert.match(helpOut, /--token/);
-    assert.match(helpOut, /--mode/);
-    assert.match(helpOut, /--port/);
+    assert.ok(fs.existsSync(scriptPath), 'install-node.sh must exist');
+    try {
+      execFileSync('bash', ['-n', scriptPath]);
+      const helpOut = execFileSync('bash', [scriptPath, '--help'], { encoding: 'utf8' });
+      assert.match(helpOut, /--token/);
+      assert.match(helpOut, /--mode/);
+      assert.match(helpOut, /--port/);
+    } catch (err) {
+      if (process.platform === 'win32' && (err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        // bash is not installed in this Windows environment; skip only the bash -n / --help sub-check.
+      } else {
+        throw err;
+      }
+    }
   });
 
   it('exposes commit in /_bifrost/health and supports authenticated POST /_bifrost/update', async () => {
