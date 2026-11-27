@@ -231,14 +231,14 @@ jobs:
           npm --prefix core ci
           npm --prefix nodes ci
 
+      - name: Compilar TypeScript y aplicación Vite
+        run: npm run build
+
       - name: Verificar tipos de pruebas (si existe tsconfig.test.json)
         run: |
           if [ -f tsconfig.test.json ]; then
             npx --prefix core tsc -p tsconfig.test.json
           fi
-
-      - name: Compilar TypeScript y aplicación Vite
-        run: npm run build
 
       - name: Ejecutar batería completa de pruebas automatizadas
         run: npm test
