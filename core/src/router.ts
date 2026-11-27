@@ -1,7 +1,8 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { decryptSecret } from './crypto.js';
-import { redactSecretsInText, writeSystemLog } from './db.js';
+import { writeSystemLog } from './db.js';
 import { isEarlyRequest429Burst } from './metrics/adaptive-quota.js';
+import { scrubSecretsFromText } from './metrics/redact.js';
 import {
   type NodeMode,
   type UpstreamTlsOptions,
@@ -154,6 +155,8 @@ const CHAT_COMPLETIONS_ALLOWED_FIELDS = new Set<string>([
   'tools',
   'tool_choice',
   'parallel_tool_calls',
+  'functions',
+  'function_call',
   'response_format',
   'reasoning_effort',
   'reasoning',
@@ -164,6 +167,12 @@ const CHAT_COMPLETIONS_ALLOWED_FIELDS = new Set<string>([
   'top_logprobs',
   'logit_bias',
   'metadata',
+  'modalities',
+  'audio',
+  'prediction',
+  'service_tier',
+  'store',
+  'web_search_options',
 ]);
 
 const inFlightReservedTokensByUser = new Map<string, number>();
@@ -221,11 +230,7 @@ export function computeTokensPerSec(
 }
 
 function redactWithRawSecret(text: string, rawSecret?: string | null): string {
-  let safe = redactSecretsInText(text);
-  if (rawSecret && rawSecret.length >= 4) {
-    safe = safe.split(rawSecret).join('[REDACTED]');
-  }
-  return safe;
+  return scrubSecretsFromText(text, rawSecret ? [rawSecret] : undefined);
 }
 
 function parseResetValueToUnixSec(rawValue: string, nowSec: number): number | null {
@@ -291,17 +296,9 @@ export function parseRateLimitHeaders(
 ): { remaining: number | null; resetAt: number | null } {
   const remainingHeaderOrder =
     rateLimitKind === 'tokens'
-      ? [
-          'x-ratelimit-remaining-tokens',
-          'x-ratelimit-remaining',
-          'x-ratelimit-remaining-requests',
-        ]
+      ? ['x-ratelimit-remaining-tokens', 'x-ratelimit-remaining']
       : rateLimitKind === 'requests'
-        ? [
-            'x-ratelimit-remaining-requests',
-            'x-ratelimit-remaining',
-            'x-ratelimit-remaining-tokens',
-          ]
+        ? ['x-ratelimit-remaining-requests', 'x-ratelimit-remaining']
         : [
             'x-ratelimit-remaining',
             'x-ratelimit-remaining-requests',
@@ -322,19 +319,9 @@ export function parseRateLimitHeaders(
 
   const resetHeaderOrder =
     rateLimitKind === 'tokens'
-      ? [
-          'x-ratelimit-reset-tokens',
-          'x-ratelimit-reset',
-          'retry-after',
-          'x-ratelimit-reset-requests',
-        ]
+      ? ['x-ratelimit-reset-tokens', 'x-ratelimit-reset', 'retry-after']
       : rateLimitKind === 'requests'
-        ? [
-            'x-ratelimit-reset-requests',
-            'x-ratelimit-reset',
-            'retry-after',
-            'x-ratelimit-reset-tokens',
-          ]
+        ? ['x-ratelimit-reset-requests', 'x-ratelimit-reset', 'retry-after']
         : [
             'x-ratelimit-reset',
             'x-ratelimit-reset-requests',
@@ -1368,6 +1355,7 @@ export async function executeChatCompletions(options: {
   requestBody: Record<string, unknown>;
   signal?: AbortSignal;
   headersTimeoutMs?: number;
+  requestTimeoutMs?: number;
   streamIdleTimeoutMs?: number;
 }): Promise<Response> {
   const {
@@ -1384,17 +1372,21 @@ export async function executeChatCompletions(options: {
     providerRow,
     requestBody,
     signal: clientSignal,
-    headersTimeoutMs = DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS,
     streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   } = options;
+  const effectiveHeadersTimeoutMs =
+    options.headersTimeoutMs ?? options.requestTimeoutMs ?? DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS;
 
   const startMs = now();
   const nowSec = Math.floor(startMs / 1000);
 
-  // Reject n != 1 (DEEP-02: prevents multi-completion billing/quota bypass)
+  // Reject any non-1 or non-numeric `n` (including n: true, n: "1", n: 2)
   if (requestBody.n !== undefined && requestBody.n !== null) {
-    const nVal = Number(requestBody.n);
-    if (!Number.isInteger(nVal) || nVal !== 1) {
+    if (
+      typeof requestBody.n !== 'number' ||
+      !Number.isInteger(requestBody.n) ||
+      requestBody.n !== 1
+    ) {
       return openAiErrorJson(
         'Parameter "n" must be 1; multiple completions (n > 1) are not supported.',
         'invalid_request_error',
@@ -1555,8 +1547,56 @@ export async function executeChatCompletions(options: {
     const dispatchRequestForKey = async (
       key: ProviderKeyRecord,
       init: RequestInit,
+      mode: 'stream' | 'buffered' = 'buffered',
     ): Promise<Response> => {
-      const combinedSignal = buildUpstreamSignal(clientSignal, headersTimeoutMs);
+      if (mode === 'stream') {
+        // B1: Dedicated AbortController for HTTP response headers timeout only;
+        // cleared immediately once headers resolve so long-running active SSE streams
+        // are governed solely by clientSignal and readChunkWithIdleTimeout.
+        const headersAbortController = new AbortController();
+        const safeTimeoutMs = Math.max(1, Math.floor(effectiveHeadersTimeoutMs));
+        const headersTimer = setTimeout(() => {
+          headersAbortController.abort(
+            new Error(`Upstream response headers timed out after ${safeTimeoutMs}ms`),
+          );
+        }, safeTimeoutMs);
+        headersTimer.unref?.();
+
+        const combinedSignal = clientSignal
+          ? AbortSignal.any([clientSignal, headersAbortController.signal])
+          : headersAbortController.signal;
+        const initWithSignal: RequestInit = {
+          ...init,
+          signal: combinedSignal,
+        };
+
+        try {
+          if (key.node_id) {
+            if (!key.node_encrypted_token || !key.node_endpoint) {
+              throw new Error(`Assigned exit node "${key.node_id}" is missing tunnel credentials`);
+            }
+            const nodeRawToken = decryptSecret(key.node_encrypted_token, masterKey);
+            return await fetchViaExitNode(
+              chatUrl,
+              initWithSignal,
+              {
+                id: key.node_id,
+                name: key.node_name ?? key.node_id,
+                mode: key.node_mode === 'public_ip' ? 'public_ip' : 'tailscale',
+                endpoint: key.node_endpoint,
+                rawToken: nodeRawToken,
+                tlsFingerprint: key.node_tls_fingerprint,
+              },
+              upstreamTls,
+            );
+          }
+          return await fetchImpl(chatUrl, { ...initWithSignal, redirect: 'error' });
+        } finally {
+          clearTimeout(headersTimer);
+        }
+      }
+
+      const combinedSignal = buildUpstreamSignal(clientSignal, effectiveHeadersTimeoutMs);
       const initWithSignal: RequestInit = {
         ...init,
         signal: combinedSignal,
@@ -2012,10 +2052,19 @@ export async function executeChatCompletions(options: {
             stream: true,
           };
           let injectedStreamOptions = false;
-          if (!omitStreamOptions && baseStreamBody.stream_options === undefined) {
-            baseStreamBody.stream_options = { include_usage: true };
+          if (!omitStreamOptions) {
+            const existingStreamOpts =
+              baseStreamBody.stream_options &&
+              typeof baseStreamBody.stream_options === 'object' &&
+              !Array.isArray(baseStreamBody.stream_options)
+                ? (baseStreamBody.stream_options as Record<string, unknown>)
+                : {};
+            baseStreamBody.stream_options = {
+              ...existingStreamOpts,
+              include_usage: true,
+            };
             injectedStreamOptions = true;
-          } else if (omitStreamOptions) {
+          } else {
             delete baseStreamBody.stream_options;
           }
 
@@ -2023,11 +2072,15 @@ export async function executeChatCompletions(options: {
 
           const sendAttempt = async (bodyObj: Record<string, unknown>): Promise<Response | null> => {
             try {
-              return await dispatchRequestForKey(key, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(bodyObj),
-              });
+              return await dispatchRequestForKey(
+                key,
+                {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify(bodyObj),
+                },
+                'stream',
+              );
             } catch (err) {
               if (clientSignal?.aborted) {
                 clientAbortedBeforeOpen = true;
@@ -2328,6 +2381,9 @@ export async function executeChatCompletions(options: {
               let connCompletionTokens = 0;
               let connReasoningTokens = 0;
               let connCachedTokens = 0;
+              let connContentChars = 0;
+              let connReasoningChars = 0;
+              let connToolCallChars = 0;
 
               const reader = currentRes.body!.getReader();
               activeReader = reader;
@@ -2407,6 +2463,7 @@ export async function executeChatCompletions(options: {
                       : null;
                   if (delta) {
                     if (typeof delta.content === 'string' && delta.content.length > 0) {
+                      connContentChars += delta.content.length;
                       contentCharsTotal += delta.content.length;
                       if (contentAccumulated.length < MAX_RESUME_ACCUMULATOR_CHARS) {
                         const room = MAX_RESUME_ACCUMULATOR_CHARS - contentAccumulated.length;
@@ -2420,6 +2477,7 @@ export async function executeChatCompletions(options: {
                           ? delta.reasoning
                           : '';
                     if (deltaReasoning.length > 0) {
+                      connReasoningChars += deltaReasoning.length;
                       reasoningCharsTotal += deltaReasoning.length;
                       if (reasoningAccumulated.length < MAX_RESUME_ACCUMULATOR_CHARS) {
                         const room = MAX_RESUME_ACCUMULATOR_CHARS - reasoningAccumulated.length;
@@ -2438,6 +2496,7 @@ export async function executeChatCompletions(options: {
                               ? (tcObj.function as Record<string, unknown>)
                               : null;
                           if (typeof fn?.name === 'string') {
+                            connToolCallChars += fn.name.length;
                             toolCallCharsAccumulated += fn.name.length;
                             if (existing.name.length < MAX_RESUME_ACCUMULATOR_CHARS) {
                               existing.name += fn.name.slice(
@@ -2447,6 +2506,7 @@ export async function executeChatCompletions(options: {
                             }
                           }
                           if (typeof fn?.arguments === 'string') {
+                            connToolCallChars += fn.arguments.length;
                             toolCallCharsAccumulated += fn.arguments.length;
                             if (existing.args.length < MAX_RESUME_ACCUMULATOR_CHARS) {
                               existing.args += fn.arguments.slice(
@@ -2623,10 +2683,26 @@ export async function executeChatCompletions(options: {
                   ).slice(0, 300);
                 }
               } finally {
-                // Merge per-connection usage once when this connection ends
+                // Merge per-connection usage once when this connection ends, applying per-segment
+                // selective fallback so a resumed segment with real usage never hides output emitted
+                // in an earlier segment that dropped before emitting a usage chunk.
+                const segCompAndToolChars = connContentChars + connToolCallChars;
+                const effectiveConnCompletion =
+                  connCompletionTokens > 0
+                    ? connCompletionTokens
+                    : segCompAndToolChars > 0
+                      ? Math.max(1, Math.ceil(segCompAndToolChars / 4))
+                      : 0;
+                const effectiveConnReasoning =
+                  connReasoningTokens > 0
+                    ? connReasoningTokens
+                    : connReasoningChars > 0
+                      ? Math.max(1, Math.ceil(connReasoningChars / 4))
+                      : 0;
+
                 totalPromptTokens += connPromptTokens;
-                totalCompletionTokens += connCompletionTokens;
-                totalReasoningTokens += connReasoningTokens;
+                totalCompletionTokens += effectiveConnCompletion;
+                totalReasoningTokens += effectiveConnReasoning;
                 totalCachedTokens += connCachedTokens;
 
                 if (activeReader === reader) {

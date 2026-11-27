@@ -308,6 +308,25 @@ describe('Ola 3 — Rolling 24h quotas, anti-TOCTOU reservations, header units, 
       parseRateLimitHeaders(rfcHeaders, nowSec, 'requests').resetAt,
       Math.floor(Date.parse(rfcDate) / 1000),
     );
+
+    // #6: Must NOT fall back to the opposite unit's headers
+    const onlyRequestsHeaders = new Headers({
+      'x-ratelimit-remaining-requests': '7',
+      'x-ratelimit-reset-requests': '45s',
+    });
+    assert.deepEqual(parseRateLimitHeaders(onlyRequestsHeaders, nowSec, 'tokens'), {
+      remaining: null,
+      resetAt: null,
+    });
+
+    const onlyTokensHeaders = new Headers({
+      'x-ratelimit-remaining-tokens': '9999',
+      'x-ratelimit-reset-tokens': '30s',
+    });
+    assert.deepEqual(parseRateLimitHeaders(onlyTokensHeaders, nowSec, 'requests'), {
+      remaining: null,
+      resetAt: null,
+    });
   });
 
   it('3) getSummaryMetrics does not mix tokens & requests, excludes offline-node keys & disabled_by_admin models, and /api/auth/me excludes expired internal API keys', async () => {
@@ -604,6 +623,155 @@ describe('Ola 3 — Rolling 24h quotas, anti-TOCTOU reservations, header units, 
         /disabled|offline/i,
       );
       assert.equal(fetchCalled, false, 'syncProviderModels must never use disabled keys');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('5) B3 / BF-04: redacts literal and URL-encoded rawSecret BEFORE truncation in Key Test, models-sync and router', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+    const clockMs = Date.UTC(2026, 10, 26, 15, 0, 0);
+    const nowSec = Math.floor(clockMs / 1000);
+    const specialSecret = 'vendor+key/with=special:chars_998877';
+    const encodedSecret = encodeURIComponent(specialSecret);
+    assert.notEqual(encodedSecret, specialSecret);
+
+    try {
+      const padding150 = 'P'.repeat(150);
+      const app = createApp({
+        db,
+        masterKey,
+        now: () => clockMs,
+        fetchImpl: async () =>
+          // Place literal secret right across the 160-char slice boundary AND include URL-encoded form
+          new Response(`${padding150}${specialSecret} and ${encodedSecret}`, {
+            status: 401,
+            headers: { 'Content-Type': 'text/plain' },
+          }),
+      });
+
+      const setupRes = await app.request('http://localhost/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'AdminPassword123!' }),
+      });
+      assert.equal(setupRes.status, 201);
+      const adminCookie = extractCookiePair(setupRes.headers.get('set-cookie'));
+
+      await app.request('http://localhost/api/providers', {
+        method: 'POST',
+        headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schemaVersion: '1.0',
+          id: 'bf04-prov',
+          name: 'BF04 Prov',
+          packageType: 'official-json',
+          baseUrl: 'https://bf04.example.com/v1',
+          auth: { type: 'bearer', header: 'Authorization', prefix: 'Bearer ' },
+          modelsSource: 'api',
+          modelsEndpoint: '/models',
+          rateLimitKind: 'tokens',
+          rateLimitWindows: ['day'],
+        }),
+      });
+
+      const keyId = randomUUID();
+      db.prepare(
+        `INSERT INTO provider_keys (id, provider_id, label, encrypted_secret, last4, status, created_at)
+         VALUES (?, 'bf04-prov', 'Special Key', ?, '8877', 'active', ?)`,
+      ).run(keyId, encryptSecret(specialSecret, masterKey), nowSec);
+
+      // A) POST /api/providers/:id/keys/:keyId/test must redact BEFORE .slice(0, 160) so no prefix leaks!
+      const testRes = await app.request(
+        `http://localhost/api/providers/bf04-prov/keys/${keyId}/test`,
+        { method: 'POST', headers: { Cookie: adminCookie } },
+      );
+      assert.equal(testRes.status, 200);
+      const testBody = (await testRes.json()) as { ok: boolean; message: string };
+      assert.equal(testBody.ok, false);
+      assert.equal(testBody.message.includes('vendor+key'), false, 'Truncated secret prefix must NEVER leak');
+      assert.equal(testBody.message.includes(specialSecret), false);
+      assert.equal(testBody.message.includes(encodedSecret), false);
+      assert.ok(testBody.message.includes('[REDACTED]'));
+
+      const storedErr = (
+        db.prepare(`SELECT last_error FROM provider_keys WHERE id = ?`).get(keyId) as {
+          last_error: string | null;
+        }
+      ).last_error ?? '';
+      assert.equal(storedErr.includes('vendor+key'), false);
+      assert.equal(storedErr.includes(encodedSecret), false);
+
+      // B) syncProviderModels catch must redact both literal and URL-encoded rawSecret
+      db.prepare(`UPDATE provider_keys SET status = 'active' WHERE id = ?`).run(keyId);
+      let syncErrMsg = '';
+      try {
+        await syncProviderModels({
+          db,
+          masterKey,
+          providerId: 'bf04-prov',
+          drainingKeys: new Set(),
+          drainingProviders: new Set(),
+          fetchImpl: async () => {
+            throw new Error(`DNS failure for https://bf04.example.com/v1/models?k=${encodedSecret}&raw=${specialSecret}`);
+          },
+          nowSec,
+          modelsDevSnapshot: {
+            modelsByProvider: new Map(),
+            modelsById: new Map(),
+            fetchedAt: nowSec,
+          } as never,
+        });
+      } catch (err) {
+        syncErrMsg = err instanceof Error ? err.message : String(err);
+      }
+      assert.ok(syncErrMsg.includes('[REDACTED]'));
+      assert.equal(syncErrMsg.includes(specialSecret), false, 'syncProviderModels error must redact literal rawSecret');
+      assert.equal(syncErrMsg.includes(encodedSecret), false, 'syncProviderModels error must redact URL-encoded rawSecret');
+
+      const syncLogsDump = JSON.stringify(db.prepare(`SELECT message, meta_json FROM system_logs`).all());
+      assert.equal(syncLogsDump.includes(specialSecret), false);
+      assert.equal(syncLogsDump.includes(encodedSecret), false);
+
+      // C) Router error must redact URL-encoded rawSecret as well as literal rawSecret
+      const providerRow = db
+        .prepare(`SELECT * FROM providers WHERE id = 'bf04-prov'`)
+        .get() as Record<string, unknown>;
+      const passHash = await hashPassword('RouterSec123!');
+      db.prepare(
+        `INSERT OR IGNORE INTO users (id, username, password_hash, role, created_at)
+         VALUES ('u-bf04', 'bf04_user', ?, 'admin', ?)`,
+      ).run(passHash, nowSec);
+
+      const routerRes = await executeChatCompletions({
+        db,
+        masterKey,
+        registry: new DrainingRegistry(),
+        fetchImpl: async () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                message: `Bad auth url=https://bf04.example.com?token=${encodedSecret} raw=${specialSecret}`,
+              },
+            }),
+            { status: 400, headers: { 'Content-Type': 'application/json' } },
+          ),
+        now: () => clockMs,
+        userId: 'u-bf04',
+        modelFullId: 'bf04-prov/m1',
+        modelId: 'm1',
+        providerRow,
+        requestBody: {
+          model: 'bf04-prov/m1',
+          messages: [{ role: 'user', content: 'Test encoded redaction' }],
+        },
+      });
+      assert.equal(routerRes.status, 400);
+      const routerErrText = await routerRes.text();
+      assert.equal(routerErrText.includes(specialSecret), false);
+      assert.equal(routerErrText.includes(encodedSecret), false);
+      assert.ok(routerErrText.includes('[REDACTED]'));
     } finally {
       db.close();
     }

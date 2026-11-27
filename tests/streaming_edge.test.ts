@@ -1014,4 +1014,324 @@ describe('Ola 3 — Streaming SSE edge cases, anti-crash Node 24, selective fall
       db.close();
     }
   });
+
+  it('5) B1: headers timeout clears once headers arrive so active SSE streams running longer than requestTimeoutMs complete without penalizing the key; B4: forces include_usage:true over client stream_options:{include_usage:false}; #7: preserves segment-1 tokens on stream_resume', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+    const registry = new DrainingRegistry();
+    let clockMs = Date.UTC(2026, 10, 26, 16, 0, 0);
+    const nowSec = Math.floor(clockMs / 1000);
+
+    try {
+      const fix = await seedRouterFixture({
+        db,
+        masterKey,
+        nowSec,
+        keys: [
+          { id: 'k-b1-1', label: 'B1 Key 1', secret: 'sk-b1-key-1111' },
+          { id: 'k-b1-2', label: 'B1 Key 2', secret: 'sk-b1-key-2222' },
+        ],
+      });
+
+      // B1: headers resolve in 20ms (< requestTimeoutMs=120ms), then stream emits 5 chunks over ~260ms (> 120ms)
+      let observedSignal: AbortSignal | undefined;
+      let signalAbortedDuringBody = false;
+
+      const longStreamFetch: typeof fetch = async (_input, init) => {
+        observedSignal = init?.signal ?? undefined;
+        await new Promise((r) => setTimeout(r, 20));
+        const enc = new TextEncoder();
+        const body = new ReadableStream<Uint8Array>({
+          async start(ctrl) {
+            for (let i = 1; i <= 5; i++) {
+              await new Promise((r) => setTimeout(r, 55));
+              if (observedSignal?.aborted) {
+                signalAbortedDuringBody = true;
+                ctrl.error(new Error('Signal aborted mid-stream'));
+                return;
+              }
+              ctrl.enqueue(
+                enc.encode(
+                  `data: ${JSON.stringify({
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { content: `chunk-${i} ` },
+                        finish_reason: i === 5 ? 'stop' : null,
+                      },
+                    ],
+                    ...(i === 5 ? { usage: { prompt_tokens: 15, completion_tokens: 12 } } : {}),
+                  })}\n\n`,
+                ),
+              );
+            }
+            ctrl.enqueue(enc.encode('data: [DONE]\n\n'));
+            ctrl.close();
+          },
+        });
+        return new Response(body, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      };
+
+      const resB1 = await executeChatCompletions({
+        db,
+        masterKey,
+        registry,
+        fetchImpl: longStreamFetch,
+        now: () => clockMs,
+        userId: fix.userId,
+        modelFullId: fix.modelFullId,
+        modelId: fix.modelId,
+        providerRow: fix.providerRow,
+        requestBody: {
+          model: fix.modelFullId,
+          stream: true,
+          messages: [{ role: 'user', content: 'Long reasoning stream' }],
+        },
+        requestTimeoutMs: 120,
+        streamIdleTimeoutMs: 500,
+      });
+      assert.equal(resB1.status, 200);
+      const b1Text = await resB1.text();
+      assert.equal(signalAbortedDuringBody, false, 'Headers timeout must NOT abort active SSE stream body');
+      assert.equal(observedSignal?.aborted, false);
+      assert.ok(b1Text.includes('chunk-1 '));
+      assert.ok(b1Text.includes('chunk-5 '));
+
+      const k1Status = (
+        db.prepare(`SELECT status FROM provider_keys WHERE id = 'k-b1-1'`).get() as { status: string }
+      ).status;
+      assert.equal(k1Status, 'active', 'Healthy key must NOT be penalized after long active stream');
+
+      // B4: client sends stream_options: { include_usage: false } -> forced to true, with transparent 400 fallback
+      const b4Bodies: Array<Record<string, unknown>> = [];
+      let b4Attempt = 0;
+      const resB4 = await executeChatCompletions({
+        db,
+        masterKey,
+        registry,
+        fetchImpl: async (_input, init) => {
+          b4Attempt++;
+          const parsed = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+          b4Bodies.push(parsed);
+          if (b4Attempt === 1) {
+            return new Response(
+              JSON.stringify({ error: { message: 'Unsupported field: stream_options' } }),
+              { status: 400, headers: { 'Content-Type': 'application/json' } },
+            );
+          }
+          const enc = new TextEncoder();
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(ctrl) {
+                ctrl.enqueue(
+                  enc.encode(
+                    `data: ${JSON.stringify({
+                      choices: [{ index: 0, delta: { content: 'b4 ok' }, finish_reason: 'stop' }],
+                    })}\n\n`,
+                  ),
+                );
+                ctrl.enqueue(enc.encode('data: [DONE]\n\n'));
+                ctrl.close();
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+          );
+        },
+        now: () => clockMs,
+        userId: fix.userId,
+        modelFullId: fix.modelFullId,
+        modelId: fix.modelId,
+        providerRow: fix.providerRow,
+        requestBody: {
+          model: fix.modelFullId,
+          stream: true,
+          stream_options: { include_usage: false },
+          messages: [{ role: 'user', content: 'Force include_usage test' }],
+        },
+      });
+      assert.equal(resB4.status, 200);
+      await resB4.text();
+      assert.equal(b4Bodies.length, 2);
+      assert.deepEqual(
+        b4Bodies[0]!.stream_options,
+        { include_usage: true },
+        'Must force include_usage: true even when client sends include_usage: false',
+      );
+      assert.equal(b4Bodies[1]!.stream_options, undefined, 'Must retry without stream_options on HTTP 400');
+
+      // #7: per-segment fallback in stream_resume (seg1: 80 chars, no usage -> 20 tokens; seg2: real completion_tokens=10 -> total 30)
+      db.prepare(`UPDATE provider_keys SET status = 'active', last_error = NULL`).run();
+      let segCall = 0;
+      const resSeg = await executeChatCompletions({
+        db,
+        masterKey,
+        registry,
+        fetchImpl: async () => {
+          segCall++;
+          const enc = new TextEncoder();
+          if (segCall === 1) {
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                start(ctrl) {
+                  ctrl.enqueue(
+                    enc.encode(
+                      `data: ${JSON.stringify({
+                        choices: [{ index: 0, delta: { content: 'a'.repeat(80) } }],
+                      })}\n\n`,
+                    ),
+                  );
+                  ctrl.close();
+                },
+              }),
+              { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+            );
+          }
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(ctrl) {
+                ctrl.enqueue(
+                  enc.encode(
+                    `data: ${JSON.stringify({
+                      choices: [{ index: 0, delta: { content: 'rest' }, finish_reason: 'stop' }],
+                      usage: { prompt_tokens: 100, completion_tokens: 10 },
+                    })}\n\n`,
+                  ),
+                );
+                ctrl.enqueue(enc.encode('data: [DONE]\n\n'));
+                ctrl.close();
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+          );
+        },
+        now: () => clockMs,
+        userId: fix.userId,
+        modelFullId: fix.modelFullId,
+        modelId: fix.modelId,
+        providerRow: fix.providerRow,
+        requestBody: {
+          model: fix.modelFullId,
+          stream: true,
+          messages: [{ role: 'user', content: 'Segment accounting test' }],
+        },
+      });
+      assert.equal(resSeg.status, 200);
+      await resSeg.text();
+      const segLog = db
+        .prepare(`SELECT prompt_tokens, completion_tokens, status FROM usage_logs ORDER BY id DESC LIMIT 1`)
+        .get() as { prompt_tokens: number; completion_tokens: number; status: string };
+      assert.equal(segLog.status, 'resumed');
+      assert.equal(segLog.prompt_tokens, 100);
+      assert.equal(
+        segLog.completion_tokens,
+        30,
+        'Resumed stream must include segment-1 estimated 20 tokens + segment-2 reported 10 tokens',
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it('6) B2 & #5: preserves standard OpenAI fields (modalities, audio, prediction, service_tier, store, web_search_options, functions, function_call), strips aggregator fields, and rejects n: true with 400', async () => {
+    const db = openDatabase(':memory:');
+    const masterKey = randomBytes(32);
+    const registry = new DrainingRegistry();
+    const clockMs = Date.UTC(2026, 10, 26, 16, 30, 0);
+    const nowSec = Math.floor(clockMs / 1000);
+
+    try {
+      const fix = await seedRouterFixture({ db, masterKey, nowSec });
+
+      // #5: n: true and n: '1' must be rejected with 400
+      for (const badN of [true, '1', 0, 2]) {
+        const badRes = await executeChatCompletions({
+          db,
+          masterKey,
+          registry,
+          fetchImpl: async () => {
+            throw new Error('Should not reach upstream for invalid n');
+          },
+          now: () => clockMs,
+          userId: fix.userId,
+          modelFullId: fix.modelFullId,
+          modelId: fix.modelId,
+          providerRow: fix.providerRow,
+          requestBody: {
+            model: fix.modelFullId,
+            n: badN,
+            messages: [{ role: 'user', content: 'Invalid n' }],
+          },
+        });
+        assert.equal(badRes.status, 400, `Expected 400 for n=${JSON.stringify(badN)}`);
+      }
+
+      // B2: standard OpenAI fields preserved; aggregator fields stripped
+      let captured: Record<string, unknown> = {};
+      const okRes = await executeChatCompletions({
+        db,
+        masterKey,
+        registry,
+        fetchImpl: async (_input, init) => {
+          captured = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  index: 0,
+                  message: {
+                    role: 'assistant',
+                    content: null,
+                    function_call: { name: 'legacy_fn', arguments: '{"x":1}' },
+                  },
+                  finish_reason: 'function_call',
+                },
+              ],
+              usage: { prompt_tokens: 10, completion_tokens: 8 },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        },
+        now: () => clockMs,
+        userId: fix.userId,
+        modelFullId: fix.modelFullId,
+        modelId: fix.modelId,
+        providerRow: fix.providerRow,
+        requestBody: {
+          model: fix.modelFullId,
+          n: 1,
+          messages: [{ role: 'user', content: 'Preserve OpenAI fields' }],
+          modalities: ['text'],
+          audio: { voice: 'alloy', format: 'wav' },
+          prediction: { type: 'content', content: 'draft' },
+          service_tier: 'auto',
+          store: false,
+          web_search_options: { search_context_size: 'low' },
+          functions: [{ name: 'legacy_fn', parameters: { type: 'object' } }],
+          function_call: { name: 'legacy_fn' },
+          models: ['openai/gpt-4o'],
+          plugins: [{ id: 'web' }],
+          provider: { order: ['OpenAI'] },
+          route: 'fallback',
+          transforms: ['middle-out'],
+        },
+      });
+      assert.equal(okRes.status, 200);
+      assert.deepEqual(captured.modalities, ['text']);
+      assert.deepEqual(captured.audio, { voice: 'alloy', format: 'wav' });
+      assert.deepEqual(captured.prediction, { type: 'content', content: 'draft' });
+      assert.equal(captured.service_tier, 'auto');
+      assert.equal(captured.store, false);
+      assert.deepEqual(captured.web_search_options, { search_context_size: 'low' });
+      assert.deepEqual(captured.functions, [{ name: 'legacy_fn', parameters: { type: 'object' } }]);
+      assert.deepEqual(captured.function_call, { name: 'legacy_fn' });
+      for (const blocked of ['models', 'plugins', 'provider', 'route', 'transforms']) {
+        assert.equal(blocked in captured, false, `Blocked field "${blocked}" must be stripped`);
+      }
+    } finally {
+      db.close();
+    }
+  });
 });

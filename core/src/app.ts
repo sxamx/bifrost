@@ -53,6 +53,7 @@ import {
   getUptime60Days,
   querySystemLogs,
   round2,
+  scrubSecretsFromText,
 } from './metrics/index.js';
 import {
   addMarketplaceSource,
@@ -2037,9 +2038,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       }
 
       const rawText = await res.text().catch(() => '');
-      const safeSnippet = redactSecretsInText(rawText.slice(0, 160))
-        .split(rawSecret)
-        .join('[REDACTED]');
+      const safeSnippet = scrubSecretsFromText(rawText, [rawSecret]).slice(0, 160);
       const errorMessage = safeSnippet
         ? `Upstream returned HTTP ${res.status}: ${safeSnippet}`
         : `Upstream returned HTTP ${res.status}.`;
@@ -2080,7 +2079,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     } catch (err) {
       const latencyMs = Math.max(0, now() - startMs);
       const rawErr = err instanceof Error ? err.message : 'Upstream key test failed.';
-      const safeMsg = redactSecretsInText(rawErr).split(rawSecret).join('[REDACTED]');
+      const safeMsg = scrubSecretsFromText(rawErr, [rawSecret]);
       const nextStatus = currentKeyStatus === 'active' ? 'rate_limited' : currentKeyStatus;
 
       const failNowSec = nowSeconds();
