@@ -7,7 +7,18 @@ import {
   type UpstreamTlsOptions,
   fetchViaExitNode,
 } from './nodes.js';
-import { type ProviderManifest, buildProviderAuthHeaders } from './schema.js';
+import {
+  type ProviderManifest,
+  buildProviderAuthHeaders,
+  mergeHeadersCaseInsensitive,
+} from './schema.js';
+import {
+  type DnsLookupFn,
+  UpstreamSsrfError,
+  assertSafeUpstreamUrlSync,
+  safeFetch,
+} from './ssrf.js';
+import { allowLocalOfficialUpstreams } from './url-security.js';
 
 export class DrainingRegistry {
   private readonly drainingKeys = new Set<string>();
@@ -892,6 +903,8 @@ export async function executeChatCompletions(options: {
   masterKey: Buffer;
   registry: DrainingRegistry;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
   upstreamTls?: UpstreamTlsOptions;
   now: () => number;
   userId: string;
@@ -906,6 +919,8 @@ export async function executeChatCompletions(options: {
     masterKey,
     registry,
     fetchImpl,
+    allowLocalhost,
+    dnsLookup,
     upstreamTls,
     now,
     userId,
@@ -938,6 +953,12 @@ export async function executeChatCompletions(options: {
   const contractFlags = detectRequestContractFlags(requestBody);
 
   const manifest = JSON.parse(String(providerRow.schema_json)) as ProviderManifest;
+  const upstreamMode =
+    providerRow.package_type === 'experimental-adapter'
+      ? ('experimental-adapter' as const)
+      : ('official-json' as const);
+  const effectiveAllowLocalhost =
+    allowLocalhost !== undefined ? allowLocalhost : allowLocalOfficialUpstreams();
   const effectiveBaseUrl =
     providerRow.package_type === 'experimental-adapter' &&
     typeof providerRow.adapter_url === 'string' &&
@@ -945,7 +966,21 @@ export async function executeChatCompletions(options: {
       ? providerRow.adapter_url
       : manifest.baseUrl;
 
-  const chatUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/chat/completions`;
+  const rawChatUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/chat/completions`;
+  let chatUrl: string;
+  try {
+    chatUrl = assertSafeUpstreamUrlSync(rawChatUrl, {
+      mode: upstreamMode,
+      allowLocalhost: effectiveAllowLocalhost,
+    });
+  } catch (err) {
+    return openAiErrorJson(
+      err instanceof Error ? err.message : 'Upstream URL blocked by SSRF policy.',
+      'invalid_request_error',
+      'ssrf_blocked',
+      400,
+    );
+  }
 
   const candidates = loadCandidateKeys(db, providerId, registry, nowSec);
   if (candidates.length === 0) {
@@ -965,7 +1000,10 @@ export async function executeChatCompletions(options: {
     );
   }
 
-  const extractSafeUpstreamErrorMessage = async (res: Response): Promise<string> => {
+  const extractSafeUpstreamErrorMessage = async (
+    res: Response,
+    explicitSecrets?: ReadonlyArray<string | null | undefined>,
+  ): Promise<string> => {
     const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
     const rawBody = await res.text().catch(() => '');
     if (contentType.includes('application/json') && rawBody.trim().length > 0) {
@@ -979,7 +1017,7 @@ export async function executeChatCompletions(options: {
               ? errField
               : parsed.message;
         if (typeof candidate === 'string' && candidate.trim().length > 0) {
-          return redactSecretsInText(candidate.trim().slice(0, 300));
+          return redactSecretsInText(candidate.trim(), explicitSecrets).slice(0, 300);
         }
       } catch {
         // Ignore malformed JSON body and return generic HTTP status message
@@ -1011,7 +1049,17 @@ export async function executeChatCompletions(options: {
         upstreamTls,
       );
     }
-    return fetchImpl(chatUrl, { ...init, redirect: 'error' });
+    return safeFetch(
+      chatUrl,
+      { ...init, redirect: 'error' },
+      {
+        mode: upstreamMode,
+        allowLocalhost: effectiveAllowLocalhost,
+        fetchImpl,
+        dnsLookup,
+        upstreamTls,
+      },
+    );
   };
 
   const isStream = requestBody.stream === true;
@@ -1075,10 +1123,10 @@ export async function executeChatCompletions(options: {
       const releaseLease = registry.acquireLease(providerId, key.id);
       try {
         const rawSecret = decryptSecret(key.encrypted_secret, masterKey);
-        const headers: Record<string, string> = {
-          ...buildProviderAuthHeaders(manifest.auth, rawSecret),
-          'Content-Type': 'application/json',
-        };
+        const headers = mergeHeadersCaseInsensitive(
+          buildProviderAuthHeaders(manifest.auth, rawSecret),
+          { 'Content-Type': 'application/json' },
+        );
         const upstreamBody = applyStrictMaxTokens({
           ...requestBody,
           model: modelId,
@@ -1093,10 +1141,18 @@ export async function executeChatCompletions(options: {
             body: JSON.stringify(upstreamBody),
           });
         } catch (err) {
+          if (err instanceof UpstreamSsrfError) {
+            return openAiErrorJson(
+              redactSecretsInText(err.message, [rawSecret]),
+              'invalid_request_error',
+              'ssrf_blocked',
+              400,
+            );
+          }
           const msg = err instanceof Error ? err.message : String(err);
           lastStatus = null;
           lastWasNetwork = true;
-          lastErrorMsg = redactSecretsInText(`Network/tunnel error: ${msg}`);
+          lastErrorMsg = redactSecretsInText(`Network/tunnel error: ${msg}`, [rawSecret]);
           markKeyFailure(db, key.id, null, lastErrorMsg, null, Math.floor(now() / 1000));
 
           const nextKey = candidates.slice(i + 1).find((k) => !registry.isKeyDraining(k.id));
@@ -1124,8 +1180,11 @@ export async function executeChatCompletions(options: {
         if (isRetryableKeyFailureStatus(res.status)) {
           lastStatus = res.status;
           lastWasNetwork = false;
-          const safeErr = await extractSafeUpstreamErrorMessage(res);
-          lastErrorMsg = redactSecretsInText(`HTTP ${res.status}: ${safeErr.slice(0, 160)}`);
+          const safeErr = await extractSafeUpstreamErrorMessage(res, [rawSecret]);
+          lastErrorMsg = redactSecretsInText(`HTTP ${res.status}: ${safeErr}`, [rawSecret]).slice(
+            0,
+            180,
+          );
           markKeyFailure(
             db,
             key.id,
@@ -1158,7 +1217,7 @@ export async function executeChatCompletions(options: {
         }
 
         if (!res.ok) {
-          const safeErr = await extractSafeUpstreamErrorMessage(res);
+          const safeErr = await extractSafeUpstreamErrorMessage(res, [rawSecret]);
           const endMs = now();
           const endSec = Math.floor(endMs / 1000);
           writeSystemLog(
@@ -1360,6 +1419,7 @@ export async function executeChatCompletions(options: {
     logCategoryOnRetry: 'failover' | 'stream_resume',
   ): Promise<{
     key: ProviderKeyRecord;
+    rawSecret: string;
     response: Response;
     releaseLease: () => void;
   } | null> => {
@@ -1373,15 +1433,14 @@ export async function executeChatCompletions(options: {
       const releaseLease = registry.acquireLease(providerId, key.id);
       try {
         const rawSecret = decryptSecret(key.encrypted_secret, masterKey);
-        const rawAuthHeaders = buildProviderAuthHeaders(manifest.auth, rawSecret);
-        const headers: Record<string, string> = {};
-        for (const [k, v] of Object.entries(rawAuthHeaders)) {
-          if (k.toLowerCase() === 'accept-encoding') continue;
-          headers[k] = v;
-        }
-        headers['Content-Type'] = 'application/json';
-        headers.Accept = 'text/event-stream';
-        headers['Accept-Encoding'] = 'identity';
+        const headers = mergeHeadersCaseInsensitive(
+          buildProviderAuthHeaders(manifest.auth, rawSecret),
+          {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+            'Accept-Encoding': 'identity',
+          },
+        );
         const upstreamBody = applyStrictMaxTokens({
           ...requestBody,
           model: modelId,
@@ -1398,9 +1457,17 @@ export async function executeChatCompletions(options: {
           });
         } catch (err) {
           releaseLease();
+          if (err instanceof UpstreamSsrfError) {
+            nonRetryableStreamFailure = {
+              status: 400,
+              message: redactSecretsInText(err.message, [rawSecret]),
+              keyId: key.id,
+            };
+            return null;
+          }
           lastStreamOpenStatus = null;
           const msg = err instanceof Error ? err.message : String(err);
-          const safeMsg = redactSecretsInText(`Network/tunnel error: ${msg}`);
+          const safeMsg = redactSecretsInText(`Network/tunnel error: ${msg}`, [rawSecret]);
           markKeyFailure(db, key.id, null, safeMsg, null, Math.floor(now() / 1000));
 
           const hasMore = candidates.some(
@@ -1422,9 +1489,12 @@ export async function executeChatCompletions(options: {
         if (isRetryableKeyFailureStatus(res.status) || !res.body) {
           const status = res.status;
           lastStreamOpenStatus = status;
-          const safeErr = await extractSafeUpstreamErrorMessage(res);
+          const safeErr = await extractSafeUpstreamErrorMessage(res, [rawSecret]);
           releaseLease();
-          const safeMsg = redactSecretsInText(`HTTP ${status}: ${safeErr.slice(0, 160)}`);
+          const safeMsg = redactSecretsInText(`HTTP ${status}: ${safeErr}`, [rawSecret]).slice(
+            0,
+            180,
+          );
           markKeyFailure(db, key.id, status, safeMsg, res.headers, Math.floor(now() / 1000));
 
           const hasMore = candidates.some(
@@ -1444,7 +1514,7 @@ export async function executeChatCompletions(options: {
         }
 
         if (!res.ok) {
-          const safeErr = await extractSafeUpstreamErrorMessage(res);
+          const safeErr = await extractSafeUpstreamErrorMessage(res, [rawSecret]);
           releaseLease();
           nonRetryableStreamFailure = {
             status: res.status,
@@ -1454,7 +1524,7 @@ export async function executeChatCompletions(options: {
           return null;
         }
 
-        return { key, response: res, releaseLease };
+        return { key, rawSecret, response: res, releaseLease };
       } catch (err) {
         releaseLease();
         throw err;
@@ -1573,6 +1643,7 @@ export async function executeChatCompletions(options: {
       void (async () => {
         let activeConn: {
           key: ProviderKeyRecord;
+          rawSecret: string;
           response: Response;
           releaseLease: () => void;
         } | null = initialConnection;
@@ -1593,6 +1664,7 @@ export async function executeChatCompletions(options: {
         try {
           while (activeConn !== null && !clientAborted) {
             const currentKey = activeConn.key;
+            const currentRawSecret = activeConn.rawSecret;
             const currentRes = activeConn.response;
             const releaseCurrent = activeConn.releaseLease;
             lastKeyUsedId = currentKey.id;
@@ -1632,7 +1704,9 @@ export async function executeChatCompletions(options: {
               }
 
             if (parsed.error) {
-              streamFailureReason = redactSecretsInText(JSON.stringify(parsed.error));
+              streamFailureReason = redactSecretsInText(JSON.stringify(parsed.error), [
+                currentRawSecret,
+              ]);
               return false;
             }
 
@@ -1792,7 +1866,9 @@ export async function executeChatCompletions(options: {
           } catch (err) {
             if (!clientAborted) {
               const msg = err instanceof Error ? err.message : String(err);
-              streamFailureReason = redactSecretsInText(`Stream interrupted: ${msg}`);
+              streamFailureReason = redactSecretsInText(`Stream interrupted: ${msg}`, [
+                currentRawSecret,
+              ]);
             }
           } finally {
             if (activeReader === reader) {
@@ -2018,6 +2094,8 @@ export async function executeEmbeddings(options: {
   masterKey: Buffer;
   registry: DrainingRegistry;
   fetchImpl: typeof fetch;
+  allowLocalhost?: boolean;
+  dnsLookup?: DnsLookupFn;
   upstreamTls?: UpstreamTlsOptions;
   now: () => number;
   userId: string;
@@ -2032,6 +2110,8 @@ export async function executeEmbeddings(options: {
     masterKey,
     registry,
     fetchImpl,
+    allowLocalhost,
+    dnsLookup,
     upstreamTls,
     now,
     userId,
@@ -2061,6 +2141,12 @@ export async function executeEmbeddings(options: {
   }
 
   const manifest = JSON.parse(String(providerRow.schema_json)) as ProviderManifest;
+  const upstreamMode =
+    providerRow.package_type === 'experimental-adapter'
+      ? ('experimental-adapter' as const)
+      : ('official-json' as const);
+  const effectiveAllowLocalhost =
+    allowLocalhost !== undefined ? allowLocalhost : allowLocalOfficialUpstreams();
   const effectiveBaseUrl =
     providerRow.package_type === 'experimental-adapter' &&
     typeof providerRow.adapter_url === 'string' &&
@@ -2068,7 +2154,21 @@ export async function executeEmbeddings(options: {
       ? providerRow.adapter_url
       : manifest.baseUrl;
 
-  const embeddingsUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/embeddings`;
+  const rawEmbeddingsUrl = `${effectiveBaseUrl.replace(/\/+$/, '')}/embeddings`;
+  let embeddingsUrl: string;
+  try {
+    embeddingsUrl = assertSafeUpstreamUrlSync(rawEmbeddingsUrl, {
+      mode: upstreamMode,
+      allowLocalhost: effectiveAllowLocalhost,
+    });
+  } catch (err) {
+    return openAiErrorJson(
+      err instanceof Error ? err.message : 'Upstream URL blocked by SSRF policy.',
+      'invalid_request_error',
+      'ssrf_blocked',
+      400,
+    );
+  }
 
   const candidates = loadCandidateKeys(db, providerId, registry, nowSec);
   if (candidates.length === 0) {
@@ -2088,7 +2188,10 @@ export async function executeEmbeddings(options: {
     );
   }
 
-  const extractSafeUpstreamErrorMessage = async (res: Response): Promise<string> => {
+  const extractSafeUpstreamErrorMessage = async (
+    res: Response,
+    explicitSecrets?: ReadonlyArray<string | null | undefined>,
+  ): Promise<string> => {
     const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
     const rawBody = await res.text().catch(() => '');
     if (contentType.includes('application/json') && rawBody.trim().length > 0) {
@@ -2102,7 +2205,7 @@ export async function executeEmbeddings(options: {
               ? errField
               : parsed.message;
         if (typeof candidate === 'string' && candidate.trim().length > 0) {
-          return redactSecretsInText(candidate.trim().slice(0, 300));
+          return redactSecretsInText(candidate.trim(), explicitSecrets).slice(0, 300);
         }
       } catch {
         // Ignore malformed JSON body
@@ -2134,7 +2237,17 @@ export async function executeEmbeddings(options: {
         upstreamTls,
       );
     }
-    return fetchImpl(embeddingsUrl, { ...init, redirect: 'error' });
+    return safeFetch(
+      embeddingsUrl,
+      { ...init, redirect: 'error' },
+      {
+        mode: upstreamMode,
+        allowLocalhost: effectiveAllowLocalhost,
+        fetchImpl,
+        dnsLookup,
+        upstreamTls,
+      },
+    );
   };
 
   const triedKeyIds = new Set<string>();
@@ -2154,10 +2267,10 @@ export async function executeEmbeddings(options: {
     const releaseLease = registry.acquireLease(providerId, key.id);
     try {
       const rawSecret = decryptSecret(key.encrypted_secret, masterKey);
-      const headers: Record<string, string> = {
-        ...buildProviderAuthHeaders(manifest.auth, rawSecret),
-        'Content-Type': 'application/json',
-      };
+      const headers = mergeHeadersCaseInsensitive(
+        buildProviderAuthHeaders(manifest.auth, rawSecret),
+        { 'Content-Type': 'application/json' },
+      );
       const upstreamBody: Record<string, unknown> = {
         ...requestBody,
         model: modelId,
@@ -2171,10 +2284,18 @@ export async function executeEmbeddings(options: {
           body: JSON.stringify(upstreamBody),
         });
       } catch (err) {
+        if (err instanceof UpstreamSsrfError) {
+          return openAiErrorJson(
+            redactSecretsInText(err.message, [rawSecret]),
+            'invalid_request_error',
+            'ssrf_blocked',
+            400,
+          );
+        }
         const msg = err instanceof Error ? err.message : String(err);
         lastStatus = null;
         lastWasNetwork = true;
-        lastErrorMsg = redactSecretsInText(`Network/tunnel error: ${msg}`);
+        lastErrorMsg = redactSecretsInText(`Network/tunnel error: ${msg}`, [rawSecret]);
         markKeyFailure(db, key.id, null, lastErrorMsg, null, Math.floor(now() / 1000));
 
         const nextKey = candidates.slice(i + 1).find((k) => !registry.isKeyDraining(k.id));
@@ -2202,8 +2323,11 @@ export async function executeEmbeddings(options: {
       if (isRetryableKeyFailureStatus(res.status)) {
         lastStatus = res.status;
         lastWasNetwork = false;
-        const safeErr = await extractSafeUpstreamErrorMessage(res);
-        lastErrorMsg = redactSecretsInText(`HTTP ${res.status}: ${safeErr.slice(0, 160)}`);
+        const safeErr = await extractSafeUpstreamErrorMessage(res, [rawSecret]);
+        lastErrorMsg = redactSecretsInText(`HTTP ${res.status}: ${safeErr}`, [rawSecret]).slice(
+          0,
+          180,
+        );
         markKeyFailure(
           db,
           key.id,
@@ -2236,7 +2360,7 @@ export async function executeEmbeddings(options: {
       }
 
       if (!res.ok) {
-        const safeErr = await extractSafeUpstreamErrorMessage(res);
+        const safeErr = await extractSafeUpstreamErrorMessage(res, [rawSecret]);
         const endMs = now();
         const endSec = Math.floor(endMs / 1000);
         writeSystemLog(

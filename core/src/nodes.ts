@@ -6,6 +6,14 @@ import type { DatabaseSync } from 'node:sqlite';
 import tls from 'node:tls';
 import { decryptSecret, encryptSecret, sha256Hex } from './crypto.js';
 import { redactSecretsInText, writeSystemLog } from './db.js';
+import {
+  isBlockedMetadataHostname,
+  isPrivateOrReservedIp,
+  isStrictLoopbackIp,
+  isTailscaleCgnatIpv4,
+  isUnconditionallyBlockedIp,
+} from './ssrf.js';
+import { allowLocalOfficialUpstreams } from './url-security.js';
 
 export type NodeMode = 'tailscale' | 'public_ip';
 export type NodeStatus = 'online' | 'unresponsive' | 'offline';
@@ -178,6 +186,179 @@ export function parseNodeEndpoint(rawEndpoint: string): ParsedEndpoint | null {
     port,
     normalized: `${normalizedHost}:${port}`,
   };
+}
+
+export interface ValidateNodeEndpointOptions {
+  allowLoopbackNodes?: boolean;
+}
+
+export type NodeEndpointValidationResult =
+  | { valid: true; parsed: ParsedEndpoint }
+  | { valid: false; error: string };
+
+const TAILSCALE_DOMAIN_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.ts\.net$/;
+const PUBLIC_HOSTNAME_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z][a-z0-9-]*$/;
+
+function canonicalizeNodeHost(rawHost: string): string | null {
+  const trimmed = rawHost.trim().toLowerCase();
+  if (
+    !trimmed ||
+    /[\u0000-\u001f\u007f\s/@?#%]/.test(trimmed) ||
+    trimmed.includes('..') ||
+    trimmed.startsWith('.')
+  ) {
+    return null;
+  }
+
+  let parsedUrl: URL;
+  try {
+    const authority = trimmed.includes(':') ? `[${trimmed}]` : trimmed;
+    parsedUrl = new URL(`https://${authority}`);
+  } catch {
+    return null;
+  }
+
+  if (parsedUrl.username !== '' || parsedUrl.password !== '' || parsedUrl.port !== '') {
+    return null;
+  }
+
+  let hostname = parsedUrl.hostname.toLowerCase();
+  if (hostname.startsWith('[') && hostname.endsWith(']')) {
+    hostname = hostname.slice(1, -1);
+  }
+  if (hostname.includes('..') || hostname.startsWith('.')) {
+    return null;
+  }
+  hostname = hostname.replace(/\.+$/, '');
+  return hostname || null;
+}
+
+/**
+ * Validates an egress node endpoint against SSRF / IMDS rules and mode-specific network constraints:
+ * - Canonicalizes hosts via WHATWG URL parsing so octal/hex/short-form IPv4 literals
+ *   (e.g. `0251.0376.0251.0376`, `0xa9.0xfe.0xa9.0xfe`, `169.254.43518`, `192.0.192`, `0177.0.0.1`)
+ *   are always evaluated against IP rules.
+ * - Unconditionally blocks Cloud IMDS (`169.254.0.0/16`, `192.0.0.192`, `100.100.100.200`, `fd00:ec2::254`),
+ *   `0.0.0.0/8`, link-local (`fe80::/10`), ULA (`fc00::/7`), multicast, and IPv6 transition ranges.
+ * - Loopback (`127.0.0.0/8`, `::1`, `localhost`) is blocked in production and allowed only when
+ *   `allowLoopbackNodes` (or test mode) is explicitly active.
+ * - `tailscale` mode requires `100.64.0.0/10` (excluding Alibaba IMDS) or a `.ts.net` hostname.
+ * - `public_ip` mode blocks loopback, RFC1918, CGNAT, and single-label/numeric-TLD hostnames.
+ */
+export function validateNodeEndpoint(
+  rawEndpoint: string,
+  mode: NodeMode,
+  options?: ValidateNodeEndpointOptions,
+): NodeEndpointValidationResult {
+  const parsed = parseNodeEndpoint(rawEndpoint);
+  if (!parsed) {
+    return {
+      valid: false,
+      error: 'Invalid node endpoint. Expected "<host>:<port>" or "<host>" (default port 9443).',
+    };
+  }
+
+  const host = canonicalizeNodeHost(parsed.host);
+  if (!host) {
+    return {
+      valid: false,
+      error: `Invalid or obfuscated node endpoint host "${parsed.host}".`,
+    };
+  }
+
+  if (isBlockedMetadataHostname(host)) {
+    return {
+      valid: false,
+      error: `Node endpoint host "${host}" is blocked by SSRF policy (metadata/internal host).`,
+    };
+  }
+
+  if (/^(0x[0-9a-f]+|\d+)$/i.test(host)) {
+    return {
+      valid: false,
+      error: `Node endpoint host "${host}" is blocked (numeric/hex IP obfuscation).`,
+    };
+  }
+
+  const normalizedHost = host.includes(':') ? `[${host}]` : host;
+  const canonicalParsed: ParsedEndpoint = {
+    host,
+    port: parsed.port,
+    normalized: `${normalizedHost}:${parsed.port}`,
+  };
+
+  const allowLoopback =
+    options?.allowLoopbackNodes !== undefined
+      ? options.allowLoopbackNodes
+      : allowLocalOfficialUpstreams();
+
+  const family = net.isIP(host);
+  if (family === 4 || family === 6) {
+    if (isUnconditionallyBlockedIp(host)) {
+      return {
+        valid: false,
+        error: `Node endpoint IP "${host}" is unconditionally blocked by SSRF policy (IMDS / link-local / reserved).`,
+      };
+    }
+
+    if (isStrictLoopbackIp(host)) {
+      if (!allowLoopback) {
+        return {
+          valid: false,
+          error: `Loopback node endpoint "${host}" is forbidden in production.`,
+        };
+      }
+      return { valid: true, parsed: canonicalParsed };
+    }
+
+    if (mode === 'tailscale') {
+      if (!isTailscaleCgnatIpv4(host)) {
+        return {
+          valid: false,
+          error: `Tailscale mode requires a Tailscale IPv4 in 100.64.0.0/10 or a .ts.net hostname (got "${host}").`,
+        };
+      }
+      return { valid: true, parsed: canonicalParsed };
+    }
+
+    if (isPrivateOrReservedIp(host)) {
+      return {
+        valid: false,
+        error: `Public IP node endpoint "${host}" cannot target private, CGNAT, or reserved IP ranges.`,
+      };
+    }
+
+    return { valid: true, parsed: canonicalParsed };
+  }
+
+  if (host === 'localhost' || host.endsWith('.localhost')) {
+    if (!allowLoopback) {
+      return {
+        valid: false,
+        error: `Loopback node endpoint "${host}" is forbidden in production.`,
+      };
+    }
+    return { valid: true, parsed: canonicalParsed };
+  }
+
+  if (mode === 'tailscale') {
+    if (!TAILSCALE_DOMAIN_RE.test(host)) {
+      return {
+        valid: false,
+        error: `Tailscale mode requires a Tailscale IPv4 in 100.64.0.0/10 or a .ts.net hostname (got "${host}").`,
+      };
+    }
+    return { valid: true, parsed: canonicalParsed };
+  }
+
+  if (!PUBLIC_HOSTNAME_RE.test(host)) {
+    return {
+      valid: false,
+      error: `Public IP node endpoint "${host}" must be a valid public IP address or multi-label hostname.`,
+    };
+  }
+
+  return { valid: true, parsed: canonicalParsed };
 }
 
 export function generateNodeToken(): { rawToken: string; tokenHash: string } {
@@ -378,6 +559,17 @@ export async function callNodeControlPlane(params: {
   if (!parsedEp) {
     throw new Error(`Invalid node endpoint: "${params.endpoint}"`);
   }
+  const canonicalHost = canonicalizeNodeHost(parsedEp.host);
+  if (
+    !canonicalHost ||
+    isBlockedMetadataHostname(canonicalHost) ||
+    (net.isIP(canonicalHost) !== 0 && isUnconditionallyBlockedIp(canonicalHost))
+  ) {
+    return Promise.reject(
+      new Error(`Node endpoint "${parsedEp.host}" is blocked by SSRF policy.`),
+    );
+  }
+  parsedEp.host = canonicalHost;
 
   const timeoutMs = params.timeoutMs ?? 5000;
   const startedAtMs = Date.now();
@@ -513,6 +705,17 @@ export function openConnectSocketToNode(
   if (!parsedEp) {
     return Promise.reject(new Error(`Invalid node endpoint "${node.endpoint}"`));
   }
+  const canonicalHost = canonicalizeNodeHost(parsedEp.host);
+  if (
+    !canonicalHost ||
+    isBlockedMetadataHostname(canonicalHost) ||
+    (net.isIP(canonicalHost) !== 0 && isUnconditionallyBlockedIp(canonicalHost))
+  ) {
+    return Promise.reject(
+      new Error(`Node endpoint "${parsedEp.host}" is blocked by SSRF policy.`),
+    );
+  }
+  parsedEp.host = canonicalHost;
 
   const pinnedNorm = node.tlsFingerprint
     ? normalizeHexFingerprint(node.tlsFingerprint)
