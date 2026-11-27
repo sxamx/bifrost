@@ -51,7 +51,9 @@ describe('Phase 1 Backend Acceptance Tests', () => {
 
       const stat = fs.statSync(resolved.keyPath);
       assert.equal(stat.size, 32, 'master.key must be 32 raw bytes');
-      assert.equal(stat.mode & 0o777, 0o600, 'master.key permissions must be 0600');
+      if (process.platform !== 'win32') {
+        assert.equal(stat.mode & 0o777, 0o600, 'master.key permissions must be 0600');
+      }
 
       const db = openDatabase(resolved.dbPath);
       try {
@@ -266,9 +268,8 @@ describe('Phase 1 Backend Acceptance Tests', () => {
 
       // Verify server entrypoint process exits non-zero with clear stderr message
       const coreDir = path.resolve(import.meta.dirname, '../core');
-      const tsxBin = path.join(coreDir, 'node_modules', '.bin', 'tsx');
       const entryPath = path.join(coreDir, 'src', 'index.ts');
-      const proc = spawnSync(tsxBin, [entryPath], {
+      const proc = spawnSync(process.execPath, ['--import', 'tsx', entryPath], {
         cwd: coreDir,
         env: {
           ...process.env,

@@ -7,6 +7,7 @@ import { createApp } from '../core/src/app.js';
 import { generateInternalApiKey, hashPassword, resolveMasterKey } from '../core/src/crypto.js';
 import { openDatabase, writeSystemLog } from '../core/src/db.js';
 import { utcStartOfDaySec } from '../core/src/metrics/index.js';
+import { createOfflineFetch } from './helpers/test-app.js';
 
 function makeTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'bifrost-phase5-test-'));
@@ -64,9 +65,10 @@ describe('Phase 5 Backend — Telemetry, UTC Quota, Percentiles, 60d Uptime, Act
     // Anchor clock to 2026-11-18T14:20:00.000Z
     let clockMs = Date.UTC(2026, 10, 18, 14, 20, 0);
 
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
 
       let upstreamMode:
         | 'ok_json'
@@ -273,7 +275,7 @@ describe('Phase 5 Backend — Telemetry, UTC Quota, Percentiles, 60d Uptime, Act
       const app = createApp({
         db,
         masterKey,
-        fetchImpl: mockFetch,
+        fetchImpl: createOfflineFetch(mockFetch),
         now: () => clockMs,
       });
 
@@ -492,22 +494,6 @@ describe('Phase 5 Backend — Telemetry, UTC Quota, Percentiles, 60d Uptime, Act
       assert.equal(gOk.status, 200);
 
       // Second guest request attempts to spoof client Date / X-Timezone headers to next week -> STILL blocked 429!
-      const gBlocked = await app.request('http://localhost/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${guestKeyGen}`,
-          Date: 'Wed, 25 Nov 2026 12:00:00 GMT',
-          'X-Timezone': 'Pacific/Kiritimati',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'openrouter/deepseek/deepseek-r1:free',
-          messages: [{ role: 'user', content: 'Bypass attempt' }],
-        }),
-      });
-      // Wait: fix Authorization header typo check -> test with exact guestKeyGen.rawKey!
-      assert.ok(gBlocked.status === 401 || gBlocked.status === 429);
-
       const gBlockedReal = await app.request('http://localhost/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -563,9 +549,8 @@ describe('Phase 5 Backend — Telemetry, UTC Quota, Percentiles, 60d Uptime, Act
       assert.equal(summaryBody.providersCount, 1);
       assert.equal(summaryBody.activeModelsCount, 1);
       assert.equal(summaryBody.quotaToday.nextResetAt, '2026-11-20T00:00:00.000Z');
-
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -576,13 +561,15 @@ describe('Phase 5 Backend — Telemetry, UTC Quota, Percentiles, 60d Uptime, Act
     const fixedNowSec = Math.floor(fixedNowMs / 1000);
     const todayStartSec = utcStartOfDaySec(fixedNowSec);
 
+    let db: ReturnType<typeof openDatabase> | null = null;
     try {
       const { key: masterKey } = resolveMasterKey({ dataDir: tmpDir, envMasterKey: undefined });
-      const db = openDatabase(path.join(tmpDir, 'bifrost.db'));
+      db = openDatabase(path.join(tmpDir, 'bifrost.db'));
 
       const app = createApp({
         db,
         masterKey,
+        fetchImpl: createOfflineFetch(),
         now: () => fixedNowMs,
       });
 
@@ -857,9 +844,8 @@ describe('Phase 5 Backend — Telemetry, UTC Quota, Percentiles, 60d Uptime, Act
       assert.ok(!failoverLogsText.includes('sk-or-v1-ultraSecret99999999'));
       assert.ok(!failoverLogsText.includes('sk-bf-leaktest1234567890'));
       assert.ok(!failoverLogsText.includes('nvapi-supersecretkey987654321'));
-
-      db.close();
     } finally {
+      db?.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
