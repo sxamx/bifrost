@@ -8,7 +8,7 @@ Registro vivo de tareas pendientes de interfaz (`panel/`) y decisiones de produc
 
 ## Decisiones ya cerradas (NO cambiar)
 
-- **Claves de proveedor nuevas en `disabled` por defecto:** al añadir una clave nueva, se crea deshabilitada intencionalmente para que el administrador pueda asignarle un nodo de salida antes de habilitar tráfico.
+- **Selector único de salida (`Sin nodo` / `Máquina principal` / `Nodo externo`) y `Sin nodo` por defecto:** reemplaza el botón separado `Desactivar clave`. Al crear una clave nueva desde el panel, se crea por defecto en `Sin nodo` (`egressMode: 'none'`, `status: 'no_node'`, `nodeId: null`), bloqueando el 100 % de las operaciones salientes (`/v1/chat/completions`, `/v1/embeddings`, `POST .../test` y `syncProviderModels` / `detect-models`). Seleccionar `Máquina principal` (`egressMode: 'direct'`) o `Nodo externo` (`egressMode: 'node'` + `nodeId`) activa el tráfico por esa salida; volver a `Sin nodo` (`egressMode: 'none'`) detiene todo tráfico saliente.
 - **Contexto de error en Playground:** mantener el comportamiento actual sin cambios.
 - **Visibilidad de `uptime` y `speed` para invitados:** mantener ambas métricas visibles para usuarios invitados por ahora.
 
@@ -18,6 +18,7 @@ Registro vivo de tareas pendientes de interfaz (`panel/`) y decisiones de produc
 
 | ID | Área / Archivo | Descripción técnica |
 | --- | --- | --- |
+| `UX-NODE-01` | `ProviderVaultCard` / `ProvidersTab` | Reemplazar el botón separado `Desactivar clave` por un selector único de salida (`Sin nodo` / `Máquina principal` / `Nodo externo`) consumiendo `key.egressMode` (`'none' \| 'direct' \| 'node'`), `api.setKeyEgress(providerId, keyId, { egressMode, nodeId?, confirmForce? })` (sobre `PATCH /api/providers/:id/keys/:keyId/node`) y el default de `api.addProviderKey` (`egressMode: 'none'`, `status: 'no_node'`). Mantener el flujo de confirmación `409 NODE_PROVIDER_COLLISION` al elegir `Nodo externo`, deshabilitar/indicar bloqueo en la acción «Probar clave» cuando `egressMode === 'none'` o `status === 'no_node'`, y mostrar claramente el estado de nodo offline cuando `egressMode === 'node'` y `status === 'no_node'`. |
 | `LOG-01` | `OverviewTab` | Eliminar el fallback que mezcla unidades `tokens` y `peticiones` al resumir cuota; respetar unidades homogéneas y estados `null`. |
 | `LOG-05` | `MetricsTab` | Respetar estrictamente valores `null` (sin datos) en percentiles, uptime y caché; nunca renderizar `null` como `0` o `0%`. |
 | `UI-02` | `panel/public/sw.js` | Endurecer el Service Worker PWA para manejar actualizaciones, fallos de red y respuestas no cacheables de forma robusta sin dejar la SPA bloqueada. |
@@ -66,7 +67,6 @@ Registro vivo de tareas pendientes de interfaz (`panel/`) y decisiones de produc
 
 > **IMPORTANTE:** Ninguno de los siguientes puntos debe implementarse sin una definición de diseño y aprobación previa del dueño del repositorio.
 
-- **Recordatorio obligatorio — Asignación de salida vs desactivación de clave:** definir con precisión la semántica, UX y flujo entre `Sin nodo`, `Máquina principal (Directo)` y `Nodo externo`, y cómo interactúan con el botón `Desactivar clave`.
 - **Límite opcional de peticiones por minuto/hora (`RPM` / `RPH`) para invitados:** diseño de configuración por usuario invitado + gráfico de peticiones totales.
 - **Retención configurable de métricas e indicador de recursos:** selector de retención (`30` / `90` / `120` días / `Ilimitado`) + indicador de uso de espacio en disco y RAM pensado para despliegues en VM de 1 GB de RAM.
 - **Documentación integrada / guía rápida «Cómo conectar clientes»:** sección en el panel con ejemplos claros para configurar clientes compatibles con OpenAI usando `sk-bf-...`.

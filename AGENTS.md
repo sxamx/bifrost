@@ -74,7 +74,7 @@ Todo cambio en el repositorio sigue este flujo sin excepciones:
 
 Estas decisiones de diseño están cerradas y no deben romperse en futuros cambios:
 
-1. **Claves nuevas en estado `disabled` por defecto:** al crear nuevas claves de proveedor en el flujo del panel se crean como `status: 'disabled'` de forma intencional, para permitir asignar el nodo de salida antes de enrutar tráfico real. El backend debe respetar siempre `status: 'disabled'` / `enabled: false` sin auto-activar claves deshabilitadas.
+1. **Selector único de salida (`Sin nodo` por defecto) y bloqueo total:** al crear nuevas claves de proveedor desde el flujo del panel se crean por defecto en modo `Sin nodo` (`egressMode: 'none'`, `status: 'no_node'`, `node_id: NULL`), sin auto-asignar nodos online y bloqueando el 100 % de las operaciones salientes (`/v1/chat/completions`, `/v1/embeddings`, `POST .../test` y `syncProviderModels`). El administrador elige explícitamente entre `Sin nodo` (`none`), `Máquina principal` (`direct`) o `Nodo externo` (`node`), reemplazando el botón separado de desactivación; por retrocompatibilidad, el backend sigue respetando `status: 'disabled'` / `enabled: false` sin auto-activar claves deshabilitadas.
 2. **Política de licencias de benchmarks y catálogo (mínimo exacto exigido):**
    - Cumplir exactamente el mínimo requerido por cada fuente, **ni más ni menos**, integrado de forma limpia en la misma línea de pie (sin banners intrusivos).
    - `CC BY 4.0` con enlace clicable para fuentes bajo esa licencia (p. ej. LMArena, ArtificialWatch).

@@ -477,13 +477,34 @@ function mapUserRow(row: Record<string, unknown>): AuthUser {
   };
 }
 
+type ProviderKeyEgressMode = 'none' | 'direct' | 'node';
+
+function resolveProviderKeyEgressMode(
+  nodeId: string | null,
+  status: string,
+): ProviderKeyEgressMode {
+  if (status === 'disabled') {
+    return 'none';
+  }
+  if (nodeId === null) {
+    return status === 'no_node' ? 'none' : 'direct';
+  }
+  return 'node';
+}
+
 function formatProviderKeyRow(row: Record<string, unknown>) {
+  const nodeId =
+    row.node_id === null || row.node_id === undefined || String(row.node_id).length === 0
+      ? null
+      : String(row.node_id);
+  const status = String(row.status);
   return {
     id: String(row.id),
     providerId: String(row.provider_id),
     label: String(row.label),
     last4: String(row.last4),
-    nodeId: row.node_id === null || row.node_id === undefined ? null : String(row.node_id),
+    nodeId,
+    egressMode: resolveProviderKeyEgressMode(nodeId, status),
     forcedNode: Number(row.forced_node ?? 0) === 1,
     dailyQuotaLimit:
       row.daily_quota_limit === null || row.daily_quota_limit === undefined
@@ -497,7 +518,7 @@ function formatProviderKeyRow(row: Record<string, unknown>) {
       row.ratelimit_reset_at === null || row.ratelimit_reset_at === undefined
         ? null
         : Number(row.ratelimit_reset_at),
-    status: String(row.status),
+    status,
     lastError:
       row.last_error === null || row.last_error === undefined ? null : String(row.last_error),
     createdAt: Number(row.created_at),
@@ -2142,16 +2163,27 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     if (
       body.status !== undefined &&
       body.status !== 'active' &&
-      body.status !== 'disabled'
+      body.status !== 'disabled' &&
+      body.status !== 'no_node'
     ) {
-      return c.json({ error: 'status must be "active" or "disabled".' }, 400);
+      return c.json({ error: 'status must be "active", "disabled", or "no_node".' }, 400);
+    }
+    if (
+      body.egressMode !== undefined &&
+      body.egressMode !== 'none' &&
+      body.egressMode !== 'direct' &&
+      body.egressMode !== 'node'
+    ) {
+      return c.json({ error: 'egressMode must be "none", "direct", or "node".' }, 400);
     }
     if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
       return c.json({ error: 'enabled must be a boolean.' }, 400);
     }
 
+    const requestedEgressMode = body.egressMode as ProviderKeyEgressMode | undefined;
     const requestedDisabled =
-      body.status === 'disabled' || (body.status !== 'active' && body.enabled === false);
+      body.status === 'disabled' ||
+      (body.status !== 'active' && body.status !== 'no_node' && body.enabled === false);
 
     let assignedNodeId: string | null = null;
     let forcedNode = 0;
@@ -2160,7 +2192,69 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       : 'active';
     let initialLastError: string | null = null;
 
-    if (typeof body.nodeId === 'string' && body.nodeId.trim().length > 0) {
+    if (
+      requestedEgressMode === 'none' ||
+      (requestedEgressMode === undefined && body.status === 'no_node')
+    ) {
+      // Explicit "Sin nodo": never auto-assign an online node; persist blocked no_node state
+      assignedNodeId = null;
+      forcedNode = 0;
+      initialKeyStatus = 'no_node';
+      initialLastError = null;
+    } else if (requestedEgressMode === 'direct') {
+      // Explicit "Máquina principal": never auto-assign an external node
+      assignedNodeId = null;
+      forcedNode = 0;
+      initialKeyStatus = requestedDisabled ? 'disabled' : 'active';
+      initialLastError = null;
+    } else if (requestedEgressMode === 'node') {
+      if (typeof body.nodeId !== 'string' || !body.nodeId.trim()) {
+        return c.json({ error: 'nodeId is required when egressMode is "node".' }, 400);
+      }
+      const targetNodeId = body.nodeId.trim();
+      const nodeRow = db
+        .prepare(`SELECT id, name, status FROM nodes WHERE id = ?`)
+        .get(targetNodeId) as { id: string; name: string; status: string } | undefined;
+      if (!nodeRow) {
+        return c.json({ error: `Node "${targetNodeId}" not found.` }, 400);
+      }
+
+      const sameProviderKeys = getNodeAssignedKeys(targetNodeId).filter(
+        (k) => k.providerId === providerId,
+      );
+      const confirmForce = body.confirmForce === true || body.forcedNode === true;
+      if (sameProviderKeys.length > 0 && !confirmForce) {
+        const collisionMsg = `Node "${nodeRow.name}" already holds ${sameProviderKeys.length} key(s) for provider "${prov.name}". Sharing the same exit IP increases ban risk.`;
+        return c.json(
+          {
+            message: collisionMsg,
+            code: 'NODE_PROVIDER_COLLISION',
+            requiresConfirmation: true,
+            existingKeys: sameProviderKeys,
+            error: {
+              message: collisionMsg,
+              code: 'NODE_PROVIDER_COLLISION',
+              requiresConfirmation: true,
+              existingKeys: sameProviderKeys,
+            },
+          },
+          409,
+        );
+      }
+
+      assignedNodeId = targetNodeId;
+      forcedNode = sameProviderKeys.length > 0 ? 1 : 0;
+      if (requestedDisabled) {
+        initialKeyStatus = 'disabled';
+        initialLastError = null;
+      } else if (nodeRow.status === 'online') {
+        initialKeyStatus = 'active';
+        initialLastError = null;
+      } else {
+        initialKeyStatus = 'no_node';
+        initialLastError = `Assigned exit node "${nodeRow.name}" is ${nodeRow.status}`;
+      }
+    } else if (typeof body.nodeId === 'string' && body.nodeId.trim().length > 0) {
       const targetNodeId = body.nodeId.trim();
       const nodeRow = db
         .prepare(`SELECT id, name, status FROM nodes WHERE id = ?`)
@@ -2199,7 +2293,8 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
         initialLastError = `Assigned exit node "${nodeRow.name}" is ${nodeRow.status}`;
       }
     } else {
-      // HU-08: Auto-assign to online node with fewest keys for this specific provider
+      // HU-08 (legacy callers without egressMode / status: 'no_node'):
+      // Auto-assign to online node with fewest keys for this specific provider
       const onlineNodes = db
         .prepare(`SELECT id, created_at FROM nodes WHERE status = 'online' ORDER BY created_at ASC`)
         .all() as Array<{ id: string; created_at: number }>;
@@ -2336,11 +2431,79 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
       return c.json({ error: 'Invalid JSON request body.' }, 400);
     }
 
+    if (
+      body.egressMode !== undefined &&
+      body.egressMode !== 'none' &&
+      body.egressMode !== 'direct' &&
+      body.egressMode !== 'node'
+    ) {
+      return c.json({ error: 'egressMode must be "none", "direct", or "node".' }, 400);
+    }
+
+    const requestedEgressMode = body.egressMode as ProviderKeyEgressMode | undefined;
     const rawNodeId = body.nodeId;
     const confirmForce = body.confirmForce === true;
     const nowSec = nowSeconds();
 
-    if (rawNodeId === null || rawNodeId === '') {
+    if (requestedEgressMode === 'none') {
+      db.prepare(
+        `UPDATE provider_keys
+         SET node_id = NULL, forced_node = 0, status = 'no_node', last_error = NULL
+         WHERE id = ? AND provider_id = ?`,
+      ).run(keyId, providerId);
+
+      writeSystemLog(
+        db,
+        'info',
+        'node',
+        `Key "${existingKey.label}" (…${existingKey.last4}) set to no-node mode (outbound traffic blocked)`,
+        { providerId, keyId, previousNodeId: existingKey.node_id, egressMode: 'none' },
+        nowSec,
+      );
+
+      const updated = db
+        .prepare(
+          `SELECT id, provider_id, label, last4, node_id, forced_node,
+                  daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
+                  status, last_error, created_at
+           FROM provider_keys
+           WHERE id = ?`,
+        )
+        .get(keyId) as Record<string, unknown>;
+
+      return c.json({ key: formatProviderKeyRow(updated) });
+    }
+
+    if (requestedEgressMode === 'direct') {
+      db.prepare(
+        `UPDATE provider_keys
+         SET node_id = NULL, forced_node = 0, status = 'active', last_error = NULL
+         WHERE id = ? AND provider_id = ?`,
+      ).run(keyId, providerId);
+
+      writeSystemLog(
+        db,
+        'info',
+        'node',
+        `Key "${existingKey.label}" (…${existingKey.last4}) assigned to direct server egress`,
+        { providerId, keyId, previousNodeId: existingKey.node_id, egressMode: 'direct' },
+        nowSec,
+      );
+
+      const updated = db
+        .prepare(
+          `SELECT id, provider_id, label, last4, node_id, forced_node,
+                  daily_quota_limit, ratelimit_remaining, ratelimit_reset_at,
+                  status, last_error, created_at
+           FROM provider_keys
+           WHERE id = ?`,
+        )
+        .get(keyId) as Record<string, unknown>;
+
+      return c.json({ key: formatProviderKeyRow(updated) });
+    }
+
+    if (requestedEgressMode === undefined && (rawNodeId === null || rawNodeId === '')) {
       const nextStatus = existingKey.status === 'no_node' ? 'active' : existingKey.status;
       const nextLastError = existingKey.status === 'no_node' ? null : existingKey.last_error;
 
@@ -2373,7 +2536,15 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     }
 
     if (typeof rawNodeId !== 'string' || !rawNodeId.trim()) {
-      return c.json({ error: 'nodeId must be a valid node ID string or null.' }, 400);
+      return c.json(
+        {
+          error:
+            requestedEgressMode === 'node'
+              ? 'nodeId is required when egressMode is "node".'
+              : 'nodeId must be a valid node ID string or null.',
+        },
+        400,
+      );
     }
 
     const targetNodeId = rawNodeId.trim();
@@ -2431,7 +2602,15 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     let nextStatus = existingKey.status;
     let nextLastError = existingKey.last_error;
 
-    if (existingKey.status === 'disabled') {
+    if (requestedEgressMode === 'node') {
+      if (targetNode.status === 'online') {
+        nextStatus = 'active';
+        nextLastError = null;
+      } else {
+        nextStatus = 'no_node';
+        nextLastError = `Assigned exit node "${targetNode.name}" is ${targetNode.status}`;
+      }
+    } else if (existingKey.status === 'disabled') {
       nextStatus = 'disabled';
     } else if (targetNode.status !== 'online') {
       nextStatus = 'no_node';
@@ -2621,14 +2800,39 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
     }
 
     const currentKeyStatus = String(keyRow.status ?? 'active');
+    const assignedNodeId =
+      typeof keyRow.node_id === 'string' && keyRow.node_id.length > 0 ? keyRow.node_id : null;
 
-    if (currentKeyStatus === 'no_node' && !keyRow.node_id) {
+    if (currentKeyStatus === 'no_node') {
+      if (!assignedNodeId) {
+        return c.json({
+          ok: false,
+          httpStatus: null,
+          latencyMs: 0,
+          status: currentKeyStatus,
+          message: 'Key has no assigned exit node (status: no_node) and will not route directly.',
+        });
+      }
+      const nodeName = String(keyRow.node_name ?? assignedNodeId);
+      const nodeStatus = keyRow.node_status ? String(keyRow.node_status) : 'offline';
       return c.json({
         ok: false,
         httpStatus: null,
         latencyMs: 0,
         status: currentKeyStatus,
-        message: 'Key has no assigned exit node (status: no_node) and will not route directly.',
+        message: `Assigned exit node "${nodeName}" is ${nodeStatus} (status: no_node); outbound key test is blocked.`,
+      });
+    }
+
+    if (assignedNodeId && keyRow.node_status !== 'online') {
+      const nodeName = String(keyRow.node_name ?? assignedNodeId);
+      const nodeStatus = keyRow.node_status ? String(keyRow.node_status) : 'offline';
+      return c.json({
+        ok: false,
+        httpStatus: null,
+        latencyMs: 0,
+        status: currentKeyStatus,
+        message: `Assigned exit node "${nodeName}" is ${nodeStatus}; outbound key test is blocked until the node is online.`,
       });
     }
 
