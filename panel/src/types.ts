@@ -581,6 +581,7 @@ export type ProviderPackageType = 'official-json' | 'experimental-adapter';
 export type ProviderModelsSource = 'api' | 'static';
 export type ProviderCategory = 'aggregator' | 'official-api' | 'experimental-adapter';
 export type ProviderKeyStatus = 'active' | 'rate_limited' | 'error' | 'no_node' | 'disabled';
+export type ProviderKeyEgressMode = 'none' | 'direct' | 'node';
 
 export type DataRetentionKind = 'zero' | 'transient' | 'retained' | 'variable';
 export type ProviderTrainingPolicy = 'never' | 'opt_out' | 'allowed' | 'unknown';
@@ -691,6 +692,7 @@ export interface ProviderKeyItem {
   label: string;
   last4: string;
   nodeId: string | null;
+  egressMode: ProviderKeyEgressMode;
   forcedNode?: boolean;
   dailyQuotaLimit?: number | null;
   ratelimitRemaining?: number | null;
@@ -771,8 +773,16 @@ export interface AddProviderKeyInput {
   secret: string;
   dailyQuotaLimit?: number;
   nodeId?: string | null;
-  status?: 'active' | 'disabled';
+  egressMode?: ProviderKeyEgressMode;
+  confirmForce?: boolean;
+  status?: 'active' | 'disabled' | 'no_node';
   enabled?: boolean;
+}
+
+export interface SetKeyEgressInput {
+  egressMode: ProviderKeyEgressMode;
+  nodeId?: string | null;
+  confirmForce?: boolean;
 }
 
 export interface ModelSyncDiff {

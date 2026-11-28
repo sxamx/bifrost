@@ -52,6 +52,7 @@ import type {
   PlaygroundMessageRole,
   ProviderAdaptiveQuota,
   ProviderCacheEntry,
+  ProviderKeyEgressMode,
   ProviderKeyItem,
   ProviderKeyTestResult,
   ProviderLogoData,
@@ -68,6 +69,7 @@ import type {
   QuotaUnit,
   ReasoningEffort,
   RotateNodeTokenResult,
+  SetKeyEgressInput,
   SpeedMetricsData,
   StatusResponse,
   SystemLogEntry,
@@ -655,6 +657,19 @@ function normalizeExitNode(raw: unknown): ExitNodeItem {
   };
 }
 
+function deriveProviderKeyEgressMode(
+  nodeId: string | null,
+  status: ProviderKeyItem['status']
+): ProviderKeyEgressMode {
+  if (status === 'disabled') {
+    return 'none';
+  }
+  if (nodeId === null) {
+    return status === 'no_node' ? 'none' : 'direct';
+  }
+  return 'node';
+}
+
 function normalizeProviderKey(raw: unknown): ProviderKeyItem {
   const r = asRecord(raw);
   const rawStatus = typeof r.status === 'string' ? r.status : 'active';
@@ -665,6 +680,17 @@ function normalizeProviderKey(raw: unknown): ProviderKeyItem {
     rawStatus === 'disabled'
       ? rawStatus
       : 'active';
+  const nodeId =
+    typeof r.nodeId === 'string' && r.nodeId.length > 0
+      ? r.nodeId
+      : typeof r.node_id === 'string' && r.node_id.length > 0
+        ? r.node_id
+        : null;
+  const rawEgressMode = r.egressMode ?? r.egress_mode;
+  const egressMode: ProviderKeyEgressMode =
+    rawEgressMode === 'none' || rawEgressMode === 'direct' || rawEgressMode === 'node'
+      ? rawEgressMode
+      : deriveProviderKeyEgressMode(nodeId, status);
 
   return {
     id: String(r.id ?? ''),
@@ -674,12 +700,8 @@ function normalizeProviderKey(raw: unknown): ProviderKeyItem {
         : (r.provider_id as string | undefined),
     label: String(r.label ?? r.name ?? 'Clave sin etiqueta'),
     last4: String(r.last4 ?? '••••'),
-    nodeId:
-      typeof r.nodeId === 'string' && r.nodeId.length > 0
-        ? r.nodeId
-        : typeof r.node_id === 'string' && r.node_id.length > 0
-          ? r.node_id
-          : null,
+    nodeId,
+    egressMode,
     forcedNode: Boolean(r.forcedNode ?? r.forced_node ?? false),
     dailyQuotaLimit:
       typeof r.dailyQuotaLimit === 'number'
@@ -2193,20 +2215,40 @@ export const api = {
     providerId: string,
     keyId: string,
     nodeId: string | null,
-    confirmForce?: boolean
+    confirmForce?: boolean,
+    egressMode?: ProviderKeyEgressMode
   ): Promise<ProviderKeyItem> {
+    const payload: Record<string, unknown> = {
+      nodeId,
+      confirmForce: Boolean(confirmForce),
+    };
+    if (egressMode !== undefined) {
+      payload.egressMode = egressMode;
+    }
     const raw = await request<unknown>(
       `/api/providers/${encodeURIComponent(providerId)}/keys/${encodeURIComponent(keyId)}/node`,
       {
         method: 'PATCH',
-        body: JSON.stringify({
-          nodeId,
-          confirmForce: Boolean(confirmForce),
-        }),
+        body: JSON.stringify(payload),
       }
     );
     const r = asRecord(raw);
     return normalizeProviderKey(r.key ?? raw);
+  },
+
+  async setKeyEgress(
+    providerId: string,
+    keyId: string,
+    options: SetKeyEgressInput
+  ): Promise<ProviderKeyItem> {
+    const targetNodeId = options.egressMode === 'node' ? (options.nodeId ?? null) : null;
+    return this.assignKeyNode(
+      providerId,
+      keyId,
+      targetNodeId,
+      options.confirmForce,
+      options.egressMode
+    );
   },
 
   /* Providers & Marketplace (Phase 2, Phase 7 HU-23 & HU-42) */
@@ -2516,13 +2558,42 @@ export const api = {
     const payload: Record<string, unknown> = {
       label: input.label.trim(),
       secret: input.secret,
-      status: input.status ?? (input.enabled === true ? 'active' : 'disabled'),
     };
+    const hasExplicitNodeId =
+      typeof input.nodeId === 'string' && input.nodeId.trim().length > 0;
+    const hasExplicitStatusOrEnabled =
+      input.status !== undefined || input.enabled !== undefined;
+
+    if (input.egressMode !== undefined) {
+      payload.egressMode = input.egressMode;
+      if (input.status !== undefined) {
+        payload.status = input.status;
+      } else if (input.enabled !== undefined) {
+        payload.status = input.enabled ? 'active' : 'disabled';
+      } else if (input.egressMode === 'none') {
+        payload.status = 'no_node';
+      }
+    } else if (!hasExplicitNodeId && !hasExplicitStatusOrEnabled) {
+      payload.egressMode = 'none';
+      payload.status = 'no_node';
+    } else {
+      if (input.status !== undefined) {
+        payload.status = input.status;
+      } else if (input.enabled !== undefined) {
+        payload.status = input.enabled ? 'active' : 'disabled';
+      } else if (hasExplicitNodeId) {
+        payload.egressMode = 'node';
+      }
+    }
+
     if (typeof input.dailyQuotaLimit === 'number' && input.dailyQuotaLimit > 0) {
       payload.dailyQuotaLimit = input.dailyQuotaLimit;
     }
     if (input.nodeId !== undefined) {
       payload.nodeId = input.nodeId;
+    }
+    if (input.confirmForce === true) {
+      payload.confirmForce = true;
     }
     const raw = await request<unknown>(
       `/api/providers/${encodeURIComponent(providerId)}/keys`,

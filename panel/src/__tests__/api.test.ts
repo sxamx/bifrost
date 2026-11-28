@@ -237,8 +237,8 @@ describe('panel/src/api.ts', () => {
     });
   });
 
-  describe('addProviderKey default status invariant', () => {
-    it('sends status: "disabled" by default when neither status nor enabled is provided', async () => {
+  describe('addProviderKey default egressMode & setKeyEgress / assignKeyNode', () => {
+    it('sends egressMode: "none" and status: "no_node" by default when no egress/node/status/enabled is provided', async () => {
       fetchMock.mockResolvedValueOnce(
         jsonResponse({
           key: {
@@ -247,7 +247,8 @@ describe('panel/src/api.ts', () => {
             label: 'Clave principal',
             last4: '9876',
             nodeId: null,
-            status: 'disabled',
+            egressMode: 'none',
+            status: 'no_node',
           },
         })
       );
@@ -266,21 +267,52 @@ describe('panel/src/api.ts', () => {
       expect(body).toEqual({
         label: 'Clave principal',
         secret: 'test-provider-secret-9876',
-        status: 'disabled',
+        egressMode: 'none',
+        status: 'no_node',
       });
-      expect(created.status).toBe('disabled');
+      expect(created.status).toBe('no_node');
+      expect(created.nodeId).toBeNull();
+      expect(created.egressMode).toBe('none');
     });
 
-    it('honors explicit enabled: true and explicit status: "active"', async () => {
+    it('honors explicit enabled: true, explicit status: "active", and explicit egressMode values', async () => {
       fetchMock
         .mockResolvedValueOnce(
-          jsonResponse({ key: { id: 'k-2', label: 'Activa', last4: '1111', status: 'active' } })
+          jsonResponse({
+            key: { id: 'k-2', label: 'Activa', last4: '1111', nodeId: 'node-1', status: 'active' },
+          })
         )
         .mockResolvedValueOnce(
-          jsonResponse({ key: { id: 'k-3', label: 'Explicita', last4: '2222', status: 'active' } })
+          jsonResponse({
+            key: { id: 'k-3', label: 'Explicita', last4: '2222', nodeId: null, status: 'active' },
+          })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            key: {
+              id: 'k-4',
+              label: 'Directa',
+              last4: '3333',
+              nodeId: null,
+              egressMode: 'direct',
+              status: 'active',
+            },
+          })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            key: {
+              id: 'k-5',
+              label: 'Nodo',
+              last4: '4444',
+              nodeId: 'node-2',
+              egressMode: 'node',
+              status: 'active',
+            },
+          })
         );
 
-      await api.addProviderKey('openrouter', {
+      const k2 = await api.addProviderKey('openrouter', {
         label: 'Activa',
         secret: 'test-secret-1111',
         enabled: true,
@@ -295,8 +327,10 @@ describe('panel/src/api.ts', () => {
       expect(firstBody.status).toBe('active');
       expect(firstBody.dailyQuotaLimit).toBe(50000);
       expect(firstBody.nodeId).toBe('node-1');
+      // Derived egressMode when backend response omits it
+      expect(k2.egressMode).toBe('node');
 
-      await api.addProviderKey('openrouter', {
+      const k3 = await api.addProviderKey('openrouter', {
         label: 'Explicita',
         secret: 'test-secret-2222',
         status: 'active',
@@ -307,6 +341,136 @@ describe('panel/src/api.ts', () => {
         unknown
       >;
       expect(secondBody.status).toBe('active');
+      expect(k3.egressMode).toBe('direct');
+
+      const k4 = await api.addProviderKey('openrouter', {
+        label: 'Directa',
+        secret: 'test-secret-3333',
+        egressMode: 'direct',
+      });
+      const thirdBody = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body)) as Record<
+        string,
+        unknown
+      >;
+      expect(thirdBody).toEqual({
+        label: 'Directa',
+        secret: 'test-secret-3333',
+        egressMode: 'direct',
+      });
+      expect(k4.egressMode).toBe('direct');
+
+      const k5 = await api.addProviderKey('openrouter', {
+        label: 'Nodo',
+        secret: 'test-secret-4444',
+        egressMode: 'node',
+        nodeId: 'node-2',
+        confirmForce: true,
+      });
+      const fourthBody = JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body)) as Record<
+        string,
+        unknown
+      >;
+      expect(fourthBody).toEqual({
+        label: 'Nodo',
+        secret: 'test-secret-4444',
+        egressMode: 'node',
+        nodeId: 'node-2',
+        confirmForce: true,
+      });
+      expect(k5.egressMode).toBe('node');
+    });
+
+    it('supports setKeyEgress and assignKeyNode with "none", "direct", and "node" modes', async () => {
+      fetchMock
+        .mockResolvedValueOnce(
+          jsonResponse({
+            key: {
+              id: 'k-10',
+              label: 'Key 10',
+              last4: '1010',
+              nodeId: null,
+              egressMode: 'none',
+              status: 'no_node',
+            },
+          })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            key: {
+              id: 'k-10',
+              label: 'Key 10',
+              last4: '1010',
+              nodeId: null,
+              egressMode: 'direct',
+              status: 'active',
+            },
+          })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            key: {
+              id: 'k-10',
+              label: 'Key 10',
+              last4: '1010',
+              nodeId: 'node-eu-1',
+              egressMode: 'node',
+              forcedNode: true,
+              status: 'active',
+            },
+          })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({
+            key: {
+              id: 'k-10',
+              label: 'Key 10',
+              last4: '1010',
+              nodeId: null,
+              status: 'disabled',
+            },
+          })
+        );
+
+      const asNone = await api.setKeyEgress('groq', 'k-10', { egressMode: 'none' });
+      expect(asNone.egressMode).toBe('none');
+      expect(asNone.status).toBe('no_node');
+      expect(asNone.nodeId).toBeNull();
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+        nodeId: null,
+        confirmForce: false,
+        egressMode: 'none',
+      });
+
+      const asDirect = await api.setKeyEgress('groq', 'k-10', { egressMode: 'direct' });
+      expect(asDirect.egressMode).toBe('direct');
+      expect(asDirect.status).toBe('active');
+      expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+        nodeId: null,
+        confirmForce: false,
+        egressMode: 'direct',
+      });
+
+      const asNode = await api.setKeyEgress('groq', 'k-10', {
+        egressMode: 'node',
+        nodeId: 'node-eu-1',
+        confirmForce: true,
+      });
+      expect(asNode.egressMode).toBe('node');
+      expect(asNode.nodeId).toBe('node-eu-1');
+      expect(asNode.forcedNode).toBe(true);
+      expect(JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body))).toEqual({
+        nodeId: 'node-eu-1',
+        confirmForce: true,
+        egressMode: 'node',
+      });
+
+      const asLegacyAssign = await api.assignKeyNode('groq', 'k-10', null, false, 'none');
+      expect(asLegacyAssign.egressMode).toBe('none');
+      expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body))).toEqual({
+        nodeId: null,
+        confirmForce: false,
+        egressMode: 'none',
+      });
     });
   });
 
